@@ -1,11 +1,23 @@
-torch==1.4.0
-torchvision==0.5.0
-numpy
-tqdm
-tensorboard
-tensorboardX
-ml-collections
-medpy
-SimpleITK
-scipy
-h5py
+# 运行环境：Python 3.12.10（项目根目录 venv）
+# GPU 版 torch 请按本机 CUDA 版本选择官方 index 安装，例如：
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
+# 注意：不要安装 torch==1.4.0（旧版与本仓库的 torch 2.x 代码不兼容）
+
+torch==2.14.1
+torchvision==0.29.1
+numpy==2.5.2
+scipy==1.18.1
+
+# 数据读取（NIfTI / HDF5）
+h5py==3.16.0
+nibabel==5.4.2
+SimpleITK==2.5.6
+
+# 网络配置与评估
+ml-collections==1.1.0
+MedPy==0.5.2
+
+# 训练日志与进度
+tensorboard==2.21.0
+tensorboardX==2.6.5
+tqdm==4.70.1

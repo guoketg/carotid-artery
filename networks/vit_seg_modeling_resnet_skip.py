@@ -1,6 +1,8 @@
 import math
 
-from os.path import join as pjoin
+def pjoin(*args):
+    """拼接 npz 权重键名，固定用正斜杠（Windows 下 os.path.join 会生成反斜杠，导致 KeyError）"""
+    return "/".join(args)
 from collections import OrderedDict
 
 import torch

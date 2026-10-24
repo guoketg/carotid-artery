@@ -1,4 +1,6 @@
 import argparse
+import csv
+import functools
 import logging
 import os
 import random
@@ -15,6 +17,29 @@ from tqdm import tqdm
 from utils import DiceLoss
 from torchvision import transforms
 
+def _worker_init(worker_id, seed):
+    # 必须是模块级函数，Windows spawn 下才能被序列化到子进程
+    random.seed(seed + worker_id)
+
+
+@torch.no_grad()
+def _eval_test(model, testloader):
+    """在测试集上逐样本计算四项指标，返回 (records, summary)"""
+    from metrics_carotid import compute_case_metrics, summarize
+    was_training = model.training
+    model.eval()
+    records = []
+    for batch in testloader:
+        logits = model(batch['image'].cuda())
+        pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
+        record = compute_case_metrics(pred, batch['label'].numpy()[0])
+        record['case'] = batch['case'][0]
+        records.append(record)
+    if was_training:
+        model.train()
+    return records, summarize(records)
+
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
@@ -25,16 +50,28 @@ def trainer_synapse(args, model, snapshot_path):
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
     # max_iterations = args.max_iterations
-    db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train",
-                               transform=transforms.Compose(
-                                   [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+    if args.dataset == 'Carotid':
+        from datasets.dataset_carotid import CarotidDataset
+        split_dir = os.path.join(args.list_dir, args.subset)
+        db_train = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "train.txt"),
+                                  split="train", img_size=args.img_size,
+                                  use_wavelet=bool(args.use_wavelet))
+        test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
+                                  split="test", img_size=args.img_size,
+                                  use_wavelet=bool(args.use_wavelet))
+        testloader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
+        curve_path = os.path.join(snapshot_path, 'test_curve.csv')
+        curve_rows = []
+    else:
+        testloader = None
+        curve_path = None
+        db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train",
+                                   transform=transforms.Compose(
+                                       [RandomGenerator(output_size=[args.img_size, args.img_size])]))
     print("The length of train set is: {}".format(len(db_train)))
 
-    def worker_init_fn(worker_id):
-        random.seed(args.seed + worker_id)
-
-    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
-                             worker_init_fn=worker_init_fn)
+    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,
+                             pin_memory=True, worker_init_fn=functools.partial(_worker_init, seed=args.seed))
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     model.train()
@@ -79,6 +116,23 @@ def trainer_synapse(args, model, snapshot_path):
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image('train/GroundTruth', labs, iter_num)
 
+        if testloader is not None and args.eval_test_every > 0 and (
+                (epoch_num + 1) % args.eval_test_every == 0 or epoch_num >= max_epoch - 1):
+            _, summary = _eval_test(model, testloader)
+            curve_rows.append({
+                "epoch": epoch_num + 1,
+                "dice": summary["dice"]["mean"],
+                "assd": summary["assd"]["mean"],
+                "hd95": summary["hd95"]["mean"],
+                "abs_delta_area": summary["abs_delta_area"]["mean"],
+            })
+            with open(curve_path, "w", newline="", encoding="utf-8") as f:
+                curve_writer = csv.DictWriter(
+                    f, fieldnames=["epoch", "dice", "assd", "hd95", "abs_delta_area"])
+                curve_writer.writeheader()
+                curve_writer.writerows(curve_rows)
+            logging.info("epoch %d test curve: %s" % (epoch_num + 1, curve_rows[-1]))
+
         save_interval = 50  # int(max_epoch/6)
         if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
             save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
@@ -93,4 +147,26 @@ def trainer_synapse(args, model, snapshot_path):
             break
 
     writer.close()
+
+    if args.dataset == 'Carotid':
+        from torch.utils.data import DataLoader as _DL
+        from metrics_carotid import compute_case_metrics, summarize
+        test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
+                                  split="test", img_size=args.img_size)
+        testloader = _DL(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
+        model.eval()
+        records = []
+        with torch.no_grad():
+            for batch in testloader:
+                logits = model(batch['image'].cuda())
+                pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
+                record = compute_case_metrics(pred, batch['label'].numpy()[0])
+                record['case'] = batch['case'][0]
+                records.append(record)
+        summary = summarize(records)
+        with open(os.path.join(snapshot_path, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
+            writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "delta_area"])
+            writer_csv.writeheader()
+            writer_csv.writerows(records)
+        logging.info("test summary: " + str(summary))
     return "Training Finished!"

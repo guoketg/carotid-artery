@@ -13,17 +13,27 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='../data/Synapse/train_npz', help='root dir for data')
 parser.add_argument('--dataset', type=str,
-                    default='Synapse', help='experiment_name')
+                    default='Carotid', help='experiment_name')
+parser.add_argument('--subset', type=str,
+                    default='SPARC', choices=['SPARC', 'Zhongnan'], help='carotid subset')
+parser.add_argument('--num_workers', type=int, default=1, help='dataloader workers, keep 1 on Windows')
+parser.add_argument('--eval_test_every', type=int, default=5,
+                    help='evaluate test set every N epochs to draw the epoch-vs-metric curve (0=off)')
 parser.add_argument('--list_dir', type=str,
-                    default='./lists/lists_Synapse', help='list dir')
+                    default='./lists/lists_Carotid', help='list dir')
 parser.add_argument('--num_classes', type=int,
-                    default=9, help='output channel of network')
+                    default=2, help='output channel of network')
 parser.add_argument('--max_iterations', type=int,
                     default=30000, help='maximum epoch number to train')
 parser.add_argument('--max_epochs', type=int,
-                    default=150, help='maximum epoch number to train')
+                    default=200, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int,
-                    default=24, help='batch_size per gpu')
+                    default=8, help='batch_size per gpu')
+parser.add_argument('--use_wavelet', type=int, default=0,
+                    help='1 = build 3 channels (raw / wavelet denoised / detail energy)')
+parser.add_argument('--fusion', type=str, default='none', choices=['none', 'se', 'cross'],
+                    help='feature fusion between main and wavelet branch')
+parser.add_argument('--heads', type=int, default=4, help='attention heads of WGA')
 parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
 parser.add_argument('--deterministic', type=int,  default=1,
                     help='whether use deterministic training')
@@ -61,6 +71,11 @@ if __name__ == "__main__":
             'list_dir': './lists/lists_Synapse',
             'num_classes': 9,
         },
+        'Carotid': {
+            'root_path': r'F:\code\datasets\2D',
+            'list_dir': './lists/lists_Carotid',
+            'num_classes': 2,
+        },
     }
     args.num_classes = dataset_config[dataset_name]['num_classes']
     args.root_path = dataset_config[dataset_name]['root_path']
@@ -77,7 +92,13 @@ if __name__ == "__main__":
     snapshot_path = snapshot_path+'_bs'+str(args.batch_size)
     snapshot_path = snapshot_path + '_lr' + str(args.base_lr) if args.base_lr != 0.01 else snapshot_path
     snapshot_path = snapshot_path + '_'+str(args.img_size)
-    snapshot_path = snapshot_path + '_s'+str(args.seed) if args.seed!=1234 else snapshot_path
+    snapshot_path = snapshot_path + '_s' + str(args.seed) if args.seed != 1234 else snapshot_path
+    if dataset_name == 'Carotid':
+        snapshot_path = snapshot_path + '_' + args.subset
+        if args.use_wavelet:
+            snapshot_path += '_w3'
+        if args.fusion != 'none':
+            snapshot_path += '_' + args.fusion
 
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
@@ -86,8 +107,14 @@ if __name__ == "__main__":
     config_vit.n_skip = args.n_skip
     if args.vit_name.find('R50') != -1:
         config_vit.patches.grid = (int(args.img_size / args.vit_patches_size), int(args.img_size / args.vit_patches_size))
-    net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    if args.fusion != 'none':
+        from networks.wavelet_model import WaveletTransUNet
+        net = WaveletTransUNet(config_vit, img_size=args.img_size,
+                               num_classes=config_vit.n_classes,
+                               fusion=args.fusion, heads=args.heads).cuda()
+    else:
+        net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
     net.load_from(weights=np.load(config_vit.pretrained_path))
 
-    trainer = {'Synapse': trainer_synapse,}
+    trainer = {'Synapse': trainer_synapse, 'Carotid': trainer_synapse,}
     trainer[dataset_name](args, net, snapshot_path)
