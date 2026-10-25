@@ -45,11 +45,13 @@ def normalize_image(volume):
         std = 1.0
     return (volume - mean) / std
 
-
+# 图像和标签全部resize
 def resize_pair(image, label, size):
     factors = (size[0] / image.shape[0], size[1] / image.shape[1])
     image = ndimage.zoom(image, factors, order=3, mode="nearest")
+
     label = ndimage.zoom(label.astype(np.float32), factors, order=0, mode="nearest")
+    # 标签二值化
     return image.astype(np.float32), (label > 0.5).astype(np.float32)
 
 

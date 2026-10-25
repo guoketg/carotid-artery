@@ -23,21 +23,22 @@
 ## 3. 硬约束
 
 1. 数据划分**必须按病例**（patient-level），禁止切片级随机划分。
-2. 实验输出不得覆盖 baseline 权重，目录名带方法后缀。
+2. 实验输出不得覆盖单通道原图基线权重，目录名带方法后缀。
 3. 训练显存上限 8GB：`img_size=224`、`batch<=8`、开启 AMP；不够就用梯度累积。
 4. 数据加载固定 `num_workers=1`，不要调大：本机内存紧张，WSL 同时开启时会冲到 95%，需要用户手动杀进程。
 5. 指标口径固定：**Dice、ASSD、HD95、DeltaArea**（预测面积 − 真值面积）。
 6. 冒烟测试样本 ≤ 50，避免无意义开销。
 7. 关键决策、路径、超参变更必须回写 `docs/` 并在本文件索引。
 8. epoch 选择：先用 `--eval_test_every 5` 跑出 test 曲线，挑一个整数 epoch 固定；后续所有消融复用该 epoch，不再反复在测试集上调。
+9. **严禁用代号**（如 `A1`、`A3`、`C1/C2/C3`、`D11`）指代方案或通道：文档、代码注释、对话回复、提交说明里都要先写清具体做法，例如「原图＋去噪重建图＋高频能量图三通道、无额外融合模块」。实验编号只能出现在附录/对照表中，且同一处必须给出对应的自然语言描述；单独出现一个编号视为不合格。
 
 ## 4. 文档索引
 
 | 文档 | 内容 |
 |---|---|
-| [docs/imaging-basics.md](docs/imaging-basics.md) | 图像类型入门：B 型图、FFT、小波、低频/高频、C1/C2/C3 的图文解释 |
+| [docs/imaging-basics.md](docs/imaging-basics.md) | 图像类型入门：B 型图、FFT、小波、低频/高频、原图通道、去噪重建通道、高频能量通道的图文解释 |
 | [docs/technical-design.md](docs/technical-design.md) | 小波预处理、三通道、分支结构、注意力融合的设计决策与理由 |
-| [docs/dual-encoder-design.md](docs/dual-encoder-design.md) | **D11 落地版**：双骨干交错执行、四级双向融合的数据流、公式、skip 替换、参数/显存/耗时实测 |
+| [docs/dual-encoder-design.md](docs/dual-encoder-design.md) | **双骨干交错四级融合落地版**：双骨干交错执行、四级双向融合的数据流、公式、skip 替换、参数/显存/耗时实测 |
 | [docs/dataset.md](docs/dataset.md) | 数据集结构、划分规则、预处理与归一化 |
 | [docs/experiments.md](docs/experiments.md) | 消融矩阵、评估协议、统计检验、运行命令 |
 | [docs/status.md](docs/status.md) | 环境与权重校验记录、进度清单、已知问题 |
@@ -45,9 +46,9 @@
 ## 5. 当前状态
 
 - 环境、预训练权重（R50+ViT-B_16）、依赖、Windows `pjoin` 修复：已完成，见 `docs/status.md`。
-- baseline（A0）与 A1/A3 消融已完成；**A3 相对 A0 无显著增益**（p > 0.29），旧轻量侧支路线已否。
-- 进行中：**D11 双骨干交错 + 四级双向融合**已实现并过 R0；强融合算子 r4(deform)/r5(aff)/r6(cross_scale) 已过等价性。
-- **2026-10-24 夜队列（只跑全量 SPARC 单子集）**：`scripts/night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `scripts/night_queue_dual2.ps1 -Skip *zhongnan`，实际顺序 r1(auto) → r4(deform) → r5(aff) → r6(auto+cs)。
+- 单通道原图基线与三通道早融合、三通道＋小波引导注意力的消融已完成；**三通道＋小波引导注意力相对单通道原图基线无显著增益**（p > 0.29），旧轻量侧支路线已否。
+- 进行中：**双骨干交错四级融合**已实现并通过探针验证；三种强融合算子（可变形大核、AFF 式幅度调制、跨尺度回流）已通过零初始化等价性检验。
+- **2026-10-24 夜队列（只跑全量 SPARC 单子集）**：`scripts/night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `scripts/night_queue_dual2.ps1 -Skip *zhongnan`，实际顺序为四点全开·窗内/全局自适应融合 → 可变形大核 → AFF 式幅度调制 → 自适应融合＋跨尺度回流（队列中依次记作 `r1` / `r4` / `r5` / `r6`）。
 - **实测耗时**：全量 SPARC 0.70 s/iter（107 iter/epoch ≈ 75 s）→ **2.5 h/job**；瓶颈是 dataloader（`num_workers=1`），GPU 仅 63% util。旧文档“34.6 s/epoch、72 min”是错的。
 - **dev 快筛子集（已撤销）**：`lists_Carotid_dev` + `scripts/night_queue_dev.ps1` + `scripts/summarize_dev.py` 保留备用，当晚未使用，中间产物已删。
 - 训练超参变更：**batch 4 + `--grad_accum 2`**（等效 8）；batch 8 触发 WDDM 换页，单步 2.6×，禁用。

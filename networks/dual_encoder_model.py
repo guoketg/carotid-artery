@@ -91,19 +91,22 @@ class BidirCrossAttention(nn.Module):
         self.norm_b = nn.GroupNorm(1, dim)
         self.gamma_a = nn.Parameter(torch.zeros(1))
         self.gamma_b = nn.Parameter(torch.zeros(1))
-        for m in (self.proj_a, self.proj_b):
-            nn.init.zeros_(m.weight)
-            nn.init.zeros_(m.bias)
+
 
     def _split_heads(self, t):
+        # (N, L, d) → (N, heads, L, d/heads)。N 是 batch×窗数，L 是 token 数
+        # （窗内 = ws²，全局 = H*W），d 是 qkv 投影后的通道数
         n, l, d = t.shape
         return t.reshape(n, l, self.heads, d // self.heads).transpose(1, 2).contiguous()
 
     def _merge_heads(self, t):
+        # (N, heads, L, d/heads) → (N, L, d)，多头结果拼回原通道顺序
         n, h, l, dh = t.shape
         return t.transpose(1, 2).reshape(n, l, h * dh)
 
     def _attend(self, q, k, v):
+        # 缩放点积注意力，缩放因子 1/sqrt(d/heads) 由 PyTorch 内部处理；
+        # 不开 causal mask、不做 dropout —— 这里是全连接的空间注意力
         out = F.scaled_dot_product_attention(
             self._split_heads(q), self._split_heads(k), self._split_heads(v))
         return self._merge_heads(out)
@@ -117,6 +120,7 @@ class BidirCrossAttention(nn.Module):
             b_, _, h, w = A.shape
             ws = self.window
             gh, gw = h // ws, w // ws          # 窗的行/列数，h、w 需能被 ws 整除
+            
             # (B,3d,H,W) → (B*gh*gw, ws², 3d)：每个窗内是 ws² 个 token
             qa, ka, va = (window_partition(t, ws) for t in (qa, ka, va))
             qb, kb, vb = (window_partition(t, ws) for t in (qb, kb, vb))
@@ -140,6 +144,7 @@ class BidirCrossAttention(nn.Module):
                 # 反向：B 出 Q、A 出 K/V
                 out_b = self._attend(qb, ka, va).transpose(1, 2).reshape(b_, self.d, h, w)
 
+        # 这里不能出现两个零乘因子，否则Proj和gamma的输出全都是0，梯度被截断
         A2 = A + self.gamma_a * self.norm_a(self.proj_a(out_a))
         if not self.bidir:
             return A2, B
@@ -185,8 +190,6 @@ class BidirConcat(nn.Module):
         self.gamma_a = nn.Parameter(torch.zeros(1))
         self.gamma_b = nn.Parameter(torch.zeros(1))
         self.bidir = bidir
-        nn.init.zeros_(self.conv_a.weight)
-        nn.init.zeros_(self.conv_b.weight)
 
     def forward(self, A, B):
         A2 = A + self.gamma_a * self.conv_a(torch.cat([A, B], dim=1))
@@ -223,7 +226,7 @@ class BidirDeform(nn.Module):
         self.norm_b = nn.GroupNorm(1, dim)
         self.gamma_a = nn.Parameter(torch.zeros(1))
         self.gamma_b = nn.Parameter(torch.zeros(1))
-        for m in (self.proj_a, self.proj_b, self.off_a, self.off_b):
+        for m in (self.off_a, self.off_b):
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
 
@@ -338,6 +341,7 @@ class DualEncoderTransUNet(VisionTransformer):
                                  width_factor=config.resnet.width_factor)
         self.side_proj = nn.Conv2d(width * 16, hidden, 1)
 
+        # 根据层查参数
         res_of = {1: img_size // 2, 2: img_size // 4, 3: img_size // 8, 4: img_size // 16}
         dim_of = {1: width, 2: width * 4, 3: width * 8, 4: hidden}
         win_of = {1: window, 2: 7, 3: 7, 4: 7}
@@ -442,6 +446,7 @@ class DualEncoderTransUNet(VisionTransformer):
         bsz, n_tok, ch = t.shape
         h = int(n_tok ** 0.5)
         ta = t.transpose(1, 2).reshape(bsz, ch, h, h)
+
         ta, b = self._fuse(4, ta, b)
         t = ta.reshape(bsz, ch, n_tok).transpose(1, 2).contiguous()
 
