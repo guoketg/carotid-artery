@@ -86,18 +86,29 @@ class WaveletTransUNet(VisionTransformer):
             x = x.repeat(1, 3, 1, 1)
         encoded, attn_weights, features = self.transformer(x)
 
+        # encoded 来自 transformer，形状 (B, n_patch, hidden) = (B, 196, 768)
         if self.fusion != "none":
             b, n_patch, hidden = encoded.size()
-            h = int(n_patch ** 0.5)
+            h = int(n_patch ** 0.5)                              # 14：token 网格边长，196 = 14×14
+            # 把 token 序列还原成二维特征图，供卷积/注意力操作：(B, 196, 768) → (B, 768, 14, 14)
             fmap = encoded.permute(0, 2, 1).reshape(b, hidden, h, h)
             if self.fusion == "cross":
+                # 侧支输入只取第 3 通道 C3（高频能量图），形状 (B, 1, 224, 224)
+                # 注意：C2 不参与这里，它只在输入端作为第 2 通道进过 stem
                 guide = x[:, 2:3]
+                # WaveletBranch：4 次 stride=2 卷积，224→112→56→28→14，通道 1→32→64→128→768
+                # 输出 (B, 768, 14, 14)，与主分支 fmap 同分辨率同通道数
                 f_wave = self.wave_branch(guide)
+                # 兜底对齐（正常情况下已是 14×14，不会触发），避免尺寸不匹配报错
                 if f_wave.shape[-1] != h:
                     f_wave = F.interpolate(f_wave, size=(h, h), mode="bilinear", align_corners=False)
+                # WGA：Q 取自 fmap，K/V 取自 f_wave，4 头跨注意力后残差相加 + GroupNorm
+                # 形状始终是 (B, 768, 14, 14)，只重加权已有的 196 个 token，不新增位置
                 fmap = self.wga(fmap, f_wave)
             else:
+                # 对照实验：SE 通道注意力只作用于主分支自身特征，不引入侧支
                 fmap = self.se(fmap)
+            # 变回 transformer 期望的序列格式：(B, 768, 14, 14) → (B, 196, 768)
             encoded = fmap.reshape(b, hidden, n_patch).permute(0, 2, 1)
 
         x = self.decoder(encoded, features)

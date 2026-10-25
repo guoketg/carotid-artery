@@ -53,6 +53,20 @@ F:\code\datasets\2D\
 
 - 由 `python datasets/dataset_carotid.py` 生成。
 
+### 4.1 dev 快筛子集（`lists_Carotid_dev`，**已撤销，脚本保留**）
+
+> 2026-10-24 23:50 撤销：全量 SPARC 实测只需 2.5 h/job，一晚上够跑 3 个完整方案，不需要降级到子集。
+> 下列产物与脚本保留备用，但**当晚训练未使用**，`_dev` 中间结果已删除。
+
+夜间用全量数据只能跑 6 个方案（每个 1.2–1.5 h），做单变量对比样本太少，因此曾另建一个**病例级** dev 子集：
+
+- 生成：`python scripts\build_dev_subset.py --subset SPARC --ratio 0.4`
+- **train**：按 patientId 抽 40% 病例（SPARC 46 例 / 175 张，原 116 例 / 428 张）；病例整体进出，不拆切片。
+- **test**：原样复制官方 holdout（SPARC 28 例 / 82 张），因此 dev 与全量**共用同一测试集**，数字可比。
+- 训练侧用 `--list_dir ./lists/lists_Carotid_dev` 切换；`train.py` 自动给 snapshot 目录加 `_dev` 后缀，
+  快筛结果与全量结果物理隔离。
+- 用途限定：只做**方案排序**，60 epoch 未收敛，绝对值不可与全量 120 epoch 比较。
+
 ## 5. 预处理（baseline 与 A1 一致）
 
 1. 读取 NIfTI → 取 2D 强度图。

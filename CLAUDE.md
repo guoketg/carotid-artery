@@ -35,7 +35,9 @@
 
 | 文档 | 内容 |
 |---|---|
+| [docs/imaging-basics.md](docs/imaging-basics.md) | 图像类型入门：B 型图、FFT、小波、低频/高频、C1/C2/C3 的图文解释 |
 | [docs/technical-design.md](docs/technical-design.md) | 小波预处理、三通道、分支结构、注意力融合的设计决策与理由 |
+| [docs/dual-encoder-design.md](docs/dual-encoder-design.md) | **D11 落地版**：双骨干交错执行、四级双向融合的数据流、公式、skip 替换、参数/显存/耗时实测 |
 | [docs/dataset.md](docs/dataset.md) | 数据集结构、划分规则、预处理与归一化 |
 | [docs/experiments.md](docs/experiments.md) | 消融矩阵、评估协议、统计检验、运行命令 |
 | [docs/status.md](docs/status.md) | 环境与权重校验记录、进度清单、已知问题 |
@@ -43,4 +45,9 @@
 ## 5. 当前状态
 
 - 环境、预训练权重（R50+ViT-B_16）、依赖、Windows `pjoin` 修复：已完成，见 `docs/status.md`。
-- 进行中：接入颈动脉数据集，跑通 baseline 并给出四项指标。
+- baseline（A0）与 A1/A3 消融已完成；**A3 相对 A0 无显著增益**（p > 0.29），旧轻量侧支路线已否。
+- 进行中：**D11 双骨干交错 + 四级双向融合**已实现并过 R0；强融合算子 r4(deform)/r5(aff)/r6(cross_scale) 已过等价性。
+- **2026-10-24 夜队列（只跑全量 SPARC 单子集）**：`scripts/night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `scripts/night_queue_dual2.ps1 -Skip *zhongnan`，实际顺序 r1(auto) → r4(deform) → r5(aff) → r6(auto+cs)。
+- **实测耗时**：全量 SPARC 0.70 s/iter（107 iter/epoch ≈ 75 s）→ **2.5 h/job**；瓶颈是 dataloader（`num_workers=1`），GPU 仅 63% util。旧文档“34.6 s/epoch、72 min”是错的。
+- **dev 快筛子集（已撤销）**：`lists_Carotid_dev` + `scripts/night_queue_dev.ps1` + `scripts/summarize_dev.py` 保留备用，当晚未使用，中间产物已删。
+- 训练超参变更：**batch 4 + `--grad_accum 2`**（等效 8）；batch 8 触发 WDDM 换页，单步 2.6×，禁用。

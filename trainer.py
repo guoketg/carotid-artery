@@ -71,7 +71,8 @@ def trainer_synapse(args, model, snapshot_path):
     print("The length of train set is: {}".format(len(db_train)))
 
     trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,
-                             pin_memory=True, worker_init_fn=functools.partial(_worker_init, seed=args.seed))
+                             pin_memory=True, persistent_workers=args.num_workers > 0,
+                             worker_init_fn=functools.partial(_worker_init, seed=args.seed))
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     model.train()
@@ -81,11 +82,14 @@ def trainer_synapse(args, model, snapshot_path):
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
     max_epoch = args.max_epochs
-    max_iterations = args.max_epochs * len(trainloader)  # max_epoch = max_iterations // len(trainloader) + 1
+    grad_accum = max(1, getattr(args, 'grad_accum', 1))
+    steps_per_epoch = (len(trainloader) + grad_accum - 1) // grad_accum
+    max_iterations = args.max_epochs * steps_per_epoch  # max_epoch = max_iterations // len(trainloader) + 1
     logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
     for epoch_num in iterator:
+        optimizer.zero_grad()
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
@@ -93,9 +97,13 @@ def trainer_synapse(args, model, snapshot_path):
             loss_ce = ce_loss(outputs, label_batch[:].long())
             loss_dice = dice_loss(outputs, label_batch, softmax=True)
             loss = 0.5 * loss_ce + 0.5 * loss_dice
-            optimizer.zero_grad()
-            loss.backward()
+            (loss / grad_accum).backward()
+
+            # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次
+            if (i_batch + 1) % grad_accum != 0 and (i_batch + 1) != len(trainloader):
+                continue
             optimizer.step()
+            optimizer.zero_grad()
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_
@@ -152,7 +160,8 @@ def trainer_synapse(args, model, snapshot_path):
         from torch.utils.data import DataLoader as _DL
         from metrics_carotid import compute_case_metrics, summarize
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
-                                  split="test", img_size=args.img_size)
+                                  split="test", img_size=args.img_size,
+                                  use_wavelet=bool(args.use_wavelet))
         testloader = _DL(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
         model.eval()
         records = []

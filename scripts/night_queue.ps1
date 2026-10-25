@@ -4,10 +4,12 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1            # run all jobs
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -DryRun   # print plan only
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -Only a0_sparc
+#   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -Skip a0_sparc,a1_sparc   # resume
 param(
     [string]$Python = "F:\code\MyPython\TransUNet\venv\Scripts\python.exe",
     [string]$Root = "F:\code\MyPython\TransUNet",
     [string]$Only = "",
+    [string]$Skip = "",
     [switch]$DryRun
 )
 
@@ -46,6 +48,12 @@ $jobs = @(
 if ($Only -ne "") {
     $jobs = @($jobs | Where-Object { $_.Name -eq $Only })
     if ($jobs.Count -eq 0) { Write-Error "unknown job: $Only"; exit 2 }
+}
+
+if ($Skip -ne "") {
+    $skipNames = @($Skip -split "," | ForEach-Object { $_.Trim() })
+    $jobs = @($jobs | Where-Object { $skipNames -notcontains $_.Name })
+    Write-Host "[queue] skipping: $($skipNames -join ', ')"
 }
 
 $statusPath = Join-Path $logDir "queue_status.csv"
