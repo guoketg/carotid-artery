@@ -75,11 +75,60 @@ F:\code\datasets\2D\
 4. 训练增强：90° 随机旋转、随机翻转、±20° 小角度旋转；验证/测试只用缩放。
 5. 三通道早融合与三通道＋小波引导注意力的三通道版本：原图通道、去噪重建通道、高频能量通道，共用同一 mean/std。
 
-## 6. 指标定义
+## 6. 指标定义（**2026-10-26 起切换物理单位，旧数字为像素口径不可直接比**）
 
-| 指标 | 定义 |
-|---|---|
-| Dice | `2|P∩G| / (|P|+|G|)`，空预测且空真值记 1 |
-| ASSD | 平均对称表面距离（像素/体素单位） |
-| HD95 | 95% 豪斯多夫距离 |
-| DeltaArea | `area(P) − area(G)` 像素数，正值=预测偏大，同时报绝对值均值 |
+| 指标 | 定义 | 单位 |
+|---|---|---|
+| Dice | `2|P∩G| / (|P|+|G|)`，空预测且空真值记 1 | 无量纲 |
+| ASSD | 平均对称表面距离（medpy `assd`，`voxelspacing`=NIfTI 头分辨率） | **mm** |
+| HD95 | 95% 豪斯多夫距离（medpy `hd95`，同上） | **mm** |
+| DeltaArea | `area(P) − area(G)`，正值=预测偏大，同时报绝对值均值 | **mm²** |
+
+口径说明（2026-10-26 起）：
+
+- 原图为非正方形（约 2:3）且面内分辨率约 0.065~0.068 mm/px；训练/预测在 224×224 正方形网格上进行，**距离指标不在 224 网格上算**，而是把预测用 `ndi.zoom` 最近邻重采样回原分辨率网格（[metrics_carotid.py](../metrics_carotid.py) `original_grid_pair`），与原分辨率 GT、NIfTI 头 spacing 一起交给 medpy 计算，assd/hd95 直接得 mm、DeltaArea 直接得 mm²。
+- 验证（模拟预测对照实验，2026-10-26）：重采样路径相对原网格物理参考 assd 误差 ≤9.2%、hd95 ≤17.4%（小目标量化误差上界），Dice 与 224 网格差 <0.6%。
+- **历史 metrics.csv 与 test 曲线均为像素口径**（assd/hd95 为 224 网格像素数、DeltaArea 为像素数），与本口径不可直接比，比较时只看 Dice 或注明口径。
+- 一侧为空时距离指标取图像对角线物理长度作为最坏罚分（`_surface_fallback`）。
+
+## 7. Carotid2D 新数据集与官方划分（2026-10-26 老师提供，**已接入代码**）
+
+### 7.1 位置与划分文件
+
+- 数据根目录：`F:\code\datasets\Carotid2D`（不在仓库内）。
+- 划分文件（仓库内）：`datasets/split/`，路径均以 `./` 开头、以该根目录为起点，标签规则不变（同名 + `_label.nii.gz`）。
+
+| 文件 | 内容 | 图像数 |
+|---|---|---|
+| `filelist_train101` | SPARC 训练列表 | 350 |
+| `filelist_test43` | SPARC 测试列表 | 160 |
+| `trainfile_zhongnan.txt` | Zhongnan 训练列表 | 448 |
+| `testfile_zhongnan.txt` | Zhongnan 测试列表 | 187 |
+
+- 文件名中的 101 / 43 **推断**为 train/test 的病例数（总数 144 例与旧划分一致，待核对）。
+- SPARC 图像 350+160=510 张，与旧 `PlaqueDataNii_SPARC_M` 总数一致；**疑似同一批图像把目录后缀从 `_M` 换成 `_S` 后重新划分**，`_M`/`_S` 预处理是否不同待向老师确认。
+- Zhongnan 448+187=635 张，旧口径为 638 张（差 3 张，待核对）；目录名即病例 ID（如 `1334`、`20750`），与旧规则兼容。
+
+### 7.2 与旧口径对比（**新旧数字不可混排**）
+
+| 项 | 旧（现役代码） | 新（老师提供） |
+|---|---|---|
+| 根目录 | `F:\code\datasets\2D` | `F:\code\datasets\Carotid2D` |
+| 子集目录 | `PlaqueDataNii_SPARC_M` / `PlaqueDataNii_Zhongnan_M` | `PlaqueDataNii_SPARC_S` / `PlaqueDataNii_Zhongnan_S` |
+| SPARC 划分 | 116 例/428 张训练，28 例/82 张测试（自划分，seed 1234） | **101 例/350 张训练，43 例/160 张测试（官方给定）** |
+| 划分文件 | `lists/lists_Carotid/<Subset>/{train,test}.txt` | `datasets/split/` 下单个文件（两种命名，无扩展名） |
+| 测试集功效 | 28 例 | 43 例：对 +1.0 Dice（约需 32 对）勉强够，对 +0.5（约需 128 对）仍不够 |
+
+- **全部已存结果（单通道基线 0.9092 等）都在旧划分上取得，切换后必须在新划分上重跑基线。**
+
+### 7.3 接入所需改动（**2026-10-26 已全部实施**）
+
+现行代码把数据根与划分写死，新划分不能零改动接入：
+
+1. `datasets/dataset_carotid.py` 顶部 `DATA_ROOT = F:\code\datasets\2D`、`SUBSETS` 指向 `_M` 目录（`build_splits` 只用于再生成旧划分，可不改）。
+2. `train.py` 的 dataset_config **无条件覆盖** `--root_path`（只有 `--list_dir` 允许 CLI 覆盖），Carotid 的 `root_path` 需改为 `F:\code\datasets\Carotid2D`（或放开 CLI 覆盖）。**已实施**：L92-93 root_path/list_dir 已切到新根与新划分。
+3. `trainer.py` 只认 `<list_dir>/<Subset>/train.txt|test.txt` 结构，需把 `datasets/split/` 的四个文件转换为 `lists/lists_Carotid2D/SPARC/{train,test}.txt` 与 `lists/lists_Carotid2D/Zhongnan/{train,test}.txt`（内容去掉行首 `./` 即可，`read_list` 本身兼容 `./`，转换只为路径拼装）。**已实施**：四个文件由用户创建，冒烟加载确认 160 例测试集。
+4. `patient_key` 对新路径天然兼容（SPARC 目录名含 `SPARC`；Zhongnan 目录名即 ID），无需改。
+5. `scripts/eval_carotid.py` L102-103 默认值已切 `F:\code\datasets\Carotid2D` / `./lists/lists_Carotid2D`。
+
+冒烟验证（2026-10-26）：`--max_epochs 2` 全链路跑通，测试集 n=160（与官方 test43 的 160 张一致），快照目录自动带 `_c2d` 后缀（train.py L138-139）。

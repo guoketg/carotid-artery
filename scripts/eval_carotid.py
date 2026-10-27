@@ -15,12 +15,13 @@ import sys
 import numpy as np
 import torch
 from scipy.stats import wilcoxon
+from metrics_carotid import original_grid_pair
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets.dataset_carotid import CarotidDataset
-from metrics_carotid import compute_case_metrics, summarize
+from metrics_carotid import compute_case_metrics, original_grid_pair, summarize
 from networks.vit_seg_modeling import CONFIGS, VisionTransformer
 
 
@@ -53,7 +54,8 @@ def eval_ckpt(args):
         for i, batch in enumerate(dl):
             logits = net(batch["image"].cuda())
             pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
-            rec = compute_case_metrics(pred, batch["label"].numpy()[0])
+            pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch["case"][0])
+            rec = compute_case_metrics(pred_o, gt_o, spacing=spacing)
             rec["case"] = batch["case"][0]
             records.append(rec)
 
@@ -99,8 +101,8 @@ def main():
     p.add_argument("--vit_name", default="R50-ViT-B_16")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--num_workers", type=int, default=1)
-    p.add_argument("--root_path", default=r"F:\code\datasets\2D")
-    p.add_argument("--list_dir", default="./lists/lists_Carotid")
+    p.add_argument("--root_path", default=r"F:\code\datasets\Carotid2D")
+    p.add_argument("--list_dir", default="./lists/lists_Carotid2D")
     p.add_argument("--model_root", default=r"F:\code\MyPython\model\TU_Carotid224")
     p.add_argument("--prefix", default="TU_pretrain_R50-ViT-B_16_skip3_epo120_bs8_224_")
     p.add_argument("--ckpt", default="")

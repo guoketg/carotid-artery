@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils import DiceLoss
 from torchvision import transforms
+from metrics_carotid import original_grid_pair
 
 def _worker_init(worker_id, seed):
     # 必须是模块级函数，Windows spawn 下才能被序列化到子进程
@@ -23,16 +24,18 @@ def _worker_init(worker_id, seed):
 
 
 @torch.no_grad()
-def _eval_test(model, testloader):
+def _eval_test(model, testloader, root_path):
     """在测试集上逐样本计算四项指标，返回 (records, summary)"""
-    from metrics_carotid import compute_case_metrics, summarize
+    from metrics_carotid import compute_case_metrics, original_grid_pair, summarize
     was_training = model.training
     model.eval()
     records = []
     for batch in testloader:
         logits = model(batch['image'].cuda())
+
         pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
-        record = compute_case_metrics(pred, batch['label'].numpy()[0])
+        pred_o, gt_o, spacing = original_grid_pair(pred, root_path, batch['case'][0])
+        record = compute_case_metrics(pred_o, gt_o, spacing=spacing)
         record['case'] = batch['case'][0]
         records.append(record)
     if was_training:
@@ -124,9 +127,18 @@ def trainer_synapse(args, model, snapshot_path):
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image('train/GroundTruth', labs, iter_num)
 
+        # 每 epoch 记录所有融合门控 gamma 的绝对值最大值，用于判断门控是否已经在学
+        gamma_now = {n: p.detach().abs().max().item()
+                     for n, p in model.named_parameters() if "gamma" in n}
+        if gamma_now:
+            logging.info("epoch %d gamma absmax: %s" % (
+                epoch_num + 1, {k: round(v, 6) for k, v in gamma_now.items()}))
+            for k, v in gamma_now.items():
+                writer.add_scalar('fusion/' + k, v, epoch_num + 1)
+
         if testloader is not None and args.eval_test_every > 0 and (
                 (epoch_num + 1) % args.eval_test_every == 0 or epoch_num >= max_epoch - 1):
-            _, summary = _eval_test(model, testloader)
+            _, summary = _eval_test(model, testloader, args.root_path)
             curve_rows.append({
                 "epoch": epoch_num + 1,
                 "dice": summary["dice"]["mean"],
@@ -158,7 +170,7 @@ def trainer_synapse(args, model, snapshot_path):
 
     if args.dataset == 'Carotid':
         from torch.utils.data import DataLoader as _DL
-        from metrics_carotid import compute_case_metrics, summarize
+        from metrics_carotid import compute_case_metrics, original_grid_pair, summarize
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
                                   use_wavelet=bool(args.use_wavelet))
@@ -169,7 +181,8 @@ def trainer_synapse(args, model, snapshot_path):
             for batch in testloader:
                 logits = model(batch['image'].cuda())
                 pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
-                record = compute_case_metrics(pred, batch['label'].numpy()[0])
+                pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch['case'][0])
+                record = compute_case_metrics(pred_o, gt_o, spacing=spacing)
                 record['case'] = batch['case'][0]
                 records.append(record)
         summary = summarize(records)

@@ -244,6 +244,77 @@
 
 ---
 
+## 频域融合：2026-10-26 精读的 8 篇（本地 PDF）
+
+> 来源：`C:\Users\guoke\Desktop\医学图像` 下 8 个 PDF，正文全文提取后逐篇精读。
+> 速查版（含融合六档、注入位置四选一、推进顺序）见 [paper-reading.md](paper-reading.md) 第五章；本节只记**正式条目与对本项目的判断**。
+
+### 结论（截至本轮）
+
+1. **三篇小波论文的结论并不矛盾，差异来自基线容量、低频定义、融合位置、任务域四个维度**。XNet 的 raw-only 基线是单编码器（全网 326M / 83G MACs），+2.74 JI 混着容量红利；GobletNet 把参数量对齐后发现「只有高频有用、再加低频反而变差」。
+2. **HF 单独无法构成语义**：XNet Table 7 中 HF only 只有 **54.50** JI（raw 82.03），LF+HF 不融合 75.82，三者都低于 raw，只有融合后 84.77 才超过。所以增益来自**两支互补**，不是「多一个频带」。
+3. **融合位置比融合算子重要**：BDFR-Net（胎儿超声，与我们同域）用**单骨干 + 特征级 DWT 解耦**，完整方案 86.83 vs baseline 84.74（**+2.09**），其中 HF 支单独 +0.79、加 LF 再 +0.42、加空间上下文再 +0.42、skip 上的 ACAM 在另一行单独 +0.47（Table 3/4）。
+4. **小波单独不如纯卷积**：WMREN Table 4 中纯小波下采样的 H-Net 81.29、纯卷积 R-Net 82.59、两者并行 + 融合才 84.40。这条直接否定「把小波当唯一手段」。
+5. **我们处在融合算子的最重一档**（双向跨支交叉注意力，4 个接点 3.70M），而文献里稳定出增益的是 concat+1×1、门控、频域通道注意力这三档。**在解掉口径不一致之前，不应再加更重的算子。**
+6. **变换种类不是主要矛盾**：GobletNet 实测小波基差异多数 <1%、二级小波无显著提升；只有需要「通道注意力式频率重加权」时，DCT 比小波自然（Syn-Net 在乳腺超声上验证）。
+
+### 条目
+
+**ICCV 2023** — XNet: Wavelet-based Low and High Frequency Fusion Networks for Fully- and Semi-supervised Semantic Segmentation of Biomedical Images（**已读全文，含 Table 7 与模型量对比**）
+- 结构：LF 编码器 + HF 编码器 + LF/HF 融合模块 + 双支解码器；融合为 3×3 卷积对齐尺寸 → 通道 concat → 1×1 transition。
+- 分解：`L = LL`，`H = HL + LH + HH`。
+- 消融（Table 7，JI）：Raw only 82.03 / LF only 80.77 / **HF only 54.50** / LF+HF 无融合 75.82 / LF+HF+融合 **84.77**；半监督对应 78.52 / 76.30 / 52.56 / 66.78 / 80.89。
+- 模型量：XNet 326M / 83G MACs，XNet− 82M / 21G，XNet−− 20M / 5G。
+- 缺陷：① **raw-only 基线是单编码器**，与双编码器 XNet 不同容量，+2.74 不能全部归因于频域融合；② 只在 EM/病理类锐边界数据上验证；③ 不报 HD95/ASSD。
+- 与本项目关系：**不能**直接引用它的 +2.74 来支持双骨干方案。它能提供的只有「LF 与 HF 必须成对且必须融合」这一条机制判断。
+
+**IEEE TMI 2025** — GobletNet: Wavelet-based High-Frequency Fusion Network for EM Image Segmentation（XNet 同团队；**已读全文**）
+- 结构：语义编码器（raw）+ HF detail encoder + 融合解码器，层间插 **FAM**（`concat → 1×1 → fusion_feat → 1×1 → 两张 attention map` 乘回两路）。
+- HF 图定义：`H = H_L(I) + L_H(I) + H_H(I) + λ·L_L(I)`，**λ 混入少量低频抑制噪声**。
+- 消融结论（正文）：① HF 作额外输入通道即提升；② 再加独立 HF 编码分支再提升；③ **引入 LF 分量有负面影响**；④ **二级小波无显著提升**；⑤ 小波基在多数数据集不敏感（UroCell 例外，最好/最差 Jaccard 差 8.89%）；⑥ FAM 加在**所有编码层**最好。
+- 训练：4×RTX3090，SGD 0.9，batch 16，200 epoch。
+- 缺陷：仅 EM 图像 7 数据集，无超声；不报 HD95。
+- 与本项目关系：**这是本批最重要的一篇**，因为它做了参数量对齐。它直接推翻了「低频是一路额外信息」的假设——主分支已经是原图，再灌 `LL` 就是冗余 + 噪声。我们的侧路喂 `LH/HL/HH` 方向正确，但**必须重建出一张全分辨率 HF 图**，而不是三个半分辨率子带直接 concat 上采样。
+
+**（待提交，2026）** — BDFR-Net: Dual-Domain Feature Decoupling and Boundary Enhancement Network for Fetal Ultrasound Segmentation（`3612 Submission.pdf`；**已读全文，含 Table 3/4**）
+- 数据：IUGC 2024 胎儿超声；256×256，AdamW 1e-4，batch 16，**3 次独立运行**。
+- 结构：单骨干 PVT-B2 + **DDBE**（ECA 抑散斑 → 高频支 `DWT → LH/HL/HH → concat → 1×1 → 3×3 → BN → 转置卷积上采样 → 通道注意力`；低频支 `LL → 5×5 → BN → 上采样 → 通道注意力`；另加空间上下文支 CTX）+ skip 上的 **ACAM**（空间-通道双注意力跨层对齐）。
+- 消融（mean Dice / ASD / HD）：baseline 84.74 / 1.17 / 14.55 → +HF **85.53** → +HF+LF 85.95 → +HF+LF+CTX 86.37；仅 ACAM 85.21；完整 **86.83**。
+- 缺陷：待提交、未经同行评审；无 Params/FLOPs 逐模块对照；不报 HD95（用 HD）。
+- 与本项目关系：**与我们同域、同量级、单骨干，是最可迁移的一篇**。它把频率信息放在**特征级**而不是输入端，且只增加了很小的参数。若我们要改方向，应优先照这条走，而不是继续加双骨干。
+
+**IJCAI 2025** — WMREN: Wavelet Multi-scale Region-Enhanced Network for Medical Image Segmentation（**已读全文，含 Table 4/5**）
+- 结构：U-Net；编码器 4 个 WRMM（WRDM 双分支下采样 + MLKM），解码器 3 个 REM。
+- WRDM：左支 `[X_L, X_HL, X_LH, X_HH] = DWT(X)` → `σ(BN(Conv1×1(Concat(...))))`；右支并行 stride 卷积残差块；两支融合。
+- 解码器：**SAFM**（空间自适应融合，替代直接 concat）+ **CREM**（对比精炼增强，保留边界）。
+- 消融（Table 4，Synapse）：H-Net（纯小波下采样）81.29 / R-Net（纯卷积）82.59 / **WMREN 84.40**（HD95 15.65）。
+- 消融（Table 5）：baseline 82.72 → +SAFM 83.52（**HD95 反而升到 21.86**）→ +SAFM+CREM 84.40。
+- 训练：224×224，SGD 0.05，400 epoch，batch 24。
+- 缺陷：只在 Synapse/ACDC 这类 CT/MRI 上验证，无超声；无参数量对照。
+- 与本项目关系：**「小波单独不如卷积，互补才有效」的最直接证据**。这条否掉「把小波当下采样替身」的省事做法，也说明融合模块单独用（SAFM +0.80 但 HD95 变差）不足以改善边界。
+
+**IEEE JBHI 2025** — Syn-Net: Synergistic CNN-Transformer Network with Frequency-perception Cross-Fusion for Ultrasound Segmentation（**已读全文**）
+- 结构：ResNet34（局部）+ Swin（全局）同步三层双支；**FrCFusion**：通道分 n 组 → 每组一组 2D-DCT 基做频率感知（FcaNet 式）→ concat → FC + sigmoid → 通道重加权；另一路空间注意力 `Conv(S×R) → 通道压缩 → FC + sigmoid`；输出 `residual(cat[Fre_S, Fre_R, A])`。另有全尺度深监督，损失 `mean(BCE + weighted IoU)`。
+- 消融（正文）：FrCFusion 版本 1（通道 + 空间注意力）→ 版本 2（DCT 加在 R 支）→ 版本 3（DCT 加在 Hadamard 之后，**较差**）→ 最终版（DCT 处理所有空间/通道注意力）最好。
+- 缺陷：不报 HD95；无 Params 对照；单中心。
+- 与本项目关系：**超声域上「频域做注意力」有效的正面证据**，但它融合的是**局部 vs 全局两骨干**（互补性强），不是 raw vs HF（互补性弱）。可借鉴的是 **DCT 频域通道注意力**这一具体算子（对应融合第 3 档），不是它的双支结构。
+
+**Neural Networks 2024** — Medical image segmentation network based on multi-scale frequency domain filter（FDFUNet；**已读全文**）
+- 结构：DRDAC（双残差深度空洞卷积）替换 UNet 基础块；**MFDF** 线性频域滤波 `Y = IFFT(W ⊙ FFT(X))`，`W` 为可学习自适应权重矩阵；ASCA 通道注意力。
+- 缺陷：`W` 全图共享、**空间不敏感**，同一张图不同区域无法用不同频带；不报 HD95。
+- 与本项目关系：作为「特征级、无固定基、端到端学频带」的参考实现。如果要做可学习频带，优先考虑 WeaveSeg 那种**空间可变**的低通，而不是 MFDF 这种全局共享的 `W`。
+
+**ICCV 2025** — WeaveSeg: Weaving Segments with Spectral Refinement for Nuclei Instance Segmentation（**已读全文**）
+- 结构：**ASR**（Adaptive Spectral Detail Refinement）在解码器上采样路径做频域处理：学习型空间可变低通 `W_LP ∈ R^{K²×2H×2W}`（受 Hamming 窗隐式调制），`F_LP = PixelShuffle(W_LP ⊛ F_high)`；高频侧用 Local Similarity-Guided Resampling 恢复细节；与 **ICW**（迭代对比编织）形成闭环，ICW 输出回灌 ASR。
+- 缺陷：任务是**实例分割**（拉开实例间距），不是语义分割的边界增强；计算量大。
+- 与本项目关系：提供「**空间可变**频域滤波」的实现范式。若 Step 3 之后还要往下走，这是比固定 Haar 更进一步的候选；但优先级低于先把注入位置做对。
+
+**ICCV 2021** — FcaNet: Frequency Channel Attention Networks（背景文献，本批未重读 PDF，仅作为 DCT 通道注意力的出处）
+- 结论：证明 GAP 是 DCT 的最低频分量，用多个 DCT 分量替换 GAP 可得到更丰富的通道描述。
+- 与本项目关系：Syn-Net 的 FrCFusion 直接建在它上面；若我们采用融合第 3 档，实现应复用 FcaNet 的多谱基，而不是自己重推。
+
+---
+
 ## 通道/空间注意力（SE / CBAM）在医学分割的实际增益
 
 ### 结论（截至本轮）
@@ -285,6 +356,53 @@
 | 同图派生视图的双输入增益只有 +0.003~+0.008 Dice | MS-Net Table 1 | 相对最好单支 LV +0.0083、LA +0.0034 |
 | DWT 结构改动的增益大于双分支融合 | MS-Net Table 2 | DWT 单独 LA Dice +0.0296（双支合计才 +0.0034） |
 | 双分支在部分子结构上不如单分支 U-Net | MS-Net Table 3 | LA Dice：U-Net 0.9155、AIDAN 0.9140、双支 0.9061 |
+| 高频单独无法构成语义 | XNet Table 7 | HF only **54.50** vs raw 82.03；LF+HF 不融合也只有 75.82 |
+| 小波双支论文的增益混入编码器容量 | XNet 模型量表 | XNet 326M / 83G，raw-only 基线是**单编码器**，+2.74 不能全归频域融合 |
+| 参数量对齐后，「再加低频」是负面的 | GobletNet 正文消融 | 主分支已吃原图，再灌 `λ·LL` 反而变差 |
+| 小波单独不如纯卷积 | WMREN Table 4 | H-Net 81.29 / R-Net 82.59 / 两者并行 + 融合 84.40 |
+| 空间自适应融合单独用，Dice 涨但 HD95 仍差 | WMREN Table 5 | +SAFM 83.52（HD95 21.86），加 CREM 才到 84.40 |
+| 小波基与级数几乎不带来差异 | GobletNet 正文消融 | 多数数据集小波基差异 <1%；二级小波无显著提升；UroCell 例外差 8.89% |
+
+---
+
+## 近两年（2024–2026）通用融合方向：检索清单（**均为检索级，未读正文，不得作论据**）
+
+> 收录原因：老师要求「通用融合方法也可，只要能增强」。本节只记录**检索到的题目、venue、宣称机制**，用于决定「值不值得下 PDF」。
+> 纪律：**这些条目一律不能写进正文引用、不能用来支撑方案选择**，读完正文后按上面的格式升级为正式条目（带表号/节号的数字）。
+> 已确认 venue 的（FreqFusion、WTConv、DB-SAM、StitchFusion、Bouthillier、Reimers）经 arXiv abs 页 `Comments` 字段核对；标注「待核」的连 venue 都需再确认。
+
+### 表 1 · 融合算子（不新增骨干，只换融合方式）
+
+| 文献 | venue | 检索到的机制 | 读正文时核对 | 与本项目关系 |
+|---|---|---|---|---|
+| **FreqFusion**: Frequency-aware Feature Fusion for Dense Image Prediction | **NeurIPS 2024**（arXiv 2408.00364） | 上采样融合时按内容自适应分配低通/高通，并对边界处错位做内容感知补偿；宣称在 8 个 dense prediction 任务上 SOTA | 增益主要来自哪类边界像素；参数量与单步耗时增量；是否只在「上采样融合」处成立 | 我们的 `window`/`concat` 融合正好落在 112²/56² 上采样接点，缺的就是边界补偿；**算子级、不加骨干，吞吐可接受，优先级最高** |
+| **DB-SAM**: Delving into High Quality Universal Medical Image Segmentation | **MICCAI 2024 Oral**（arXiv 2505.12741，**待核**） | 双分支（CNN 局部 + ViT 全局）带交互，面向通用医学分割 | 双分支是共享权重还是异构；交互是「门控」还是「交叉注意力」；报不报 HD95 | 和我们的「原图骨干 + 方向子带侧路」同构；重点看它**怎么避免第二路退化成噪声注入** |
+| **StitchFusion**: Multi-Modal Medical Image Segmentation via Feature Stitching | **ACM MM 2025** | 不走「多模态各配一个编码器再融合」，而是把多模态特征在编码器内部直接 stitch，只训一个骨干 | 单骨干如何同时吃两路输入；无额外编码器时的参数与显存 | 直接对应我们的「一个 R50+ViT 骨干 + 一条轻侧路」设想；若成立，可省掉 121M 双骨干的一半参数 |
+| **Metric-Guided Feature Fusion**（题名待核） | **CVPR 2026 Findings**（**待核**） | 先**量化两路特征的互补性**，再据此决定怎么融 | 互补性度量怎么算、需不需要额外标注、能否离线算 | 能直接把「侧路 LH/HL/HH 到底有没有互补信息」变成一个 30 分钟就能算完的预实验，避免再盲跑 2.5 h/job |
+| **BiFPN**（加权双向特征金字塔） | CVPR 2020（已属旧作，列作基线对照） | 可学习权重的双向跨尺度聚合 | — | 我们的 `--cross_scale` 就是它的实现；旧作不重复投入 |
+
+### 表 2 · 信息源 / 频域注入（改「侧路喂什么」，不是改「怎么融」）
+
+| 文献 | venue | 检索到的机制 | 读正文时核对 | 与本项目关系 |
+|---|---|---|---|---|
+| **WTConv**: Wavelet Convolutions for Large Receptive Fields | **ECCV 2024**（arXiv 2407.05848） | 用「DWT → 只在低频上卷积 → IDWT」级联替代大核卷积，感受野近指数增长、参数近线性 | 分割任务上的增益是否集中在边界/形状指标；额外参数与耗时；小波基选择 | **最贴合的一条**：我们的侧路把低频全丢了、只喂 LH/HL/HH，WTConv 的做法相反——保留低频、把高频当细节补偿。若它的消融显示「低频不可省」，我们侧路的输入定义就错了 |
+| **FDANet**: Frequency-Domain Attention Network（题名/缩写待核） | 2025（**venue 待核**） | 频域注意力，把 FFT 幅度/相位分开调制 | 是否只在分类/检测上验证；分割有无下游结果 | 我们已否掉「输入级去噪」，但「特征级频域调制」是另一件事，可作小改动的候选 |
+| **Spectral U-Net**（2023，略早于时间窗，作机制参照） | SPIE Medical Imaging 2023 | 用可学习频谱变换替代固定小波做分解 | 与固定 Haar 的差异有多大 | 判断「固定 Haar 是否够用」，决定要不要引入可学习分解 |
+
+### 表 3 · 医学双分支 / 多模态（看第二路到底提供什么）
+
+| 文献 | venue | 检索到的机制 | 读正文时核对 | 与本项目关系 |
+|---|---|---|---|---|
+| **UltraMamba**（题名待核） | IEEE TMI 2026（**待核**） | 超声分割的 Mamba 骨干 | 参数量、显存、是否 2D；与 TransUNet 的对比较是否同数据同划分 | 若确实更强，是「换骨干」而非「加融合」，与当前路线（不动基座）冲突，只在长期规划里记一笔 |
+| **MulFF-Net** | IEEE Trans 2025（**待核**，见下方 PDF 清单 #4） | 多尺度特征融合 + 影像组学 | 融合位置、是否报 HD95/ASSD | 与 5 篇待下 PDF 清单合并处理，不重复下载 |
+| **MFuser**（题名待核） | CVPR 2025（**待核**） | 多模态融合的高效统一框架 | 是否支持「同图派生视图」这种弱互补情形 | 决定「同图派生双输入」这条路是否还有救 |
+
+### 表 4 · 方法学（决定结论能不能写进论文）
+
+| 文献 | venue | 要点 | 与本项目关系 |
+|---|---|---|---|
+| Bouthillier et al., *Accounting for Variance in Machine Learning Benchmarks* | **MLSys 2021**（arXiv 2103.03098） | 系统量化随机源（种子、数据顺序、初始化）对结论的影响，主张报告分布而非单点 | 我们当前所有结论都是单 seed；`status.md` §4.5.6 的 −0.41 点落在噪声带内，正是它描述的情形。**这是补 3 seeds 的直接依据** |
+| Reimers & Gurevych, *Reporting Score Distributions Makes a Difference* | **EMNLP 2017**（arXiv 1707.09861） | 用 LSTM 序列标注做例证：单次跑分排序与多次分布排序经常相反 | 说明「单 seed 上四项指标全差」不能写成「该方法更差」，只能写「未观察到增益」 |
 
 ---
 
@@ -315,7 +433,12 @@
 - [ ] 「skip 融合与注意力门控」补：是否存在「融合放在浅/中/深哪一级」的消融论文（**仍未找到任何一篇**；ESTAN/DCLA/WDFFU/DEFI-Net 全是「多级全开」→ 我们的融合位置单点扫描实验仍是空白点）。
 - [x] 「双骨干 / 双输入融合」补：MBFF-Net 全文（颈动脉 + 多分支）——**已读 PDF 全文**：单 ResNeXt101 编码器 + 每层三分支 + BPS，Table 1/2 全部数字已录入「颈动脉斑块超声分割：公开指标区间」一节。
 - [x] 「双骨干 / 双输入融合」补：MS-Net 全文（ISBI 2021，双输入双分支）——**已读 PDF 全文**：Table 1/2/3 全部数字已录入该节。
+- [x] 「频域融合」补：本地 8 篇 PDF（XNet、GobletNet、BDFR-Net、WMREN、Syn-Net、MFDF、WeaveSeg、FcaNet）已精读并录入「频域融合：2026-10-26 精读的 8 篇」一节；负面结果表已补 6 行。
+- [ ] 待办：确认 BDFR-Net 的最终 venue（`3612 Submission.pdf` 尚未见刊），以及 WMREN 的正式页码。
 - [ ] 所有条目补齐 venue/年份/DOI，并把「摘要级」条目升级为「全文级」。
+- [ ] 「近两年通用融合」清单降级为正式条目：按优先级读 **WTConv（ECCV 2024）→ FreqFusion（NeurIPS 2024）→ DB-SAM（MICCAI 2024）→ StitchFusion（ACM MM 2025）**，每篇只回答三个问题：①改的是「融什么」还是「怎么融」；②是否报边界距离指标；③额外参数量与单步耗时。
+- [ ] 用 Metric-Guided 的「互补性先量化」思路做一次**离线预实验**：只前向一次，算主路特征与侧路 LH/HL/HH 特征的互信息/余弦冗余度，决定侧路去留，不再靠盲跑 2.5 h/job 试错。
+- [ ] 方法学条目的落地：把 Bouthillier（MLSys 2021）的多随机源结论写进 `experiments.md` 的统计协议一节，明确「单 seed 结论只能用『未观察到增益』的措辞」。
 
 ---
 

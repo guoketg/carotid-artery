@@ -126,6 +126,47 @@ def check_equivalence(args, config, weights):
     return diff < 1e-5
 
 
+def check_gamma_grad(args, config, weights, steps=3):
+    """每个融合模块两个方向的 gamma 在第 1 步就应有非零梯度。
+
+    悬空子图（计算图上没有下游消费者）参数会拿到 .grad = None，而不是 0。
+    """
+    torch.manual_seed(1234)
+    net = DualEncoderTransUNet(config, img_size=args.img_size,
+                               num_classes=config.n_classes,
+                               levels=args.levels, fuse_op=args.fuse_op,
+                               window=args.window, dk_ratio=args.dk_ratio,
+                               bidir=bool(args.bidir),
+                               side_pretrained=bool(args.side_pretrained),
+                               cross_scale=bool(getattr(args, 'cross_scale', 0))).cuda()
+    net.load_from(weights=weights)
+    net.train()
+    opt = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+    ce = torch.nn.CrossEntropyLoss()
+    g = torch.Generator(device='cuda').manual_seed(0)
+    x = torch.randn(2, 1, args.img_size, args.img_size, device='cuda', generator=g)
+    y = (torch.rand(2, args.img_size, args.img_size, device='cuda', generator=g) > 0.7).long()
+
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+        loss = ce(net(x), y)
+        loss.backward()
+        for k, m in net.fuse.items():
+            cols = [f'F{k}:{type(m).__name__}']
+            for name in ('gamma_a', 'gamma_b'):
+                p = getattr(m, name, None)
+                if p is None:
+                    cols.append(f'{name} n/a')
+                elif p.grad is None:
+                    cols.append(f'{name} grad=None <-- 悬空')
+                else:
+                    cols.append(f'{name} v={p.item():+.2e} g={p.grad.item():+.2e}')
+            print('[grad] step%d  %s' % (step, '  '.join(cols)))
+        opt.step()
+    del net, opt
+    torch.cuda.empty_cache()
+
+
 def _timeit(fn, repeat=5, warmup=2):
     for _ in range(warmup):
         fn()
@@ -285,6 +326,7 @@ def main():
     p.add_argument('--batch_sizes', type=str, default='4,6,8')
     p.add_argument('--steps', type=int, default=30)
     p.add_argument('--skip_equiv', action='store_true')
+    p.add_argument('--check_grad', action='store_true', help='检查各融合层 gamma 的梯度是否非空')
     p.add_argument('--profile', action='store_true', help='逐段计时 + baseline 对比')
     p.add_argument('--profile_batch', type=int, default=4)
     args = p.parse_args()
@@ -311,6 +353,9 @@ def main():
         ok = check_equivalence(args, config, weights)
         if not ok:
             print('[equiv] WARNING: 等价性未通过，先别开夜间队列')
+
+    if args.check_grad:
+        check_gamma_grad(args, config, weights, steps=args.steps)
 
     if args.profile:
         profile_sections(args, config, weights, args.profile_batch)

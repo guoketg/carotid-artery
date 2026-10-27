@@ -64,6 +64,8 @@ parser.add_argument('--vit_name', type=str,
                     default='R50-ViT-B_16', help='select one vit model')
 parser.add_argument('--vit_patches_size', type=int,
                     default=16, help='vit_patches_size, default is 16')
+parser.add_argument('--main_input', type=str, default='raw', choices=['raw', 'll'],
+                    help='dual 主路输入：raw = 原图复制 3 通道（现状）；ll = 小波 LL 低频近似图（XNet 式低频/高频双流，高频全在侧路）')
 args = parser.parse_args()
 
 
@@ -87,8 +89,8 @@ if __name__ == "__main__":
             'num_classes': 9,
         },
         'Carotid': {
-            'root_path': r'F:\code\datasets\2D',
-            'list_dir': './lists/lists_Carotid',
+            'root_path': r'F:\code\datasets\Carotid2D',
+            'list_dir': './lists/lists_Carotid2D',
             'num_classes': 2,
         },
     }
@@ -124,6 +126,8 @@ if __name__ == "__main__":
                 snapshot_path += '_cs'
             if not args.bidir:
                 snapshot_path += '_uni'
+            if args.main_input=='ll':
+                snapshot_path += '_mainLL'
             if not args.side_pretrained:
                 snapshot_path += '_sp0'
             if args.tag:
@@ -131,6 +135,8 @@ if __name__ == "__main__":
         if 'lists_Carotid_dev' in args.list_dir.replace('\\', '/'):
             # 快筛子集的结果绝不能和全量结果混在一起
             snapshot_path += '_dev'
+        if 'lists_Carotid2D' in args.list_dir.replace('\\', '/'):
+            snapshot_path+='_c2d'
 
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
@@ -147,7 +153,8 @@ if __name__ == "__main__":
                                    window=args.window, dk_ratio=args.dk_ratio,
                                    bidir=bool(args.bidir),
                                    side_pretrained=bool(args.side_pretrained),
-                                   cross_scale=bool(args.cross_scale)).cuda()
+                                   cross_scale=bool(args.cross_scale),
+                                   main_input=args.main_input).cuda()
     elif args.fusion != 'none':
         from networks.wavelet_model import WaveletTransUNet
         net = WaveletTransUNet(config_vit, img_size=args.img_size,

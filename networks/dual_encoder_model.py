@@ -5,8 +5,10 @@
 - 主路只吃 C1（复制成 3 通道），侧路只吃 1 级 Haar 的 LH/HL/HH 方向子带；
 - 四个接点：★F1 112²/64、★F2 56²/256、★F3 28²/512、★F4 14²/768；
 - 两个骨干**交错执行**：每级先各自出特征、双向融合，融合结果再回到两条骨干往下走；
-- 融合单元 `A' = A + γ_A·GN(Attn(Q=A, K=V=B))`，γ 标量零初始化、输出投影零初始化
-  → 第 0 步与 baseline 逐元素等价（误差应 < 1e-5）。
+- 融合单元 `A' = A + γ_A·GN(Attn(Q=A, K=V=B))`，**只有 γ 标量零初始化**（输出投影正常
+  初始化，否则两个零相乘会互相锁死梯度）→ 第 0 步与 baseline 逐元素等价（误差 < 1e-5）；
+- 最深接点默认 `chain=True`：先更新侧路 B，主路再拿更新后的 B 重取 K/V（串联双向）。
+  并行双向时 B 没有下游消费者，`gamma_b` 恒为 0、该方向整支悬空。
 
 侧路直接复用 `ResNetV2`（其 PreActBottleneck 内部本来就是 GroupNorm，不需要 BN→GN 改写），
 并可复用主路同一份 ImageNet21k R50 权重初始化。
@@ -29,7 +31,7 @@ def _standardize(x, eps=1e-6):
     std = x.std(dim=(1, 2, 3), keepdim=True).clamp_min(eps)
     return (x - mean) / std
 
-
+# 获得高频图，先拼接，然后插值到224
 def build_detail_channels(x, size=224, log_domain=True):
     """(B,1,H,W) 归一化原图 → (B,3,size,size) 的 LH / HL / HH 方向子带。
 
@@ -46,6 +48,21 @@ def build_detail_channels(x, size=224, log_domain=True):
         outs.append(_standardize(d))
     return torch.cat(outs, dim=1)
 
+# 获得低频图，插值到224
+def build_ll_image(x, size=224, log_domain=True):
+    """(B,1,H,W) 归一化原图 → (B,1,size,size) 的 LL 低频近似图。
+
+    与 build_detail_channels 同域（log1p 后做 1 级 Haar），取近似子带 LL（112²）
+    双线性上采样回 size，逐样本标准化。Haar 下「只保留 LL 的重建」就是逐 2 倍
+    上采样，所以这里直接上采样等价于 IDWT（高频置零）的低频图。
+    """
+    # 使用对数预处理
+    if log_domain:
+        x_pos = x - x.amin(dim=(2, 3), keepdim=True) + 1e-3
+        x = torch.log1p(x_pos)
+    approx, _ = haar_dwt(x)
+    ll = F.interpolate(approx, size=(size, size), mode="bilinear", align_corners=False)
+    return _standardize(ll)
 
 # ---------------------------------------------------------------- 窗口工具
 
@@ -74,14 +91,16 @@ class BidirCrossAttention(nn.Module):
     mode='global'：全图 token 注意力。
     两个方向共享同一份 qkv 投影（A 算一份、B 算一份，然后互喂），
     但输出投影各一套；`bidir=False` 时只改写 A（R7 单向对照）。
+    `chain=True` 时改为串联：先更新 B，再用更新后的 B 重取 K/V 更新 A。
     """
 
-    def __init__(self, dim, heads=4, dk_ratio=2, window=8, mode="window", bidir=True):
+    def __init__(self, dim, heads=4, dk_ratio=2, window=8, mode="window", bidir=True,chain=False):
         super().__init__()
         d = max(heads, dim // dk_ratio)
         d = max(heads, (d // heads) * heads)
         self.dim, self.d, self.heads = dim, d, heads
         self.window, self.mode, self.bidir = window, mode, bidir
+        self.chain = chain and bidir
 
         self.qkv_a = nn.Conv2d(dim, 3 * d, 1)
         self.qkv_b = nn.Conv2d(dim, 3 * d, 1)
@@ -91,7 +110,6 @@ class BidirCrossAttention(nn.Module):
         self.norm_b = nn.GroupNorm(1, dim)
         self.gamma_a = nn.Parameter(torch.zeros(1))
         self.gamma_b = nn.Parameter(torch.zeros(1))
-
 
     def _split_heads(self, t):
         # (N, L, d) → (N, heads, L, d/heads)。N 是 batch×窗数，L 是 token 数
@@ -114,41 +132,38 @@ class BidirCrossAttention(nn.Module):
     def forward(self, A, B):
         qa, ka, va = self.qkv_a(A).chunk(3, dim=1)
         qb, kb, vb = self.qkv_b(B).chunk(3, dim=1)
+        b_, _, h, w = A.shape
 
         if self.mode == "window":
             # ---- 窗内注意力：112²/56² 用。全图 token 太多，切成 ws×ws 窗各自算
-            b_, _, h, w = A.shape
             ws = self.window
             gh, gw = h // ws, w // ws          # 窗的行/列数，h、w 需能被 ws 整除
-            
-            # (B,3d,H,W) → (B*gh*gw, ws², 3d)：每个窗内是 ws² 个 token
-            qa, ka, va = (window_partition(t, ws) for t in (qa, ka, va))
-            qb, kb, vb = (window_partition(t, ws) for t in (qb, kb, vb))
-            # A 出 Q、B 出 K/V：主路在同一空间位置上向侧路「取内容」
-            out_a = self._attend(qa, kb, vb)
-            # (B*gh*gw, ws², d) → (B,d,H,W)，拼回原图布局
-            out_a = window_reverse(out_a, ws, gh, gw, b_, self.d)
-            if self.bidir:
-                # 反向再来一次：B 出 Q、A 出 K/V
-                out_b = self._attend(qb, ka, va)
-                out_b = window_reverse(out_b, ws, gh, gw, b_, self.d)
+            to_tok = lambda *ts: tuple(window_partition(t, ws) for t in ts)
+            back = lambda t: window_reverse(t, ws, gh, gw, b_, self.d)
         else:
             # ---- 全局注意力：28²/14² 用，token 数（784 / 196）可承受全图自注意力
-            b_, _, h, w = A.shape
-            # (B,3d,H,W) → (B,H*W,3d)，把空间位置拉平成 token 序列
-            qa, ka, va = (t.flatten(2).transpose(1, 2) for t in (qa, ka, va))
-            qb, kb, vb = (t.flatten(2).transpose(1, 2) for t in (qb, kb, vb))
-            # 同样 A 出 Q、B 出 K/V；算完 reshape 回 (B,d,H,W)
-            out_a = self._attend(qa, kb, vb).transpose(1, 2).reshape(b_, self.d, h, w)
-            if self.bidir:
-                # 反向：B 出 Q、A 出 K/V
-                out_b = self._attend(qb, ka, va).transpose(1, 2).reshape(b_, self.d, h, w)
+            to_tok = lambda *ts: tuple(t.flatten(2).transpose(1, 2) for t in ts)
+            back = lambda t: t.transpose(1, 2).reshape(b_, self.d, h, w)
 
-        # 这里不能出现两个零乘因子，否则Proj和gamma的输出全都是0，梯度被截断
+        # (B,3d,H,W) → (B*gh*gw, ws², 3d) 或 (B,H*W,3d)
+        qa, ka, va = to_tok(qa, ka, va)
+        qb, kb, vb = to_tok(qb, kb, vb)
+
+        # 这里不能出现两个零乘因子，否则 Proj 和 gamma 的输出全都是 0，梯度被截断
+        if self.chain:
+            # 串联双向：先用融合前的 B 更新侧路，主路再拿更新后的 B 重取 K/V。
+            # 并行写法下最深接点的 B 没有任何下游消费者，gamma_b 恒为 0、整支悬空。
+            B2 = B + self.gamma_b * self.norm_b(self.proj_b(back(self._attend(qb, ka, va))))
+            kb, vb = to_tok(*self.qkv_b(B2).chunk(3, dim=1)[1:])
+            out_a = back(self._attend(qa, kb, vb))
+            A2 = A + self.gamma_a * self.norm_a(self.proj_a(out_a))
+            return A2, B2
+
+        out_a = back(self._attend(qa, kb, vb))
         A2 = A + self.gamma_a * self.norm_a(self.proj_a(out_a))
         if not self.bidir:
             return A2, B
-        B2 = B + self.gamma_b * self.norm_b(self.proj_b(out_b))
+        B2 = B + self.gamma_b * self.norm_b(self.proj_b(back(self._attend(qb, ka, va))))
         return A2, B2
 
 
@@ -202,12 +217,13 @@ class BidirDeform(nn.Module):
     """L3 档：可变形大核跨支聚合（D-LKA 思路）。
 
     一支特征先用 1×1 降到 d 维，再由 3×3 预测 k×k 采样偏移，在**另一支**上做
-    可变形卷积。采样点跟着解剖边界走，而不是固定网格 —— 这直接针对 A3 的
-    「固定网格 + 只在 14² 一点融合」两个缺陷。
+    可变形卷积。采样点跟着解剖边界走，而不是固定网格 —— 这直接针对旧版三通道＋
+    小波引导注意力「固定网格 + 只在 14² 一点融合」两个缺陷。
 
     两个方向共用降维投影（A→低维既作自身的偏移预测源，又作对方的内容源），
-    因此参数量约为双向各建一套的一半。偏移卷积零初始化 → 初始等价于固定网格；
-    输出投影零初始化 + γ=0 → 第 0 步与 baseline 逐元素相同。
+    因此参数量约为双向各建一套的一半。偏移卷积零初始化 → 初始等价于固定网格
+    （等价于零偏移的常规卷积，输出非零）；输出投影正常初始化，只靠 γ=0 保证
+    第 0 步与 baseline 逐元素相同。
     """
 
     def __init__(self, dim, dk_ratio=2, k=5, bidir=True):
@@ -296,11 +312,13 @@ class BidirAFF(nn.Module):
         return A2, B2
 
 
-def make_fusion(kind, dim, heads, dk_ratio, window, bidir):
+def make_fusion(kind, dim, heads, dk_ratio, window, bidir, chain=False):
     if kind == "window":
-        return BidirCrossAttention(dim, heads, dk_ratio, window, mode="window", bidir=bidir)
+        return BidirCrossAttention(dim, heads, dk_ratio, window, mode="window",
+                                   bidir=bidir, chain=chain)
     if kind == "global":
-        return BidirCrossAttention(dim, heads, dk_ratio, 1, mode="global", bidir=bidir)
+        return BidirCrossAttention(dim, heads, dk_ratio, 1, mode="global",
+                                   bidir=bidir, chain=chain)
     if kind == "gate":
         return BidirGate(dim, bidir=bidir)
     if kind == "concat":
@@ -324,7 +342,7 @@ class DualEncoderTransUNet(VisionTransformer):
 
     def __init__(self, config, img_size=224, num_classes=2, levels="1,2,3,4",
                  fuse_op="auto", window=8, dk_ratio=2, bidir=True,
-                 side_pretrained=True, cross_scale=False):
+                 side_pretrained=True, cross_scale=False,main_input="raw"):
         super().__init__(config, img_size, num_classes)
         self.img_size = img_size
         self.levels = [int(v) for v in str(levels).split(",") if str(v).strip()]
@@ -332,6 +350,7 @@ class DualEncoderTransUNet(VisionTransformer):
         self.bidir = bidir
         self.side_pretrained = side_pretrained
         self.cross_scale = cross_scale
+        self.main_input=main_input
 
         width = int(64 * config.resnet.width_factor)
         hidden = config.hidden_size
@@ -361,8 +380,10 @@ class DualEncoderTransUNet(VisionTransformer):
                 kind = "window" if res >= 112 else "global"
             else:
                 kind = fuse_op
+            # 最深的那个接点用串联双向：并行写法下该层的 B 没有下游消费者
+            chain = bool(bidir) and lv == max(self.levels) and kind in ("window", "global")
             self.fuse[str(lv)] = make_fusion(
-                kind, dim_of[lv], heads_of[lv], dk_ratio, win_of[lv], bidir)
+                kind, dim_of[lv], heads_of[lv], dk_ratio, win_of[lv], bidir, chain=chain)
 
         self._pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)
 
@@ -463,11 +484,19 @@ class DualEncoderTransUNet(VisionTransformer):
         return t, [f3, f2, f1]
 
     def forward(self, x):
+
+        # 输入的修改
         if x.dim() == 3:
             x = x.unsqueeze(1)
+        
         if x.size(1) == 1:
             raw = x
-            main_in = x.repeat(1, 3, 1, 1)
+
+            if self.main_input == "ll":
+                # XNet 式：主路只吃低频近似图，高频信息全在侧路
+                main_in = build_ll_image(raw, self.img_size).repeat(1, 3, 1, 1)
+            else:
+                main_in = x.repeat(1, 3, 1, 1)
         else:
             raw = x[:, 0:1]
             main_in = x[:, 0:3]
