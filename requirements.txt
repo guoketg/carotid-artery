@@ -1,12 +1,13 @@
-# 运行环境：Python 3.12.10（项目根目录 venv）
+# 运行环境：Python 3.11.5（项目根目录 venv）
 # GPU 版 torch 请按本机 CUDA 版本选择官方 index 安装，例如：
 #   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
 # 注意：不要安装 torch==1.4.0（旧版与本仓库的 torch 2.x 代码不兼容）
+# 若在 Python 3.12 上重建环境，numpy 需 >=2.5.0、scipy 需 >=1.18.0（当前 3.11 装不了这两个版本）
 
 torch==2.14.1
 torchvision==0.29.1
-numpy==2.5.2
-scipy==1.18.1
+numpy==2.4.6
+scipy==1.17.1
 
 # 数据读取（NIfTI / HDF5）
 h5py==3.16.0

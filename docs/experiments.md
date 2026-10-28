@@ -158,6 +158,123 @@
 - 统计：按病例配对 Wilcoxon（同一病例的多张切片先取均值再配对），每子集独立；不跨设备合并。
 - 主指标 **HD95 / ASSD**，Dice 为次要门槛；DeltaArea 只报带符号均值与 |DeltaArea|，不做显著性。
 
+### 1.7 2026-10-28 夜：融合算子横评 + DDBE 门槛验证 + 基线补跑（**已入队**）
+
+队列脚本：[scripts/queue_c2d_fuse.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/queue_c2d_fuse.ps1)（第三个接力队列，2026-10-28 00:54 以 WMI 启动，pid 34168；等主队列 `queue_c2d.ps1` 与边缘队列 `queue_c2d_edge.ps1` 全部退出、GPU 空闲后自动开跑）。统一口径 `$common`：SPARC / bs4 + ga2 / 200 epoch / `--eval_test_every 5`，取 ep150，与 1.6 及既有队列完全一致。
+
+**本次改了哪些代码**（DDBE 实现，冒烟全过）：
+
+| 文件 | 改动 |
+|---|---|
+| [networks/ddbe.py](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py)（新增） | BDFR-Net 式 DDBE：ECA → HF 支（多通道 Haar DWT 取 LH/HL/HH → concat → 1×1 → 3×3+BN → 转置卷积上采样 → SE）/ LF 支（LL → 5×5+BN → 双线性上采样 → SE）/ CTX 支（7×7+BN → 自门控）→ concat → 1×1（**唯一零初始化点**）→ CBAM → 残差加回。level3 参数量 0.440 M |
+| [networks/vit_seg_modeling.py](file:///e:/mkl/code/python_code/carotid-artery/networks/vit_seg_modeling.py) | `DecoderCup` 加 `ddbe/ddbe_idx` 挂载点（forward 中在第 N 级 decoder_block 输出后调用）；`VisionTransformer` 加 `ddbe_level` 参数，**在全部基础权重初始化之后**再建 DDBE（保证同 seed 基础权重逐位不变，RNG 对齐） |
+| [train.py](file:///e:/mkl/code/python_code/carotid-artery/train.py) | 加 `--ddbe 0~4`（仅 baseline 接了，dual 会 parser.error）；快照名追加 `_ddbe<N>`（拼在 fusion 后缀之后、dual 块之前） |
+
+冒烟结论（临时脚本 `Temp\smoke_ddbe.py`，已跑 ALL PASS）：① 同 seed 基础权重与不挂 DDBE 版本 `torch.equal`（DDBE 仅新增 35 个张量）；② eval 恒等起步 `max|Δ| = 0`（零初始化 → 初始 logits 与基线逐位相等）；③ train 模式前反向正常；④ level 1~4 四级 forward 均通（解码器四级实际输出 28/56/112/224，level3 = 112×112/64ch，与论文「挂在哪级」无关紧要——先用 level3 做门槛验证）。
+
+**队列 6 个 job（顺序 = 优先级）**：
+
+| # | job | 配置 | 快照目录（与 train.py 逐字对齐） | 对照 | 预计完成 |
+|---|---|---|---|---|---|
+| 1 | `faff1234_sparc` | dual `--fuse_op aff`（AFF MS-CAM，0.47 M） | `..._224_SPARC_dual_L1234_aff_c2d` | d1234 auto（已完成） | ≈ 07:20 |
+| 2 | `fgate1234_sparc` | dual `--fuse_op gate`（逐元素门控，R6 对照） | `..._224_SPARC_dual_L1234_gate_c2d` | 同上 | ≈ 09:00 |
+| 3 | `fdeform1234_sparc` | dual `--fuse_op deform`（D-LKA 可变形大核，3.69 M） | `..._224_SPARC_dual_L1234_deform_c2d` | 同上 | ≈ 10:40 |
+| 4 | `ddbe3_1234_sparc` | baseline `--ddbe 3`（DDBE 挂 112²/64ch 级） | `..._224_SPARC_ddbe3_c2d` | A0 基线 seed1234 | ≈ 12:00 |
+| 5 | `b1234_sparc` | A0 单通道原图基线 seed1234 **重建** | `..._224_SPARC_c2d` | —（见下方发现） | ≈ 13:15 |
+| 6 | `b3407_sparc` | A0 基线 seed3407 **补跑** | `..._224_s3407_SPARC_c2d` | —（见下方发现） | ≈ 14:30 |
+
+排班依据与两个意外发现：
+
+- **aff / gate / deform 零实现成本**（算子已在 `networks/` 实现且过零初始化等价性），先横评融合算子，与已完成的 `d1234_sparc`（auto）同 seed 配对；
+- **发现 1**：A0 基线 seed1234 的新口径产物（`..._SPARC_c2d/` 的 `test_curve.csv`、`metrics.csv`，§3 epoch 选择即依据它）在本机已不存在——全盘（C:/E:）搜不到。ddbe3 的病例级 Wilcoxon 必须有同 seed 配对对照，故**补跑 job 5**恢复之（aggregate 数字 status.md §3.1 已存档，跑完核对是否复现 0.9049/0.1431/0.3896）；
+- **发现 2**：`b3407_sparc` 上一轮在 epoch≈50 被中途杀掉（log 止于 iteration 2163、无 `metrics.csv`），但 `queue_c2d.ps1` 的 `-Skip` 把它跳过了、status.md 仍写「排队」——故**补跑 job 6**；
+- **本轮不碰 QKV、不上四级全量 DDBE**：DDBE 只做 level3 单级门槛验证，过了门槛再谈全量（写在跑之前，避免事后解释）。
+
+判定规则（跑之前写死）：
+
+| 检查 | 通过条件 | 不通过时的处置 |
+|---|---|---|
+| aff / gate / deform vs d1234 auto（同 seed 配对） | 某算子 HD95 下降 ≥ 0.5 mm 且 p < 0.05 | 无显著差异 → 融合算子不敏感，维持 auto，横评线关闭 |
+| ddbe3（DDBE 单级门槛） vs A0 基线 seed1234 | \|ΔDice\| ≥ 0.005 **或** HD95 显著下降（p < 0.05，病例级 Wilcoxon） | 不过门槛 → DDBE 线停止投入，不排四级全量 |
+| b1234 重建 vs status.md §3.1 存档 | ep150 四项指标复现（Dice 差 < 0.005） | 不复现 → 以重建产物为准并核查口径 |
+
+### 1.8 2026-10-28 三个队列跑完：ep150 横评结果与病例级 Wilcoxon（**已收口**）
+
+三个队列（`queue_c2d.ps1` 主队列 + `queue_c2d_edge.ps1` 边缘队列 + `queue_c2d_fuse.ps1` 融合队列）全部执行完毕。统一口径：SPARC 官方划分 / bs4 + ga2 / 200 epoch（poly 绑死）/ `--eval_test_every 5`，判定点 **ep150**（存档 `epoch_149.pth`）。
+
+**故障与修复**：
+
+- `faff1234`（dual `--fuse_op aff`）在 epoch 5 首次测试时崩溃（exit 1，仅存活 1.8 min）：`_MSCAM` 全局支路的 GroupNorm 在 GAP 后 1×1 空间 + eval batch=1 时校验失败（`input size [1, 8, 1, 1]`）。**修复**：[dual_encoder_model.py](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py) 的 `_MSCAM.glb` 去掉 GroupNorm，改带 bias 的 SE 式 MLP（局部支路保留 GN）；冒烟（eval batch1 前向 + train batch4 反向）通过，批次 0 重跑。
+- **时点错位**：`trainer.py` 末尾 `metrics.csv` 是 ep199 的逐切片指标，与 ep150 判定点不符 → 用 `epoch_149.pth` 重算。[scripts/eval_carotid.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_carotid.py) 已扩展：`build_model` 支持三分支（baseline/dual/fusion + edge_in/ddbe），新增病例级聚合 `_group_by_case`（同病例多切片先取均值再配对，§1.6 口径）与 CLI 全参数；批量驱动 [scripts/eval_batch_ep149.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_batch_ep149.ps1)。全部 11 个有效快照重算完毕，每个 ~0.3 min，逐切片汇总与 `test_curve.csv` ep150 完全吻合（交叉验证通过）。
+
+**ep150 逐切片汇总**（n=160，SPARC test；Dice / ASSD mm / HD95 mm）：
+
+| job | 配置 | Dice | ASSD | HD95 |
+|---|---|---|---|---|
+| b1234 | A0 基线 seed1234 | 0.8995 | 0.1498 | 0.3997 |
+| b2024 | A0 基线 seed2024 | 0.9027 | 0.1498 | 0.4146 |
+| b3407 | A0 基线 seed3407 | 0.9026 | 0.1508 | 0.4303 |
+| dauto1234 | dual auto（L1234，双向）s1234 | 0.9040 | 0.1476 | 0.4064 |
+| dauto2024 | dual auto s2024 | 0.9011 | 0.1468 | 0.4036 |
+| dauto3407 | dual auto s3407 | 0.8985 | 0.1570 | 0.4461 |
+| gate1234 | dual gate s1234 | 0.9035 | 0.1434 | 0.4034 |
+| deform1234 | dual deform s1234 | **0.9061** | **0.1412** | **0.3788** |
+| ddbe3 | baseline `--ddbe 3` s1234 | 0.9008 | 0.1513 | 0.4404 |
+| edge1234 | baseline `--edge_in 1` s1234 | 0.9020 | 0.1476 | 0.3973 |
+| edgedual | dual auto + edge_in s1234 | **0.9072** | 0.1416 | 0.3895 |
+| faff1234 | dual aff s1234 | ❌ 崩溃（见上），批次 0 重跑 | | |
+
+**病例级配对 Wilcoxon**（43 例，同病例切片先均值再配对；基线 = 对应 seed 的 A0）：
+
+| 比较 | ΔDice（病例级） | p(Dice) | p(ASSD) | p(HD95) |
+|---|---|---|---|---|
+| dauto1234 vs b1234 | +0.0038 | 0.209 | 0.294 | 0.385 |
+| dauto2024 vs b2024 | +0.0000 | 0.816 | 0.586 | 0.385 |
+| dauto3407 vs b3407 | **−0.0049** | **0.0036** ✗ | **0.0097** ✗ | 0.104 |
+| gate1234 vs b1234 | +0.0027 | 0.663 | 0.742 | 0.333 |
+| deform1234 vs b1234 | +0.0059 | 0.113 | 0.154 | 0.276 |
+| ddbe3 vs b1234 | −0.0003 | 0.680 | 0.881 | 0.093 |
+| edge1234 vs b1234 | +0.0027 | 0.595 | 0.447 | 0.891 |
+| edgedual vs b1234 | +0.0062 | 0.069 | 0.223 | 0.791 |
+
+（各 log 中还出现 `delta_area` p<0.001 的行：A0 基线系统性低估面积（−0.90 mm²），多数变体向 0 靠拢——这是**面积偏差校正**方向的真实差异，但反映的是偏置而非边界精度，不计入判定。）
+
+**结论（对照 §1.7 判定规则）**：
+
+1. **融合算子横评（aff/gate/deform vs auto）：全部未通过**（无算子达 HD95 降 ≥0.5 mm 且 p<0.05）→ 融合算子不敏感，维持 auto；deform 是唯二方向一致为正的点（ΔDice +0.0059、HD95 −0.019 mm）但 p=0.113。
+2. **双骨干 3-seed：无增益**。A0 三 seed 均值 0.9016 vs dual auto 0.9012；且 s3407 上 dual **显著变差**（Dice p=0.0036、ASSD p=0.0097，方向为负）。在当前融合设计下双骨干线判负——增益若存在也掩埋在 seed 方差之下。
+3. **ddbe3 单级挂载：未过门槛**（ΔDice −0.0003，HD95 反而 +0.078 mm）→ 与用户判断一致：别人的论文（BDFR-Net）是**四级全挂 + 每级 ACAM**，单级挂载证明不了什么，转批次 1（§1.9）。
+4. **edge 线索保留**：edgedual 是全场最佳点（0.9072/0.1416/0.3895，p=0.069 边缘），deform 次之；两者都只是方向证据，不作为结论。
+
+## 1.9 文献复现计划（2026-10-28 用户批准，批次 0–4）
+
+**复现口径**：本项目只有 Carotid2D 数据（SPARC/Zhongnan 两子集），无法复现论文原数据集 → 「复现」定义为**把论文核心模块移植进现有 TransUNet 管线**，与 A0 基线同口径（官方划分 / bs4+ga2 / 200 epoch poly / 判定点 ep150 / SPARC / seed1234），用 §1.8 的病例级配对 Wilcoxon 比较。基线锚点：A0 s1234 = 0.8995 / 0.1498 / 0.3997。
+
+**判定规则（跑之前写死，每批次同一模板）**：
+
+| 通过条件 | 不通过时的处置 |
+|---|---|
+| \|ΔDice\| ≥ 0.005（病例级）**或** HD95 下降 ≥ 0.5 mm 且 p < 0.05 | 该论文的模块在本任务无效 → 记录负面结果，该线停止投入 |
+
+| 批次 | 内容 | 出处（pdf/） | 实现要点 | 状态 |
+|---|---|---|---|---|
+| **0** | faff 重跑 + 全量 ep149 病例级统计 | 本项目 | AFF GroupNorm 修复（§1.8）；`eval_batch_ep149.ps1` 已跑完 11 快照 | 统计 ✅ 2026-10-28；faff 重跑已入队（队列第 3 位） |
+| **1** | ① `ddbe4`：解码器**四级全挂** DDBE ② `ddbefull`：DDBE×4 + ACAM skip 对齐 | 3612 Submission.pdf（BDFR-Net）p.3「four cascaded stages, each comprising … DDBE … ACAM」、p.5「repeats across all four resolution levels」 | 复用 [networks/ddbe.py](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py)（零初始化恒等起步，保同 seed 等价）；ddbe4 = `--ddbe 4` 语义扩展为全四级；ACAM = 解码器逐级对 skip 特征做跨级语义对齐再拼接 | 已实现 ✅（冒烟 5 项全过，参数量 105.3M→114.8M）；已入队在训 |
+| **2** | GobletNet 式：单主干 + 轻量 HF 支 + FAM 逐层融合 | GobletNet.pdf Eq.5 / Table VI / Table X | 单 R50+ViT 主干（不翻容量）：HF 图 `H=HL+LH+HH+λ·LL`（λ=0.3，forward 内现算）→ 轻量 HF 支（32@112/64@56/128@28，+0.29M）→ FAM 逐级与 skip 互标定（官方通道不等适配版，+0.84M）→ `skip = x1_fa + inject(x2_fa)`（inject 零初始化，对应官方 decoder cat(x2_fa)） | 已实现 ✅（冒烟 5 项全过：同 seed 对齐 / 恒等起步 max\|Δ\|=0 / 门控时序验证 / 参数 105.3M→106.5M / λ 回灌行为；详见 §1.9 执行记录②）；待批次 1 结论后入队 |
+| **3** | Syn-Net FrCFusion 融合算子 | Syn-Net.pdf | 落地为 `--fuse_op dct`（频域通道混合），接入现有 dual 四接点框架 | 待实现 |
+| **4** | WMREN WRDM 双分支 DWT | WMREN.pdf | 双分支（原图 + DWT 子带）+ WRDM 式权重残差蒸馏融合 | 待实现 |
+| 搭车 | XNet 便宜变体 `--main_input ll`（主路吃 LL 低频图） | XNet.pdf | 零新代码，仅改输入构成 | 已入队（队列第 4 位） |
+
+不复现：WeaveSeg / FcaNet / MFDF / XNet 全量（模块重、与现有框架重叠度高、预期增益低，理由见 [literature.md](literature.md)）。
+
+执行顺序：批次 0 收尾（faff 重跑）→ 批次 1（ddbe4 → ddbefull，先四级 DDBE 消融出「挂几层」结论，再加 ACAM）→ 视结果决定批次 2–4 排期。队列脚本沿用 [queue_c2d_fuse.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/queue_c2d_fuse.ps1) 模板（接力等待 + jobs 数组 + WMI 启动），WMI 启动纪律不变。
+
+> **执行记录**：批次 0+1 已合并为一个队列 [queue_c2d_repro.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/queue_c2d_repro.ps1)，2026-10-28 17:16 经 WMI 启动（pid 26772），4 job 顺序：ddbe4 → ddbefull → faff 重跑 → mainLL 搭车，约 12 h；快照名 `_ddbe4` / `_ddbe4_acam`；status CSV `logs/queue/queue_c2d_repro_status.csv`。队列跑完后按 §1.9 判定规则对 4 个快照跑 ep149 eval + 病例级 Wilcoxon。
+>
+> **执行记录②（批次 2 实现，2026-10-28 18:00）**：GobletNet 移植完成，趁 GPU 忙碌先行实现（不占队列）。改动：[networks/hf_branch.py](file:///e:/mkl/code/python_code/carotid-artery/networks/hf_branch.py)（新建，HFBranch + FAM + `HF_DET_CHANNELS=(32,64,128)`）；[networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py) `build_hf_image` 加 `lf_weight=0.0` 参数（λ·LL 回灌，默认 0 与 edge_in 逐位一致）；[networks/vit_seg_modeling.py](file:///e:/mkl/code/python_code/carotid-artery/networks/vit_seg_modeling.py) `VisionTransformer` 加 `hf_branch/hf_lambda`（挂载在 ddbe/acam 之后，RNG 纪律；forward 浅→深交错：det 被 FAM 重标定后继续下采样，贴官方「FA 后特征继续进下一层」）；[train.py](file:///e:/mkl/code/python_code/carotid-artery/train.py) `--hf_branch / --hf_lambda 0.3`（仅 baseline，快照后缀 `_hfbr3`）；[scripts/eval_carotid.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_carotid.py) 同名参数。冒烟 `Temp\smoke_hfbr.py` 5 项全过：①同 seed 基础权重对齐（96 新张量，0 missing/mismatch）②恒等起步 max|Δlogits|=0 ③门控时序：step 0 仅 gamma/inject 有梯度（det 链在两道零门后，LoRA B=0 同款一步延迟，预期行为），3 步 SGD 后全链解锁 ④参数 105.276M→106.482M（+1.206M）⑤λ=0.3 回灌改变 HF 图且有限值。入队命令（批次 1 结论后）：`--hf_branch 1 --hf_lambda 0.3`，快照 `*_SPARC_hfbr3_c2d`。
+>
+> **执行记录③（评测流水线就绪，2026-10-28 17:55）**：`eval_batch_ep149.ps1` 追加 4 个新 job 条目（ddbe4 / ddbefull / faff / mainll，Baseline 均配 b1234 的 metrics_ep149.csv，DryRun 验证快照路径全部正确）；新增 [watch_eval_repro.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/watch_eval_repro.ps1)（WMI 启动，pid 16200）每 5 min 轮询 `queue_c2d_repro_status.csv`，某 job 行落地（exit 0）即自动跑其 ep149 eval + 病例级 Wilcoxon，4 job 处理完自动退出；watcher 日志 `logs/queue/watch_eval_repro.log`，各 job 评测日志 `logs/queue/watch_eval_<job>.log`。进度实测：ddbe4 ~120 iter/min（比 ddbe3 的 290 iter/min 慢，四级挂载计算量更大），17600 iter 预计 ~19:45 跑完，全队列 ~01:30。
+
 
 ## 2. 评估协议
 
@@ -210,6 +327,10 @@
 # 夜间队列（顺序执行，一次只跑一个）
 powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -DryRun   # 只打印计划
 powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1            # 正式执行
+
+# 融合算子横评 + DDBE 门槛 + 基线补跑（第三个接力队列，2026-10-28 00:54 已 WMI 启动 pid 34168，详见 §1.7）
+powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_fuse.ps1 -DryRun   # 只打印 6 条计划
+powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_fuse.ps1            # 正式执行（等主/edge 队列全退出后自动接力）
 
 # dev 快筛（**已撤销，仅保留备用**；16 个单变量 job，约 4 h）
 # .\venv\Scripts\python.exe scripts\build_dev_subset.py --subset SPARC --ratio 0.4

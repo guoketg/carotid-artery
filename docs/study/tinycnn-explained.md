@@ -1,0 +1,121 @@
+# TinyCNN 讲解：门槛实验里那个"小网络"到底是什么
+
+配套代码：[scripts/probe_edge_signal.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py)（原始版）
+和 [scripts/probe_fusion_axis.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_fusion_axis.py)（改造版 TinySeg）。
+概念背景（边缘图是什么、门槛实验为什么这么设计）见 [edge-fusion-explained.md](edge-fusion-explained.md)。
+
+---
+
+## 0. 一句话版
+
+TinyCNN 是一个 **0.06M 参数的极简分割网络**（正式模型 TransUNet 是 105M，它是它的 1/1700）。
+它存在的唯一目的：**用几分钟的训练快速回答"多喂一个高频通道，到底有没有信息增量"**。
+它的绝对成绩很差（Dice ≈ 0.49），但这不重要——我们只看**同一次实验里两个 TinyCNN 的差值**。
+
+## 1. 为什么要用这么小的网络
+
+正式模型 TransUNet 跑一轮实验要 200 epoch、十几个小时。如果每次只想验证
+"一个输入通道有没有用"就动用正式模型，试错成本太高。
+
+逻辑是这样的：
+
+```
+如果连 TinyCNN 都吃不出 HF 通道的增益 → 大概率说明 HF 通道本身没多少信息，正式模型也白搭；
+如果 TinyCNN 能吃出增益（哪怕只有 1~2 个点）→ 值得花十几个小时上正式模型验证。
+```
+
+小网络 = 便宜的"信息是否存在"探测器。它不需要分好，只需要**两个变体之间可比**。
+
+## 2. 逐层拆解（原始版 TinyCNN）
+
+代码在 [probe_edge_signal.py 第 121-137 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L121-L137)。
+输入 `(B, in_ch, 224, 224)`，输出 `(B, 2, 224, 224)`（背景/斑块两类）。
+
+| 层 | 运算 | 输出尺寸 | 说明 |
+|---|---|---|---|
+| conv1 | 3×3, stride 2, in_ch→16 | 112² | 下采样第 1 刀 |
+| GN(4)+ReLU | | | GroupNorm 代替 BatchNorm，小 batch 也稳 |
+| conv2 | 3×3, stride 2, 16→32 | 56² | 第 2 刀 |
+| conv3 | 3×3, stride 2, 32→64 | 28² | 第 3 刀 |
+| conv4 | 3×3, stride 2, 64→64 | 14² | 第 4 刀 |
+| 双线性上采样 | 14² → 224² | | **没有解码器**，直接放大回原尺寸 |
+| head | 1×1 conv, 64→2 | | 每个像素输出 2 个 logit |
+
+参数合计约 0.061M。整个网络就是一个"4 刀下采样的编码器 + 放大 + 逐像素分类"。
+
+**关键设计：故意没有解码器。** 正式 U-Net 的 skip connection 会把高分辨率细节绕过来
+喂给输出端。TinyCNN 砍掉一切，让输出质量完全取决于**编码器从输入里读到了什么**——
+输入多给的那一个通道，有没有用，就藏不住、也骗不了。
+
+## 3. 三个变体（门槛实验的全部）
+
+同一套结构，只换输入通道（[第 140-148 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L140-L148)）：
+
+| 变体 | 输入 | 回答的问题 |
+|---|---|---|
+| `raw` | 原图 1 通道 | 基线 |
+| `raw_hf` | 原图 + HF 边缘图，2 通道拼接 | **多给 HF 有没有增量**（核心对比） |
+| `hf` | 只给 HF 边缘图 | HF 自己能做到多少（旁证） |
+
+HF 图不是预先存好的，而是训练时对每个 batch 现算 `build_hf_image(x)`
+（小波高频 IDWT 重建、LL 置零、逐样本 z-score，见 [networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py)）。
+
+训练配置（[第 168-204 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L168-L204)）：
+
+- Adam lr=2e-3 + 余弦退火，batch 16，20 epoch；
+- **三个变体用同一个 seed（1234）、同一份 shuffle 顺序**（独立 `torch.Generator`），
+  保证差值只来自输入通道本身；
+- `augment=False`：不做任何数据增强，进一步减少无关变量；
+- 数据全部预读进内存，单变体训练只要几十秒到一两分钟。
+
+## 4. 跑出来的结果怎么读
+
+| 子集 | raw | raw_hf | 差值 |
+|---|---|---|---|
+| SPARC | ≈0.489 | ≈0.507 | **+0.0181** |
+| Zhongnan | ≈0.489 | ≈0.507 | **+0.0183** |
+
+三条解读：
+
+1. **两个完全独立的数据库给出几乎一样的增量**（+1.8 个点），这不是噪声能解释的巧合，
+   说明 HF 通道的增益是真实的、可复现的；
+2. 增量小（1.8 个点）——别期待边缘图是质变，它是"有信息但有限"的辅助通道；
+3. `hf` 单独一列（只给边缘图）成绩显著低于 `raw`，但明显高于 0——
+   证明边缘图**携带了原图之外的边界信息**，而不是原图的冗余复制。
+
+## 5. 它的四个已知局限（为什么不能拿绝对值说事）
+
+1. **输出网格天花板**：14×14 特征直接放大回 224，即使完美分割，Dice 上限也只有
+   **0.8707（SPARC）/ 0.8939（Zhongnan）**（实测：把真值自己压到 14² 再放大算 Dice）。
+   基线 0.49 远没到天花板，说明差距来自模型容量小，不是分辨率卡死；
+2. **单 seed**：0.49 这个绝对值有种子波动，所以规则是**只认同一轮内的相对差值**；
+3. **无增强、20 epoch**：欠训练是故意的（省时间），换来的是绝对值没有横向可比性；
+4. **TinyCNN ≠ TransUNet**：小网络上的 +1.8 点不能外推成正式模型上也会 +1.8 点，
+   它只负责回答"值不值得上正式模型"这一个问题。
+
+## 6. 改造版：TinySeg（融合轴实验）
+
+[probe_fusion_axis.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_fusion_axis.py)
+把 TinyCNN 拆成可复用的 `encoder()`（与原始版逐层同构），外面套 8 种变体，
+用来回答新问题："HF 该走**通道**还是该走 **QKV 注意力**？"
+
+| 组 | 变体 | HF 走的路 | 相对 raw 的 Dice |
+|---|---|---|---|
+| 基线 | `raw` / `raw_hf` | 不走 / 输入级通道拼接 | 0 / **+0.015** |
+| 通道轴 | `feat_concat` | 双分支特征再拼接融合 | +0.005 |
+| 注意力轴 | `feat_attn` | 双分支 + 14² 上 QKV 交叉注意力 | +0.240 |
+| 对照 | `feat_attn_zero` | 侧路喂**全零** | **+0.266（最高）** |
+
+结论：`feat_attn` 那 +0.24 **不是频率信息的功劳**——侧路喂全零反而更高。
+注意力的涨幅来自架构本身（全局感受野/常数偏置效应），可归因于 HF 的增益
+只有通道轴的 +0.015。这正面支持了"低频/高频是通道的事情，QKV 用错了轴"的判断。
+
+## 7. 想自己跑一遍
+
+```powershell
+# 门槛实验（原始三变体，约几分钟）
+& .\venv\Scripts\python.exe scripts\probe_edge_signal.py --subset SPARC --epochs 20
+
+# 融合轴实验（8 变体，约十几分钟）
+& .\venv\Scripts\python.exe scripts\probe_fusion_axis.py --subset SPARC --seeds 1234
+```

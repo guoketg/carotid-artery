@@ -1,12 +1,12 @@
-# Overnight queue: dual-encoder interleaved + 4-level bidirectional fusion (D11).
+﻿# Overnight queue: dual-encoder interleaved + 4-level bidirectional fusion (D11).
 # Same mechanics as night_queue.ps1: one job at a time, archive old snapshots, keep machine awake.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue_dual.ps1 -DryRun
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue_dual.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue_dual.ps1 -Skip r1_sparc
 param(
-    [string]$Python = "F:\code\MyPython\TransUNet\venv\Scripts\python.exe",
-    [string]$Root = "F:\code\MyPython\TransUNet",
+    [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
+    [string]$Root = "E:\mkl\code\python_code\carotid-artery",
     [string]$Only = "",
     [string]$Skip = "",
     [switch]$DryRun
@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $logDir = Join-Path $Root "logs\queue"
-$modelDir = "F:\code\MyPython\model\TU_Carotid224"
+$modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # Prevent system sleep while training.
@@ -41,14 +41,14 @@ $prefix = "TU_pretrain_R50-ViT-B_16_skip3_epo120_bs4_ga2_224"
 
 # Order == priority: main method on both subsets first, then gate / concat / unidirectional controls.
 $jobs = @(
-    @{ Name = "r1_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "auto") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_auto" },
-    @{ Name = "r1_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "auto") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_auto" },
-    @{ Name = "r2_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "gate") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_gate" },
-    @{ Name = "r2_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "gate") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_gate" },
-    @{ Name = "r3_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "concat") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_concat" },
-    @{ Name = "r3_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "concat") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_concat" },
-    @{ Name = "r7_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "auto", "--bidir", "0") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_auto_uni" },
-    @{ Name = "r7_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "auto", "--bidir", "0") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_auto_uni" }
+    @{ Name = "r1_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "auto") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_auto_c2d" },
+    @{ Name = "r1_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "auto") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_auto_c2d" },
+    @{ Name = "r2_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "gate") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_gate_c2d" },
+    @{ Name = "r2_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "gate") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_gate_c2d" },
+    @{ Name = "r3_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "concat") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_concat_c2d" },
+    @{ Name = "r3_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "concat") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_concat_c2d" },
+    @{ Name = "r7_sparc";    Args = @("train.py", "--subset", "SPARC",    "--fuse_op", "auto", "--bidir", "0") + $common; Snapshot = "${prefix}_SPARC_dual_L1234_auto_uni_c2d" },
+    @{ Name = "r7_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--fuse_op", "auto", "--bidir", "0") + $common; Snapshot = "${prefix}_Zhongnan_dual_L1234_auto_uni_c2d" }
 )
 
 if ($Only -ne "") {

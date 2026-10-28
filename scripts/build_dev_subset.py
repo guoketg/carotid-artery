@@ -14,7 +14,7 @@ import os
 import random
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_ROOT = os.path.join(PROJECT_ROOT, "lists", "lists_Carotid")
+SRC_ROOT = os.path.join(PROJECT_ROOT, "lists", "lists_Carotid2D")
 DST_ROOT = os.path.join(PROJECT_ROOT, "lists", "lists_Carotid_dev")
 
 

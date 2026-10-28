@@ -66,7 +66,29 @@ parser.add_argument('--vit_patches_size', type=int,
                     default=16, help='vit_patches_size, default is 16')
 parser.add_argument('--main_input', type=str, default='raw', choices=['raw', 'll'],
                     help='dual 主路输入：raw = 原图复制 3 通道（现状）；ll = 小波 LL 低频近似图（XNet 式低频/高频双流，高频全在侧路）')
+parser.add_argument('--edge_in', type=int, default=0,
+                    help='1 = 边缘特征融合·输入级：stem 吃 4 通道（原图 3 + 小波高频重建图 1）')
+parser.add_argument('--ddbe', type=int, default=0,
+                    help='1~3 = 解码器第 N 级输出（28/56/112/224，level3=112×112/64ch）挂 BDFR-Net 式 DDBE；'
+                         '4 = 四级全挂 DDBE×4（BDFR-Net 完整版）；0 = 关（仅 baseline）')
+parser.add_argument('--acam', type=int, default=0,
+                    help='1 = 每个 decoder 级对 skip 特征做 ACAM 跨级语义对齐（ddbefull = --ddbe 4 --acam 1；仅 baseline）')
+parser.add_argument('--hf_branch', type=int, default=0,
+                    help='1 = GobletNet 式：轻量 HF 支 + FAM 与 skip 逐级互标定（仅 baseline）')
+parser.add_argument('--hf_lambda', type=float, default=0.3,
+                    help='HF 图低频回灌权重 λ（GobletNet Eq.5：H=HL+LH+HH+λ·LL，论文最优 0~0.3）')
 args = parser.parse_args()
+
+if args.ddbe and args.arch != 'baseline':
+    parser.error('--ddbe 只接了 baseline 解码器（dual 的融合在编码器接点，未接 DDBE）')
+if not 0 <= args.ddbe <= 4:
+    parser.error('--ddbe 取值 0~4')
+if args.acam and args.arch != 'baseline':
+    parser.error('--acam 只接了 baseline 解码器（与 --ddbe 同挂载面）')
+if args.hf_branch and args.arch != 'baseline':
+    parser.error('--hf_branch 只接了 baseline 解码器（FAM 挂在 skip 上，dual 未接）')
+if not 0 <= args.hf_lambda <= 1:
+    parser.error('--hf_lambda 取值 0~1（GobletNet 论文最优区间 0~0.3）')
 
 
 if __name__ == "__main__":
@@ -89,7 +111,7 @@ if __name__ == "__main__":
             'num_classes': 9,
         },
         'Carotid': {
-            'root_path': r'F:\code\datasets\Carotid2D',
+            'root_path': r'E:\mkl\code\datasets\Carotid2D',
             'list_dir': './lists/lists_Carotid2D',
             'num_classes': 2,
         },
@@ -116,8 +138,18 @@ if __name__ == "__main__":
         snapshot_path = snapshot_path + '_' + args.subset
         if args.use_wavelet:
             snapshot_path += '_w3'
+        if args.edge_in:
+            snapshot_path += '_edge'
         if args.fusion != 'none':
             snapshot_path += '_' + args.fusion
+        if args.ddbe:
+            # 快照名必须反映真实配置（status.md 3.3：名不副实 = 新旧权重混目录）
+            snapshot_path += '_ddbe' + str(args.ddbe)
+        if args.acam:
+            snapshot_path += '_acam'
+        if args.hf_branch:
+            # λ 量化到 0.1 粒度进快照名（λ=0.3 → _hfbr3）
+            snapshot_path += '_hfbr' + str(int(round(args.hf_lambda * 10)))
         if args.arch == 'dual':
             # 双骨干自己从原图算子带，数据集只给 1 通道
             args.use_wavelet = 0
@@ -154,14 +186,17 @@ if __name__ == "__main__":
                                    bidir=bool(args.bidir),
                                    side_pretrained=bool(args.side_pretrained),
                                    cross_scale=bool(args.cross_scale),
-                                   main_input=args.main_input).cuda()
+                                   main_input=args.main_input,
+                                   edge_in=bool(args.edge_in)).cuda()
     elif args.fusion != 'none':
         from networks.wavelet_model import WaveletTransUNet
         net = WaveletTransUNet(config_vit, img_size=args.img_size,
                                num_classes=config_vit.n_classes,
                                fusion=args.fusion, heads=args.heads).cuda()
     else:
-        net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+        net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes,
+                      edge_in=bool(args.edge_in), ddbe_level=args.ddbe, acam=bool(args.acam),
+                      hf_branch=bool(args.hf_branch), hf_lambda=args.hf_lambda).cuda()
     net.load_from(weights=np.load(config_vit.pretrained_path))
 
     trainer = {'Synapse': trainer_synapse, 'Carotid': trainer_synapse,}

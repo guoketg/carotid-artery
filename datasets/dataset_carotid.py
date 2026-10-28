@@ -7,11 +7,11 @@ import torch
 from scipy import ndimage
 from torch.utils.data import Dataset
 
-DATA_ROOT = r"F:\code\datasets\2D"
+DATA_ROOT = r"E:\mkl\code\datasets\Carotid2D"
 # 两个子集必须**分开**训练与评估，不能混合
-SUBSETS = {"SPARC": "PlaqueDataNii_SPARC_M", "Zhongnan": "PlaqueDataNii_Zhongnan_M"}
+SUBSETS = {"SPARC": "PlaqueDataNii_SPARC_S", "Zhongnan": "PlaqueDataNii_Zhongnan_S"}
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIST_DIR = os.path.join(PROJECT_ROOT, "lists", "lists_Carotid")
+LIST_DIR = os.path.join(PROJECT_ROOT, "lists", "lists_Carotid2D")
 
 
 def read_list(list_file):

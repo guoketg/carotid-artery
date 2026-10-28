@@ -20,7 +20,7 @@ from torchvision.ops import deform_conv2d
 
 from networks.vit_seg_modeling import VisionTransformer
 from networks.vit_seg_modeling_resnet_skip import ResNetV2, np2th
-from networks.wavelet import haar_dwt
+from networks.wavelet import haar_dwt, build_hf_image
 
 
 # ---------------------------------------------------------------- 输入侧
@@ -263,7 +263,9 @@ class BidirDeform(nn.Module):
 class _MSCAM(nn.Module):
     """AFF 的多尺度通道注意力（arXiv 2009.14082 的 MS-CAM）。
 
-    原版用 BN，这里统一换 GroupNorm：batch 4 下 BN 统计不稳。
+    原版用 BN，这里局部支路换 GroupNorm（batch 4 下 BN 统计不稳）。
+    全局支路 GAP 后空间为 1×1，GroupNorm 校验 batch×空间>1 会在
+    eval（batch=1）时崩溃 → 全局支路不带归一化（SE 式 MLP，带 bias）。
     局部支路保留空间分布，全局支路用 GAP 抓通道显著性，相加后 sigmoid。
     """
 
@@ -276,8 +278,8 @@ class _MSCAM(nn.Module):
             nn.Conv2d(c, dim, 1, bias=False), nn.GroupNorm(1, dim))
         self.glb = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, c, 1, bias=False), nn.GroupNorm(g, c), nn.ReLU(inplace=True),
-            nn.Conv2d(c, dim, 1, bias=False), nn.GroupNorm(1, dim))
+            nn.Conv2d(dim, c, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(c, dim, 1))
         self.act = nn.Sigmoid()
 
     def forward(self, x):
@@ -342,8 +344,9 @@ class DualEncoderTransUNet(VisionTransformer):
 
     def __init__(self, config, img_size=224, num_classes=2, levels="1,2,3,4",
                  fuse_op="auto", window=8, dk_ratio=2, bidir=True,
-                 side_pretrained=True, cross_scale=False,main_input="raw"):
-        super().__init__(config, img_size, num_classes)
+                 side_pretrained=True, cross_scale=False, main_input="raw",
+                 edge_in=False):
+        super().__init__(config, img_size, num_classes, edge_in=edge_in)
         self.img_size = img_size
         self.levels = [int(v) for v in str(levels).split(",") if str(v).strip()]
         self.fuse_op = fuse_op
@@ -497,6 +500,9 @@ class DualEncoderTransUNet(VisionTransformer):
                 main_in = build_ll_image(raw, self.img_size).repeat(1, 3, 1, 1)
             else:
                 main_in = x.repeat(1, 3, 1, 1)
+            if self.edge_in:
+                # 边缘特征融合·输入级：主路 stem 再吃一张小波高频重建图
+                main_in = torch.cat([main_in, build_hf_image(raw)], dim=1)
         else:
             raw = x[:, 0:1]
             main_in = x[:, 0:3]

@@ -1,4 +1,4 @@
-# Sequential overnight training queue.
+﻿# Sequential overnight training queue.
 # Runs one job at a time, waits for the previous one, never runs two in parallel.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1            # run all jobs
@@ -6,8 +6,8 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -Only a0_sparc
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -Skip a0_sparc,a1_sparc   # resume
 param(
-    [string]$Python = "F:\code\MyPython\TransUNet\venv\Scripts\python.exe",
-    [string]$Root = "F:\code\MyPython\TransUNet",
+    [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
+    [string]$Root = "E:\mkl\code\python_code\carotid-artery",
     [string]$Only = "",
     [string]$Skip = "",
     [switch]$DryRun
@@ -15,7 +15,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $logDir = Join-Path $Root "logs\queue"
-$modelDir = "F:\code\MyPython\model\TU_Carotid224"
+$modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # Keep the machine awake while the queue runs.
@@ -37,12 +37,12 @@ function Get-TrainingProcess {
 $common = @("--batch_size", "8", "--max_epochs", "120", "--eval_test_every", "10")
 $prefix = "TU_pretrain_R50-ViT-B_16_skip3_epo120_bs8_224"
 $jobs = @(
-    @{ Name = "a0_sparc"; Args = @("train.py", "--subset", "SPARC") + $common; Snapshot = "${prefix}_SPARC" },
-    @{ Name = "a3_sparc"; Args = @("train.py", "--subset", "SPARC", "--use_wavelet", "1", "--fusion", "cross") + $common; Snapshot = "${prefix}_SPARC_w3_cross" },
-    @{ Name = "a1_sparc"; Args = @("train.py", "--subset", "SPARC", "--use_wavelet", "1") + $common; Snapshot = "${prefix}_SPARC_w3" },
-    @{ Name = "a0_zhongnan"; Args = @("train.py", "--subset", "Zhongnan") + $common; Snapshot = "${prefix}_Zhongnan" },
-    @{ Name = "a3_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--use_wavelet", "1", "--fusion", "cross") + $common; Snapshot = "${prefix}_Zhongnan_w3_cross" },
-    @{ Name = "a1_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--use_wavelet", "1") + $common; Snapshot = "${prefix}_Zhongnan_w3" }
+    @{ Name = "a0_sparc"; Args = @("train.py", "--subset", "SPARC") + $common; Snapshot = "${prefix}_SPARC_c2d" },
+    @{ Name = "a3_sparc"; Args = @("train.py", "--subset", "SPARC", "--use_wavelet", "1", "--fusion", "cross") + $common; Snapshot = "${prefix}_SPARC_w3_cross_c2d" },
+    @{ Name = "a1_sparc"; Args = @("train.py", "--subset", "SPARC", "--use_wavelet", "1") + $common; Snapshot = "${prefix}_SPARC_w3_c2d" },
+    @{ Name = "a0_zhongnan"; Args = @("train.py", "--subset", "Zhongnan") + $common; Snapshot = "${prefix}_Zhongnan_c2d" },
+    @{ Name = "a3_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--use_wavelet", "1", "--fusion", "cross") + $common; Snapshot = "${prefix}_Zhongnan_w3_cross_c2d" },
+    @{ Name = "a1_zhongnan"; Args = @("train.py", "--subset", "Zhongnan", "--use_wavelet", "1") + $common; Snapshot = "${prefix}_Zhongnan_w3_c2d" }
 )
 
 if ($Only -ne "") {

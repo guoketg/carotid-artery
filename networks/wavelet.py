@@ -55,6 +55,37 @@ def _standardize(x, eps=1e-6):
     return (x - mean) / std
 
 
+def build_hf_image(x, log_domain=True, lf_weight=0.0):
+    """输入 (B,1,H,W) 归一化原图，输出 (B,1,H,W) 的小波高频重建图。
+
+    对数域做 1 级 Haar 分解，把近似子带 LL 置零后 IDWT 重建 —— 得到的是与原图
+    同分辨率、只含高频成分的「边缘图」。这是老师定的边缘图算子
+    (technical-design.md 频率注入位置一节)：Sobel/Laplacian 只作后续对照。
+
+    lf_weight = λ（GobletNet Eq.5：H = HL+LH+HH+λ·LL）：>0 时高频图掺回少量
+    低频，缓解纯高频图信息量过稀（论文 Table VI：λ∈[0,0.3] 最优）。
+    默认 0.0，与 edge_in 的纯高频行为逐位一致。
+
+    为什么不直接用细节能量图（sqrt(LH²+HL²+HH²)）：能量图丢了方向与符号，
+    只剩「哪里有高频」，没有「高频往哪个方向走」，边缘朝向信息丢光。
+    """
+    if x.shape[-1] % 2 != 0 or x.shape[-2] % 2 != 0:
+        x = F.interpolate(x, size=(x.shape[-2] // 2 * 2, x.shape[-1] // 2 * 2),
+                          mode="bilinear", align_corners=False)
+
+    if log_domain:
+        x_pos = x - x.amin(dim=(2, 3), keepdim=True) + 1e-3
+        xl = torch.log1p(x_pos)
+    else:
+        xl = x
+
+    ll, details = haar_dwt(xl)
+    hf = haar_idwt(lf_weight * ll, details)   # λ=0 → LL 置零只剩高频；λ>0 → GobletNet 式回灌
+    if log_domain:
+        hf = torch.expm1(hf)
+    return _standardize(hf)
+
+
 def build_three_channel(x, threshold=True):
     """输入 (B,1,H,W) 已归一化图像，输出 (B,3,H,W)：原图 / 小波去噪重建 / 细节能量。
 

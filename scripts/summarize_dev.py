@@ -65,7 +65,7 @@ def read_curve(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_root", type=str,
-                    default=r"F:\code\MyPython\model\TU_Carotid224")
+                    default=r"E:\mkl\code\python_code\model\TU_Carotid224")
     ap.add_argument("--suffix", type=str, default="_dev")
     ap.add_argument("--out", type=str, default="")
     args = ap.parse_args()

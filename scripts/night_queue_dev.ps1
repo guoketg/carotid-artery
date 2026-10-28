@@ -6,8 +6,8 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue_dev.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\night_queue_dev.ps1 -Only d05_deform
 param(
-    [string]$Python = "F:\code\MyPython\TransUNet\venv\Scripts\python.exe",
-    [string]$Root = "F:\code\MyPython\TransUNet",
+    [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
+    [string]$Root = "E:\mkl\code\python_code\carotid-artery",
     [string]$Only = "",
     [string]$Skip = "",
     [int]$IdleMinutes = 3,
@@ -16,7 +16,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $logDir = Join-Path $Root "logs\queue"
-$modelDir = "F:\code\MyPython\model\TU_Carotid224"
+$modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 $sig = '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);'

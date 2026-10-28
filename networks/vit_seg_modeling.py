@@ -20,6 +20,9 @@ from torch.nn.modules.utils import _pair
 from scipy import ndimage
 from . import vit_seg_configs as configs
 from .vit_seg_modeling_resnet_skip import ResNetV2
+from .wavelet import build_hf_image
+from .ddbe import DDBE, ACAM
+from .hf_branch import HFBranch, FAM, HF_DET_CHANNELS
 
 
 logger = logging.getLogger(__name__)
@@ -134,7 +137,7 @@ class Embeddings(nn.Module):
             grid_size = config.patches["grid"]
             patch_size = (img_size[0] // 16 // grid_size[0], img_size[1] // 16 // grid_size[1])
             patch_size_real = (patch_size[0] * 16, patch_size[1] * 16)
-            n_patches = (img_size[0] // patch_size_real[0]) * (img_size[1] // patch_size_real[1])  
+            n_patches = (img_size[0] // patch_size_real[0]) * (img_size[1] // patch_size_real[1])
             self.hybrid = True
         else:
             patch_size = _pair(config.patches["size"])
@@ -142,7 +145,9 @@ class Embeddings(nn.Module):
             self.hybrid = False
 
         if self.hybrid:
-            self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers, width_factor=config.resnet.width_factor)
+            self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers,
+                                         width_factor=config.resnet.width_factor,
+                                         in_channels=in_channels)
             in_channels = self.hybrid_model.width * 16
         self.patch_embeddings = Conv2d(in_channels=in_channels,
                                        out_channels=config.hidden_size,
@@ -247,9 +252,9 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, vis):
+    def __init__(self, config, img_size, vis, in_channels=3):
         super(Transformer, self).__init__()
-        self.embeddings = Embeddings(config, img_size=img_size)
+        self.embeddings = Embeddings(config, img_size=img_size, in_channels=in_channels)
         self.encoder = Encoder(config, vis)
 
     def forward(self, input_ids):
@@ -353,6 +358,11 @@ class DecoderCup(nn.Module):
             DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
         ]
         self.blocks = nn.ModuleList(blocks)
+        # DDBE / ACAM 由 VisionTransformer 在全部基础权重初始化之后挂上（保证同 seed RNG 对齐）
+        self.ddbe = None
+        self.ddbe_idx = -1
+        self.ddbe_all = None
+        self.acams = None
 
     def forward(self, hidden_states, features=None):
         B, n_patch, hidden = hidden_states.size()  # reshape from (B, n_patch, hidden) to (B, h, w, hidden)
@@ -365,17 +375,28 @@ class DecoderCup(nn.Module):
                 skip = features[i] if (i < self.config.n_skip) else None
             else:
                 skip = None
+            if skip is not None and self.acams is not None:
+                # ACAM：深层特征跨级对齐 skip（ddbefull；零初始化恒等起步）
+                skip = self.acams[i](skip, x)
             x = decoder_block(x, skip=skip)
+            if self.ddbe is not None and i == self.ddbe_idx:
+                x = self.ddbe(x)
+            if self.ddbe_all is not None:
+                x = self.ddbe_all[i](x)
         return x
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
+                 edge_in=False, ddbe_level=0, acam=False, hf_branch=False, hf_lambda=0.3):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.classifier = config.classifier
-        self.transformer = Transformer(config, img_size, vis)
+        # edge_in：stem 吃 4 通道（原图 3 + 小波高频重建图 1），边缘特征融合的输入级版本
+        self.edge_in = edge_in
+        self.transformer = Transformer(config, img_size, vis,
+                                       in_channels=4 if edge_in else 3)
         self.decoder = DecoderCup(config)
         self.segmentation_head = SegmentationHead(
             in_channels=config['decoder_channels'][-1],
@@ -383,11 +404,69 @@ class VisionTransformer(nn.Module):
             kernel_size=3,
         )
         self.config = config
+        # ddbe_level 1~3 = 解码器第 N 级输出（实际 28/56/112/224，level3=112×112/64ch）挂 DDBE；
+        # 4 = 四级全挂 DDBE×4（BDFR-Net 完整版，消融「挂几层」）。
+        # acam = 每个 decoder 级对 skip 特征做 ACAM 跨级语义对齐（ddbefull = ddbe4 + acam）。
+        # 必须最后再建：否则随机数消耗顺序改变，同 seed 的基础权重与不挂的版本不再对齐。
+        if ddbe_level == 4:
+            self.decoder.ddbe_all = nn.ModuleList([DDBE(c) for c in config.decoder_channels])
+        elif ddbe_level:
+            self.decoder.ddbe = DDBE(config.decoder_channels[ddbe_level - 1])
+            self.decoder.ddbe_idx = ddbe_level - 1
+        if acam:
+            in_ch = [512] + list(config.decoder_channels[:-1])
+            self.decoder.acams = nn.ModuleList([
+                ACAM(sk, ic) for sk, ic in zip(config.skip_channels[:config.n_skip],
+                                               in_ch[:config.n_skip])
+            ])
+        # hf_branch = GobletNet 式：轻量 HF 特征支 + FAM 与 skip 逐级互标定（批次 2）。
+        # 高频图 H = HL+LH+HH+λ·LL 在 forward 内现算（λ 固定超参，不进 state_dict）。
+        # 同样必须等全部基础权重建完再创建（RNG 对齐纪律），恒等起步见 hf_branch.py。
+        self.hf_lambda = hf_lambda
+        if hf_branch:
+            sem_ch = list(config.skip_channels[:config.n_skip])  # [512, 256, 64] 深→浅
+            det_ch = HF_DET_CHANNELS                              # [32, 64, 128] 浅→深
+            self.hf_net = HFBranch()
+            self.hf_fams = nn.ModuleList([
+                FAM(sem_ch=sem_ch[2], det_ch=det_ch[0]),   # 112²
+                FAM(sem_ch=sem_ch[1], det_ch=det_ch[1]),   # 56²
+                FAM(sem_ch=sem_ch[0], det_ch=det_ch[2]),   # 28²
+            ])
+            # 最小移植官方 decoder 的 cat(x2_fa)：1×1 det→sem 零初始化加进 skip
+            self.hf_inject = nn.ModuleList([
+                nn.Conv2d(det_ch[0], sem_ch[2], 1, bias=False),   # 32→64 @112
+                nn.Conv2d(det_ch[1], sem_ch[1], 1, bias=False),   # 64→256 @56
+                nn.Conv2d(det_ch[2], sem_ch[0], 1, bias=False),   # 128→512 @28
+            ])
+            for inj in self.hf_inject:
+                nn.init.zeros_(inj.weight)
+        else:
+            self.hf_net = None
 
     def forward(self, x):
+        x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
         if x.size()[1] == 1:
-            x = x.repeat(1,3,1,1)
+            if self.edge_in:
+                # 第 4 通道：小波高频重建图（LL 置零），与原图同分辨率
+                x = torch.cat([x.repeat(1, 3, 1, 1), build_hf_image(x)], dim=1)
+            else:
+                x = x.repeat(1,3,1,1)
         x, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)
+        if self.hf_net is not None:
+            # GobletNet 式逐级融合，浅→深：det 被 FAM 重标定后继续下采样（贴官方
+            # 「FA 后特征继续进下一层」），fa 顺序 [(112²), (56²), (28²)]
+            hf_img = build_hf_image(x_in[:, :1], lf_weight=self.hf_lambda)
+            det = self.hf_net.stem(hf_img)                       # 32@112
+            fa = []
+            for i in range(3):
+                sem, det = self.hf_fams[i](features[2 - i], det)
+                fa.append((sem, det))
+                if i < 2:
+                    det = self.hf_net.downs[i](det)
+            # skip = x1_fa + inject(x2_fa)（inject 零初始化，恒等起步）
+            features = [fa[2][0] + self.hf_inject[2](fa[2][1]),   # 512@28
+                        fa[1][0] + self.hf_inject[1](fa[1][1]),   # 256@56
+                        fa[0][0] + self.hf_inject[0](fa[0][1])]   # 64@112
         x = self.decoder(x, features)
         logits = self.segmentation_head(x)
         return logits
@@ -431,7 +510,14 @@ class VisionTransformer(nn.Module):
                     unit.load_from(weights, n_block=uname)
 
             if self.transformer.embeddings.hybrid:
-                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(res_weight["conv_root/kernel"], conv=True))
+                # stem 首层：预训练是 3 通道，edge_in 时是 4 通道 → 新增通道零填充
+                conv_w = np2th(res_weight["conv_root/kernel"], conv=True)
+                tgt = self.transformer.embeddings.hybrid_model.root.conv.weight
+                if conv_w.shape[1] != tgt.shape[1]:
+                    pad = torch.zeros(tgt.shape[0], tgt.shape[1] - conv_w.shape[1],
+                                      *conv_w.shape[2:])
+                    conv_w = torch.cat([conv_w, pad], dim=1)
+                tgt.copy_(conv_w)
                 gn_weight = np2th(res_weight["gn_root/scale"]).view(-1)
                 gn_bias = np2th(res_weight["gn_root/bias"]).view(-1)
                 self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)

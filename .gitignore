@@ -10,5 +10,23 @@ local/
 .env
 *.key
 *.dpapi
+
+# 图像/文档产物：除 docs/assets 下的文档插图外一律不进仓库
+# （避免有人把带病人标识的中间图随手丢进仓库；docs/assets 下的是已脱敏的论文插图）
 *.pdf
 *.png
+!docs/assets/**/*.png
+!docs/assets/**/*.pdf
+
+# ---- 病人隐私相关：一律不得进仓库 ----
+# 原始影像（NIfTI）、病例划分清单、训练/评估产物都会带病人标识
+datasets/split/
+*.nii
+*.nii.gz
+*.dcm
+patient*
+case*
+*.pth
+*.npz
+model/
+pdf/
