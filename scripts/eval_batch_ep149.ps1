@@ -40,6 +40,10 @@ $jobs = @(
     @{ Name = "mainll";     Snap = "${pre}_SPARC_dual_L1234_auto_mainLL_c2d";   Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--main_input", "ll"); Baseline = "b1234" }
 )
 
+# 基线查表必须在 -Only/-Skip 过滤之前构建，否则单跑变体 job 时查不到基线快照
+$snapOf = @{}
+foreach ($j in $jobs) { $snapOf[$j.Name] = $j.Snap }
+
 if ($Only -ne "") {
     $jobs = @($jobs | Where-Object { $_.Name -eq $Only })
     if ($jobs.Count -eq 0) { Write-Error "unknown job: $Only"; exit 2 }
@@ -55,10 +59,6 @@ $statusPath = Join-Path $logDir "eval_batch_ep149_status.csv"
 if (-not (Test-Path $statusPath)) {
     "job,start,end,minutes,exit_code" | Out-File -FilePath $statusPath -Encoding utf8
 }
-
-# 先解析基线 CSV 路径（基线 job 必须先跑或已有产物）
-$snapOf = @{}
-foreach ($j in $jobs) { $snapOf[$j.Name] = $j.Snap }
 
 foreach ($job in $jobs) {
     $snap = Join-Path $modelDir $job.Snap

@@ -1,0 +1,139 @@
+# deform 融合算子深讲：为什么本轮横评它最好，代码逐段怎么读
+
+配套代码：[networks/dual_encoder_model.py L216-L260](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L216-L260)。
+六档横评全表与另五个算子的讲解见 [fusion-operators-explained.md](fusion-operators-explained.md)（输入侧、损失、口径不再重复）。
+本文只回答两个问题：**deform 凭什么排第一**、**它的代码每一行在干什么**。
+
+## 0. 一页版
+
+deform = 可变形大核跨支聚合（`--fuse_op deform`，D-LKA 思路）。本轮横评（SPARC、ep150、
+同 seed 1234、同 bs4+ga2+200ep）唯一三项全优的档：
+
+| 档位 | Dice ↑ | ASSD ↓ | HD95 ↓ | HD95 相对基线 |
+|---|---|---|---|---|
+| 单通道基线（无融合模块） | 89.95% | 0.1498 | 0.3997 | — |
+| auto（跨支 QKV 注意力） | 90.40% | 0.1476 | 0.4064 | +0.0067 更差 |
+| gate（逐像素门控） | 90.35% | 0.1434 | 0.4034 | +0.0037 更差 |
+| **deform（可变形大核）** | **90.61%** | **0.1412** | **0.3788** | **−0.0209 唯一变好** |
+
+一句话机制：它是六档里唯一「**去对方那里读内容的位置会动**」的算子——5×5 采样网格每个点
+都加了一个由特征预测出的偏移，采样点可以贴着斑块边界走。注意结论边界：单 seed；病例级
+Wilcoxon（43 例配对）ΔDice p=0.113、ΔASSD p=0.154、ΔHD95 p=0.276，均未过「HD95 降 ≥0.5 mm
+且 p<0.05」判定线——本轮排序成立，显著性不成立。
+
+## 1. 它在模型里的位置
+
+融合位置：双骨干四个接点 112²/64、56²/256、28²/512、14²/768，主路 A = 原图骨干特征，
+侧路 B = 高频细节骨干特征（LH/HL/HH 拼 3 通道，定义见总览 §1）。轴向：空间轴的局部版本
+——**同支路内的位置间取内容**，但只取 5×5 邻域、且取哪些点由内容决定。γ 零初始化残差，
+第 0 步与基线逐元素相同。
+
+## 2. 为什么它最好：先分清六档"能做什么"
+
+| 档 | 对 A 能做的事 | 「去哪读」由谁定 | HD95 vs 基线 |
+|---|---|---|---|
+| gate / aff | 只乘 0~1 权重调幅度 | 不读对方，原地缩放 | 0.4034 更差 |
+| concat | 同位置固定线性混合 | 固定同位置 | （正式模型未测） |
+| auto | 跨位置取内容，按点积相似度打分 | 固定窗口/全图网格 | 0.4064 更差 |
+| **deform** | 跨位置取内容，位置由内容预测 | **5×5 邻域内逐点偏移** | **0.3788 唯一变好** |
+
+证据链怎么对上"几何自适应"这个读法：
+
+1. **增益集中在边界指标而不是 Dice**：deform 相对 auto，Dice 只 +0.0021（噪声带），
+   ASSD −0.0064、HD95 −0.0276（本轮最大单项变化）。若只是参数多、容量大，Dice 应普遍抬；
+   增益全部落在 ASSD/HD95（边界距离，mm）上，与"采样点贴着边界走"一致。
+2. **auto/gate 的 HD95 反而比基线差**：0.4064/0.4034 vs 0.3997。HD95 是 95 分位豪斯多夫
+   距离，专门抓"少数切片上大的边界失误"——这两档多数切片略好、但尾部出现远处大失误。
+   deform 是唯一把尾部压下去的档："只在 5×5 局部邻域内采样、不会飘到远处乱取"与此吻合；
+   auto 在 28²/14² 是全局注意力，无局部性先验。
+3. **gate ≈ auto** 说明"调幅度 vs 相似度重组"这条轴不敏感；deform 与两者的本质区别不在
+   "重组不重组"，而在"位置自适应"。
+4. **不能排除容量混杂**：deform 参数 3.69 M 为六档最大（aff 0.47 M、gate 近零），没有
+   "固定网格同参数量"的对照，机制读法是解释而非证明。
+
+## 3. 模型：逐层表与公式
+
+公式（更新 A 的方向，B 对称）：
+
+```
+o   = Conv3×3(Red1×1(A))          # 偏移：由"自己"的降维特征预测 25 组 (Δx,Δy)
+y   = DCN(Red1×1(B), o)           # 聚合：拿 o 到"对方"特征上采样，做 5×5 加权和
+A'  = A + γ_a · GroupNorm(Proj1×1(y))
+```
+
+逐层表（`__init__` [L229-L247](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L229-L247)）：
+
+| 名字 | 运算 | 输出 | 作用 |
+|---|---|---|---|
+| d | `max(32, min(128, dim//2))` | 32~128 通道 | 可变形支路瓶颈通道（112²/64ch→32，其余接点→128） |
+| red_a / red_b | Conv1×1 dim→d | d 通道 | 降维，双向共用：a 的降维结果既当 A→B 方向的偏移预测源，又当 B→A 方向的内容源，省约一半参数 |
+| off_a / off_b | Conv3×3 d→2·k·k（k=5，即 50） | 25 组 (Δx,Δy) | 给 5×5 网格每个采样点预测坐标偏移；权重与 bias **全零初始化**（L245-247） |
+| def_a / def_b | 5×5 卷积核 d→d | — | 真正做聚合的卷积权重，被 `deform_conv2d` 拿到不规则位置上使用 |
+| proj_a / proj_b | Conv1×1 d→dim | dim 通道 | 升回原通道数 |
+| norm_a / norm_b | GroupNorm(1, dim) | — | 放在残差支路内、γ 之前 |
+| gamma_a / gamma_b | 标量，零初始化 | — | 链上唯一乘性零，第 0 步恒等 |
+
+参数增量：四接点合计 3.69 M，六档最大。大头在 def 的 5×5·d·d 与 proj 的 d·dim
+（14²/768 接点单方向：25·128·128≈0.41 M + 128·768≈0.10 M）。
+
+## 4. 代码逐段
+
+### 4.1 单方向三步（`_dir` [L249-L252](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L249-L252)）
+
+```python
+o = off(src)      # ① 偏移：由"自己"的降维特征预测 25 组 (Δx,Δy)
+y = deform_conv2d(dst, o, dfm.weight, dfm.bias, padding=self.k // 2)
+                  # ② 采样聚合：按 o 在"对方"特征上取 25 个点（双线性插值），5×5 加权和
+return orig + gamma * norm(proj(y))
+                  # ③ 残差：升维 → 归一化 → ×γ → 加回自己
+```
+
+注意方向：更新 A 时（[forward L254-L260](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L254-L260)），
+偏移源是 `a = red_a(A)`，内容源是 `b = red_b(B)`——**A 自己决定去 B 的哪里取**。直觉：
+A 知道自己哪个位置处于边界不确定区，就去对方的边缘细节图上把对应位置的响应取过来。
+双向各跑一遍（A 用 off_a/def_a，B 用 off_b/def_b），互不共享卷积权重、只共享降维投影。
+
+### 4.2 deform_conv2d 是什么（[L19](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L19) 导入）
+
+- 常规卷积的采样位置固定在 `p0 + pk` 网格；可变形卷积改成 `p0 + pk + o(p)`，o 由输入特征
+  算出、坐标可以是小数，取值用双线性插值。这就是"采样点跟着边界走"的实现层含义。
+- **术语消歧**：论文里 DCNv2 = 偏移 + 逐点幅度调制（mask）。本实现调用 torchvision 的
+  `deform_conv2d` **没传 mask**，等价 DCNv1：只学"去哪读"，不学"读多少"。
+  总览文档旧写法 DCNv2 已随之更正。
+- **为什么 off 零初始化不是死锁**：off 置零的是**采样坐标增量**，不是输出幅值。初始 o=0
+  时等价于固定网格 5×5 常规卷积，输出非零；且 `deform_conv2d` 对偏移可导（双线性插值对
+  坐标的导数 = 邻域两点值之差，非零），off 从第 1 步就有梯度。链上唯一的乘性零仍是 γ，
+  不出现"两个零相乘"的永久冻结。
+
+### 4.3 挂接与开关
+
+- 工厂：[make_fusion L317](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L317)，
+  deform 分支 [L329](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L329)。
+- 开关：`train.py --fuse_op deform`；其余训练口径与所有档完全一致
+  （CE+Dice、bs4+ga2、200 epoch、seed 1234、SPARC 官方划分）——横评差值只能归因于算子本身。
+
+## 5. 指标与结果怎么读
+
+见 §0 表。三条证据、一条反证：
+
+- 证据 ①：deform 唯一三项全优于无融合基线；其余任何档都至少有一项比基线差。
+- 证据 ②：deform 的增量集中在 ASSD/HD95（边界），Dice 几乎不动。
+- 证据 ③：auto/gate 抬 Dice/ASSD 却恶化 HD95（尾部失误变多），deform 压尾部。
+- 反证/混杂：参数量未对齐（3.69 M 六档最大，无同容量固定网格对照）、单 seed；病例级 Wilcoxon
+  已补：ΔDice p=0.113、ΔASSD p=0.154、ΔHD95 p=0.276，全部 >0.05——"几何自适应带来增益"是
+  当前证据下最一致的读法，不是被对照实验证明的因果结论。
+
+## 6. 结论边界与复现
+
+**能说**：同 seed 同口径下，deform 是本轮横评第一（排序成立，五档齐）；唯一在 HD95 上优于基线的档。
+**不能说**：deform 显著更好（0.028 mm << 0.5 mm 判定线，Wilcoxon p=0.113/0.154/0.276 均 >0.05）；
+增益确因几何自适应（无同容量固定网格对照）；任何 Zhongnan 上的结论（本轮全是 SPARC）。
+
+复现命令（PowerShell）：
+
+```powershell
+.\venv\Scripts\python.exe train.py --subset SPARC --seed 1234 --arch dual --levels 1,2,3,4 --fuse_op deform --dataset Carotid --batch_size 4 --grad_accum 2 --max_epochs 200 --eval_test_every 5
+```
+
+与其他方案的关系：deform 回答的是"通道轴内部哪种算子最好"；输入级要不要高频（`--edge_in 1`）
+与之正交，下一步是把胜出组合搬到 Zhongnan 复现，并补 aff 缺档。

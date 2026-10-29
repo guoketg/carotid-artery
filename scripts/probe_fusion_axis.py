@@ -230,7 +230,7 @@ def main():
     p, g = (up > 0.25).float(), te_l.float().unsqueeze(1)
     inter = (p * g).sum(dim=(1, 2, 3))
     den = p.sum(dim=(1, 2, 3)) + g.sum(dim=(1, 2, 3))
-    print(f"[ceiling] 真值压到 14×14 再放大 → Dice 上限 = {(2*inter/den.clamp_min(1)).mean():.4f}"
+    print(f"[ceiling] 真值压到 14×14 再放大 → Dice 上限 = {(2*inter/den.clamp_min(1)).mean() * 100:.2f}%"
           f"（小网络的输出网格就这么粗）\n")
 
     seeds = [int(s) for s in args.seeds.split(",")]
@@ -241,19 +241,19 @@ def main():
         for sd in seeds:
             m = train_one(variant, tr_i, tr_l, te_i, te_l, spacings, args.epochs, sd)
             runs.append(m)
-            print(f"  {variant:<14} seed {sd}: dice {m['dice']:.4f}  assd {m['assd']:.4f}  "
+            print(f"  {variant:<14} seed {sd}: dice {m['dice'] * 100:.2f}%  assd {m['assd']:.4f}  "
                   f"hd95 {m['hd95']:.4f}  |dA| {m['abs_delta_area']:.3f}")
         agg = {k: float(np.mean([r[k] for r in runs])) for k in ["dice", "assd", "hd95", "abs_delta_area"]}
         agg["nparam"] = runs[0]["nparam"]
         allm[variant] = agg
-        print(f"{variant:<14} {agg['nparam']/1e6:>7.3f}M {agg['dice']:>8.4f} {agg['assd']:>9.4f} "
+        print(f"{variant:<14} {agg['nparam']/1e6:>7.3f}M {agg['dice'] * 100:>7.2f}% {agg['assd']:>9.4f} "
               f"{agg['hd95']:>9.4f} {agg['abs_delta_area']:>9.3f}\n")
 
     b = allm["raw"]
     print("=== 相对 raw 的差值 ===")
     for v in VARIANTS[1:]:
         m = allm[v]
-        print(f"  {v:<14} Dice {m['dice']-b['dice']:+.4f}   ASSD {m['assd']-b['assd']:+.4f} mm   "
+        print(f"  {v:<14} Dice {(m['dice']-b['dice']) * 100:+.2f}%   ASSD {m['assd']-b['assd']:+.4f} mm   "
               f"HD95 {m['hd95']-b['hd95']:+.4f} mm   |ΔArea| {m['abs_delta_area']-b['abs_delta_area']:+.3f} mm²")
 
 

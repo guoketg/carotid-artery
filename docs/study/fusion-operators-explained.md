@@ -11,11 +11,11 @@
 
 | 算子 | 一行公式 | 轴向 | ep150 Dice / ASSD / HD95 | 结论 |
 |---|---|---|---|---|
-| gate | `A' = A + γ·A·σ(conv([mean(A),max(A)]))` | 只调幅度 | 0.9035 / 0.1434 / 0.4034 | 与 auto 拉不开 |
-| auto（QKV） | `A' = A + γ·Proj(Attn(Q=A,K=V=B))` | 跨位置重组 | 0.9040 / 0.1476 / 0.4064 | 旧冠军，被 deform 超越 |
-| deform | `A' = A + γ·DCNv2(dst, off(src))` | 几何自适应 | **0.9061 / 0.1412 / 0.3788** | **本轮最好** |
-| aff | `A' = A + γ·A·MS-CAM(A+B)` | 只调幅度 | —（训练崩溃，待修） | 缺一档 |
-| DDBE（单级挂载） | 三分支 DWT 融合 + 残差 | 通道轴 | 0.9008 / 0.1513 / 0.4404（vs 基线 0.8995/0.1498/0.3997） | 大概率不过门槛 |
+| gate | `A' = A + γ·A·σ(conv([mean(A),max(A)]))` | 只调幅度 | 90.35% / 0.1434 / 0.4034 | 与 auto 拉不开 |
+| auto（QKV） | `A' = A + γ·Proj(Attn(Q=A,K=V=B))` | 跨位置重组 | 90.40% / 0.1476 / 0.4064 | 旧冠军，被 deform 超越 |
+| deform | `A' = A + γ·DCN(dst, off(src))` | 几何自适应 | **90.61% / 0.1412 / 0.3788** | **本轮最好**，深讲见 [deform-fusion-explained.md](deform-fusion-explained.md) |
+| aff | `A' = A + γ·A·MS-CAM(A+B)` | 只调幅度 | 90.17% / 0.1469 / 0.4011 | 重跑成功，五档垫底 |
+| DDBE（单级挂载） | 三分支 DWT 融合 + 残差 | 通道轴 | 90.08% / 0.1513 / 0.4404（vs 基线 89.95%/0.1498/0.3997） | 判负；四级全挂 90.33%、+ACAM 完整版 90.53% 方向为正 |
 
 **高频图的拼接问题**：小波分解出 LH/HL/HH 三个高频子带后，文献里有三种处理，**拼接成 3 通道只是其中一种**
 （详见 §1.3）。BDFR-Net 的 HF 支和本项目侧路都选拼接；老师指定的输入级边缘图选的是"重建回单通道"。
@@ -93,12 +93,14 @@ A' = A + γ_a · Proj(Attn(Q=A, K=B, V=B))     # A 的每个位置去 B 的所�
 **④ deform 可变形大核**（[BidirDeform L216](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L216-L260)）
 
 ```
-off = Conv3×3(red(B))                        # 从对方特征预测 5×5 卷积的采样偏移
-A'  = A + γ_a · Proj(DCNv2(red(A)处内容, off))  # 采样点跟着边界走，不是固定网格
+off = Conv3×3(red(A))                        # 偏移由"自己"的降维特征预测（不是对方）
+A'  = A + γ_a · Proj(DCN(red(B)处内容, off))    # 拿偏移到对方特征上采样，采样点跟着边界走
 ```
 
-先 1×1 降到 32~128 维再做可变形卷积（省参数）。偏移卷积零初始化 → 初始等价于固定网格卷积（输出非零），
-只有 γ=0 保证恒等起步。参数量 3.69 M，四个接点里最大。
+先 1×1 降到 32~128 维再做可变形卷积（省参数）。偏移卷积零初始化 → 初始等价于固定网格卷积
+（输出非零），只有 γ=0 保证恒等起步。参数量 3.69 M，四个接点里最大。
+术语消歧：torchvision `deform_conv2d` 未传 mask，是 v1 口径（只学偏移、无逐点幅度调制），
+不是 DCNv2。为什么本轮最好＋逐行代码：[deform-fusion-explained.md](deform-fusion-explained.md)。
 
 **⑤ aff 两级注意力融合**（[BidirAFF L287](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L287-L312)，核心是 [MS-CAM L263](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L263-L284)）
 
@@ -109,8 +111,9 @@ A' = A + γ_a · (A ⊙ m);  B' = B + γ_b · (B ⊙ (1-m))
 
 MS-CAM = 局部支路（保空间分布）+ 全局支路（GAP 抓通道显著性）相加过 sigmoid。
 与 gate 同属"只调幅度"家族，但权重是**两支联合**算出来的且互补（m 与 1-m）。参数量 0.47 M。
-**本轮训练崩溃**（GroupNorm 在 batch=1 的 1×1 特征上报 `Expected more than 1 value per channel`，
-log `logs/queue/faff1234_sparc_20261028_050536.log`），横评缺这一档，待修复重跑。
+首跑在 ep5 崩溃（GroupNorm 接在 GAP 后的 1×1 特征上，eval batch=1 报
+`Expected more than 1 value per channel`）；修复 = 全局支路改 SE 式 MLP 不带空间归一化，
+重跑成功。结果 90.17% / 0.1469 / 0.4011，五档垫底——"只调幅度"且权重全局化，比逐像素 gate 更差。
 
 **⑥ DDBE 三分支**（[ddbe.py](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py)，单级挂载，`--ddbe 3`）
 
@@ -125,6 +128,10 @@ x'  = x + CBAM(1×1_zero(cat(HF,LF,CTX)))     # 通道拼接 → 1×1（唯一�
 与其他算子的本质区别：**它不做双支路交换，而是单支路内部把特征按频段拆开再融合**，
 融合轴向是纯通道轴（同位置拼接），全程无 QKV。挂载点 = 解码器第 N 级输出
 （level3 = 112²/64ch，参数 0.440 M）。零初始化只放最后的 1×1，初始整支恒等。
+批次 0+1 已把挂载方式跑全：单级（`--ddbe 3`）90.08% 判负；**四级全挂**（`--ddbe 4`）
+90.33% / 0.1439 / 0.3936；**四级全挂 + ACAM skip 对齐**（`--ddbe 4 --acam 1`，BDFR 完整版）
+90.53% / 0.1441 / 0.3935——方向为正，ACAM 净贡献 +0.20% Dice；Wilcoxon 已补齐（见 §3）：
+四级全挂 p=0.462/0.288/0.876、完整版 p=0.334/0.419/0.731，均未过门槛。
 
 ### 2.2 损失与训练口径
 
@@ -140,20 +147,28 @@ mm 物理单位，每 5 epoch 评估，取 ep150。同一 seed（1234）下所�
 
 | 配置（SPARC, ep150） | Dice ↑ | ASSD ↓ | HD95 ↓ | 相对 auto 的差 |
 |---|---|---|---|---|
-| 基线 A0（seed1234 重建） | 0.8995 | 0.1498 | 0.3997 | — |
-| dual **auto** | 0.9040 | 0.1476 | 0.4064 | 基准 |
-| dual **gate** | 0.9035 | 0.1434 | 0.4034 | HD95 −0.003 → 无差异 |
-| dual **deform** | **0.9061** | **0.1412** | **0.3788** | **HD95 −0.028** |
-| dual aff | 训练崩溃 | — | — | 缺档 |
-| baseline + DDBE(level3) | 0.9008 | 0.1513 | 0.4404 | vs 基线：HD95 **+0.041 变差** |
+| 基线 A0（seed1234 重建） | 89.95% | 0.1498 | 0.3997 | — |
+| dual **auto** | 90.40% | 0.1476 | 0.4064 | 基准 |
+| dual **gate** | 90.35% | 0.1434 | 0.4034 | HD95 −0.003 → 无差异 |
+| dual **deform** | **90.61%** | **0.1412** | **0.3788** | **HD95 −0.028** |
+| dual aff（重跑） | 90.17% | 0.1469 | 0.4011 | Dice −0.23%，五档垫底 |
+| baseline + DDBE(level3) | 90.08% | 0.1513 | 0.4404 | vs 基线：HD95 **+0.041 变差** |
+| baseline + DDBE 四级全挂 | 90.33% | 0.1439 | 0.3936 | vs 基线：Dice +0.37% |
+| baseline + DDBE×4 + ACAM | 90.53% | 0.1441 | 0.3935 | vs 基线：Dice +0.57% |
 
 怎么读：
 
 1. **deform 是本轮唯一全面变好的档**（三项都优于 auto），但幅度 HD95 −0.028 mm 远小于事先写死的
    0.5 mm 判定线——方向对，量级不够；
-2. gate 与 auto 差值全在噪声带 → **"调幅度 vs 重组内容"这两种轴向在本任务上不敏感**；
-3. DDBE 单级挂载 Dice 只 +0.0012 且 HD95 变差 → 按 experiments.md §1.7 判定表**大概率不过门槛**，
-   正式 p 值待病例级 Wilcoxon；不过则四级全量不排。
+2. gate 与 auto 差值全在噪声带，aff 垫底 → **"调幅度 vs 重组内容"这两种轴向在本任务上不敏感**，
+   且权重越全局化越差（逐像素 gate > 全局 MS-CAM）；
+3. DDBE 单级挂载 Dice 只 +0.12% 且 HD95 变差 → **判负**；但四级全挂与 +ACAM 完整版方向为正
+   （ΔDice +0.37% / +0.57%，HD95 −0.006 mm），证明 BDFR 论文"每级都挂 + 每级 ACAM"的挂载方式
+   才是对的，单级挂载没有意义；
+4. **病例级 Wilcoxon（43 例配对，vs 基线）已全部补齐**：deform ΔDice p=0.113、ΔASSD p=0.154、
+   ΔHD95 p=0.276；gate 三项 p≥0.33；aff p=0.454/0.663/0.375；DDBE 四级 p=0.462/0.288/0.876、
+   DDBE+ACAM p=0.334/0.419/0.731；mainLL p=0.447/0.742/0.426；双骨干 auto 在 seed3407 上显著
+   **变差**（Dice p=0.0036、ASSD p=0.0097）——横评排序成立，显著性全部不成立。
 
 ## 4. 代码实现在哪里
 
@@ -164,11 +179,14 @@ mm 物理单位，每 5 epoch 评估，取 ep150。同一 seed（1234）下所�
 
 ## 5. 结论边界与其他
 
-**能说**：同 seed 同口径下 deform > auto > gate（SPARC 单 seed）；DDBE 单级门槛验证初读不通过。
-**不能说**：① deform 显著优于 auto（未到 0.5 mm 判定线，也还没有 p 值）；② 任何 Zhongnan 上的结论
-（本轮全是 SPARC）；③ aff 好坏（没跑完）；④ "双骨干无增益"的最终结论（3 seed 交叉在 status.md）。
+**能说**：同 seed 同口径下 deform > auto > gate > aff（SPARC 单 seed，aff 垫底）；deform 方向三项全正
+但 Wilcoxon p=0.113/0.154/0.276 均不显著；DDBE 单级判负（HD95 +0.041 mm），四级全挂 / +ACAM 完整版
+方向为正但 p=0.33~0.88 也不显著；mainLL 与主路原图无差异（p=0.447/0.742/0.426）；双骨干 3-seed 交叉
+无增益（seed3407 显著变差，p=0.0036）。
+**不能说**：① deform 显著更好（未过「HD95 降 ≥0.5 mm 且 p<0.05」门槛）；② 任何 Zhongnan 上的结论
+（本轮全是 SPARC）；③ DDBE 四级 / +ACAM 或 mainLL 有增益（方向为正、均不显著）。
 
-已知局限：单 seed（1234）；aggregate 口径未做病例级配对 Wilcoxon（待跑）；aff 缺档。
+已知局限：融合算子横评为单 seed（1234）；43 例检验功效不足，+0.006 量级的 Dice 差判不了显著性。
 
 复现命令：
 

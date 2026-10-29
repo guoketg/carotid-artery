@@ -80,7 +80,7 @@ def eval_ckpt(args):
 
     s = summarize(records)
     print(f"[eval] {args.out}")
-    print(f"[eval] n={s['n_cases']} dice={s['dice']['mean']:.4f}±{s['dice']['std']:.4f} "
+    print(f"[eval] n={s['n_cases']} dice={s['dice']['mean'] * 100:.2f}%±{s['dice']['std'] * 100:.2f}% "
           f"assd={s['assd']['mean']:.3f}±{s['assd']['std']:.3f} "
           f"hd95={s['hd95']['mean']:.2f}±{s['hd95']['std']:.2f} "
           f"delta_area={s['delta_area']['mean']:.1f}±{s['delta_area']['std']:.1f} "
@@ -123,7 +123,11 @@ def compare(baseline_csv, variant_csv):
         a = np.array([float(base[c][key]) for c in common])
         b = np.array([float(var[c][key]) for c in common])
         p = wilcoxon(b, a).pvalue if np.any(a != b) else 1.0
-        print(f"{key:<14}{a.mean():>10.4f}{b.mean():>10.4f}{(b - a).mean():>10.4f}{p:>14.4f}")
+        if key == "dice":
+            print(f"{key:<14}{a.mean() * 100:>9.2f}%{b.mean() * 100:>9.2f}%"
+                  f"{(b - a).mean() * 100:>+9.2f}%{p:>14.4f}")
+        else:
+            print(f"{key:<14}{a.mean():>10.4f}{b.mean():>10.4f}{(b - a).mean():>10.4f}{p:>14.4f}")
 
 
 def main():

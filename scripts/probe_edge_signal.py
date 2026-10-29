@@ -201,10 +201,10 @@ def part_b(train_img, train_lab, test_img, test_lab, epochs, seed=1234):
         nparam = sum(p.numel() for p in model.parameters())
         results[variant] = d
         print(f"  变体 {variant:<8} in_ch={1 if variant in ('raw','hf') else 2}  "
-              f"参数 {nparam/1e6:.3f}M  test Dice = {d:.4f}   ({time.time()-t0:.0f}s)")
+              f"参数 {nparam/1e6:.3f}M  test Dice = {d * 100:.2f}%   ({time.time()-t0:.0f}s)")
 
-    print(f"\n  差值：raw+HF − raw = {results['raw_hf'] - results['raw']:+.4f}")
-    print(f"        HF 单独       = {results['hf']:.4f}（边缘图自己能做到多少）")
+    print(f"\n  差值：raw+HF − raw = {(results['raw_hf'] - results['raw']) * 100:+.2f}%")
+    print(f"        HF 单独       = {results['hf'] * 100:.2f}%（边缘图自己能做到多少）")
     return results
 
 

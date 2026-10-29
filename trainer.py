@@ -151,7 +151,9 @@ def trainer_synapse(args, model, snapshot_path):
                     f, fieldnames=["epoch", "dice", "assd", "hd95", "abs_delta_area"])
                 curve_writer.writeheader()
                 curve_writer.writerows(curve_rows)
-            logging.info("epoch %d test curve: %s" % (epoch_num + 1, curve_rows[-1]))
+            row = curve_rows[-1]
+            logging.info("epoch %d test curve: dice=%.2f%% assd=%.3f hd95=%.2f |dA|=%.1f" % (
+                epoch_num + 1, row["dice"] * 100, row["assd"], row["hd95"], row["abs_delta_area"]))
 
         save_interval = 50  # int(max_epoch/6)
         if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
@@ -190,5 +192,11 @@ def trainer_synapse(args, model, snapshot_path):
             writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "delta_area"])
             writer_csv.writeheader()
             writer_csv.writerows(records)
-        logging.info("test summary: " + str(summary))
+        logging.info("test summary: dice=%.2f%%±%.2f%% assd=%.3f±%.3f hd95=%.2f±%.2f "
+                     "dA=%.1f±%.1f |dA|=%.1f" % (
+                         summary["dice"]["mean"] * 100, summary["dice"]["std"] * 100,
+                         summary["assd"]["mean"], summary["assd"]["std"],
+                         summary["hd95"]["mean"], summary["hd95"]["std"],
+                         summary["delta_area"]["mean"], summary["delta_area"]["std"],
+                         summary["abs_delta_area"]["mean"]))
     return "Training Finished!"

@@ -177,7 +177,10 @@ def main():
     logger("test summary:")
     for key in ["dice", "assd", "hd95", "delta_area", "abs_delta_area"]:
         item = summary[key]
-        logger(f"  {key}: {item['mean']:.4f} +/- {item['std']:.4f}")
+        if key == "dice":
+            logger(f"  {key}: {item['mean'] * 100:.2f}% +/- {item['std'] * 100:.2f}%")
+        else:
+            logger(f"  {key}: {item['mean']:.4f} +/- {item['std']:.4f}")
     logger(f"saved: {csv_path}")
 
 

@@ -107,9 +107,9 @@ def main():
         lines.append("| # | 方案 | Dice | ASSD | HD95 | |ΔArea| | ΔDice vs base | best_ep | cases |")
         lines.append("|---|---|---|---|---|---|---|---|---|")
         for i, r in enumerate(done, 1):
-            dd = ("%+.4f" % (r["dice"] - base_dice)) if base_dice is not None else "-"
-            lines.append("| %d | %s | %.4f | %.2f | %.2f | %.1f | %s | %d | %d |" % (
-                i, r["name"], r["dice"], r["assd"], r["hd95"],
+            dd = ("%+.2f" % ((r["dice"] - base_dice) * 100)) if base_dice is not None else "-"
+            lines.append("| %d | %s | %.2f%% | %.2f | %.2f | %.1f | %s | %d | %d |" % (
+                i, r["name"], r["dice"] * 100, r["assd"], r["hd95"],
                 r["abs_delta_area"], dd, r["best_ep"], r["n_case"]))
     pending = [r for r in records if r["status"] != "done"]
     if pending:

@@ -98,7 +98,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 - 融合位置为 **ViT 输出瓶颈（14×14，196 token）**，不是原设计的 stage2/3 skip：实现简单、注意力开销低，单通道原图基线完全不受影响。偏差已记入 `technical-design.md`。
 - batch=8 实测：峰值显存 3.3GB，纯模型单步 0.36s，含数据约 0.5s，SPARC 约 27s/epoch。
 - 夜间队列 6 个任务，统一 `--max_epochs 120 --eval_test_every 10`，顺序 a0_sparc → a3_sparc → a1_sparc → a0_zhongnan → a3_zhongnan → a1_zhongnan（依次为单通道原图基线、三通道＋小波引导注意力、三通道早融合，SPARC 与 Zhongnan 各一轮），预计 6 小时。
-- 冒烟（1 epoch，仅验证链路）：三通道早融合 dice 0.745，三通道＋小波引导注意力 dice 0.756。
+- 冒烟（1 epoch，仅验证链路）：三通道早融合 dice 74.5%，三通道＋小波引导注意力 dice 75.6%。
 - 2026-10-24 12:30 起训练 DataLoader 加 `persistent_workers=True`：实测 GPU 每 epoch 空转 6–7 s（GPU 利用率 0%、功耗 6W，worker 进程被销毁重建），约占 wall time 25%。**早期的单通道原图基线、三通道＋小波引导注意力、三通道早融合三个 job（`a0_sparc` / `a3_sparc` / `a1_sparc`）为旧配置，`a0_zhongnan` 及之后为新配置**；该改动使增强随机序列跨 epoch 变化（旧配置每 epoch 重置 seed，增强序列完全相同）。
 
 ## 1. 环境
@@ -127,7 +127,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 | TransUNet 在 Windows 下加载 npz 报 `KeyError: 'Transformer/...\kernel'` | `vit_seg_modeling.py` 与 `vit_seg_modeling_resnet_skip.py` 的 `pjoin` 改为 `"/".join(args)` |
 | `requirements.txt` 固定 torch 1.4.0 | 按实际 venv 重写 |
 | git origin 指向原仓库 | 改为 `https://github.com/guoketg/carotid-artery` |
-| 训练结束写 `metrics.csv` 时重建 `CarotidDataset` 漏传 `use_wavelet`，导致小波模型用非小波输入评估（SPARC_w3 0.8906 vs 实际 0.9079；Zhongnan_w3_cross 0.8579 vs 0.9077） | 2026-10-24 15:18 在 `trainer.py` 末尾评估处补上 `use_wavelet=bool(args.use_wavelet)`；新增 `scripts/eval_carotid.py`（支持 `--use_wavelet/--fusion` 与 `--baseline_csv` 配对检验），已重算全部 6 个模型的 `metrics.csv`（`test_curve.csv` 不受影响，可信） |
+| 训练结束写 `metrics.csv` 时重建 `CarotidDataset` 漏传 `use_wavelet`，导致小波模型用非小波输入评估（SPARC_w3 89.06% vs 实际 90.79%；Zhongnan_w3_cross 85.79% vs 90.77%） | 2026-10-24 15:18 在 `trainer.py` 末尾评估处补上 `use_wavelet=bool(args.use_wavelet)`；新增 `scripts/eval_carotid.py`（支持 `--use_wavelet/--fusion` 与 `--baseline_csv` 配对检验），已重算全部 6 个模型的 `metrics.csv`（`test_curve.csv` 不受影响，可信） |
 
 ## 4. 进度
 
@@ -183,7 +183,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 - **探针验证**：总 121.66M（主 105.28 / 侧 12.68 / 融合 3.70；112×112 接点 0.017、56×56 接点 0.264、28×28 接点 1.053、14×14 接点 2.366）；`γ=0` 与单通道原图基线逐元素 `max|Δ| = 0`。
 - **显存/单步**：batch 2/4/6/8 = 2.13GB/267.9ms、3.32GB/319.8ms、4.21GB/416.3ms、5.01GB/1101.6ms。
   batch 8 超过 8GB 卡的可用显存后进入 WDDM 换页（共享显存走 PCIe），单步 2.6× 惩罚，**不是算力瓶颈**。结论：**batch 4 + `--grad_accum 2`**（等效 8，0.64 s/optimizer-step，峰值 3.32GB）。
-- **冒烟**：SPARC 1 epoch 57 s（含 82 张测试推理），dice 0.7948 / assd 9.92 / hd95 24.50 / abs_delta_area 4028.4，`metrics.csv`、`test_curve.csv` 正常产出。
+- **冒烟**：SPARC 1 epoch 57 s（含 82 张测试推理），dice 79.48% / assd 9.92 / hd95 24.50 / abs_delta_area 4028.4，`metrics.csv`、`test_curve.csv` 正常产出。
 - **耗时（2026-10-24 实测修正）**：早先按 34.6 s/epoch 估的 72 min/job 是错的。全量 SPARC 实测 **0.70 s/iter × 107 iter ≈ 75 s/epoch → 120 epoch ≈ 2.5 h/job**。`nvidia-smi` 同期只有 63% util / 34 W / 1560 MHz，瓶颈是 dataloader（`num_workers=1` + `nib.load`），不是算力；`num_workers` 受 CLAUDE.md 约束不能调大。
 - **夜间队列** `scripts/night_queue_dual.ps1`：四点全开·窗内/全局自适应融合（`r1`）→ 跨支门控（`r2`）→ 拼接回投影对照（`r3`）→ 仅侧路到主路单向（`r7`），各跑 SPARC + Zhongnan，共 8 job（按实测口径 ≈ 20 h）。状态写 `logs/queue/queue_dual_status.csv`。
 - 已知坑：`fuse_op=auto` 的档位判据必须是 `res >= 56` 用窗内、否则全局；写反时 112×112 融合接点误用全局注意力，单次 265ms（正确应 6.0ms）。
@@ -231,14 +231,14 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 | 配置 | 跨支注意力/可变形分支 | 跨尺度回流 | epoch 120 Dice |
 |---|---|---|---|
-| 单通道原图基线 | — | — | 0.9092 |
-| 原图＋去噪重建＋高频能量三通道早融合 | — | — | 0.9079 |
-| 三通道＋小波引导注意力（旧轻量路线） | — | — | 0.9087 |
-| 双骨干·窗内/全局自适应融合 `auto` | **冻结** | — | 0.9117 |
-| 双骨干·可变形大核 `deform` | **冻结** | — | 0.9088 |
-| 双骨干·自适应融合＋跨尺度回流 `auto_cs` | **冻结** | 正常学 | 0.9093 |
+| 单通道原图基线 | — | — | 90.92% |
+| 原图＋去噪重建＋高频能量三通道早融合 | — | — | 90.79% |
+| 三通道＋小波引导注意力（旧轻量路线） | — | — | 90.87% |
+| 双骨干·窗内/全局自适应融合 `auto` | **冻结** | — | 91.17% |
+| 双骨干·可变形大核 `deform` | **冻结** | — | 90.88% |
+| 双骨干·自适应融合＋跨尺度回流 `auto_cs` | **冻结** | 正常学 | 90.93% |
 
-- 前三个是旧路线（本来就没有该融合块），后三个里 `auto` / `deform` 的融合分支全程冻结，模型等价于「基线 + 一批不参与计算、也不更新的参数」；它们与基线的差异（0.9079~0.9117 全距 0.0038）落在初始化/随机数差异的噪声带内，**不能作为"融合有/无增益"的证据**。
+- 前三个是旧路线（本来就没有该融合块），后三个里 `auto` / `deform` 的融合分支全程冻结，模型等价于「基线 + 一批不参与计算、也不更新的参数」；它们与基线的差异（90.79%~91.17% 全距 0.38%）落在初始化/随机数差异的噪声带内，**不能作为"融合有/无增益"的证据**。
 - `auto_cs` 是唯一部分有效的：`cs_gamma` 乘的是非零的 `cs43(ta)`，跨尺度回流确实在训；但它的四级跨支融合仍是冻结的。
 - `--fuse_op aff` 不受死锁影响（该档没有输出投影，γ 乘的是非零的 `A*m`）；但白天 11:03 那次没有产出 `test_curve.csv`，15:05 的 `aff` 重跑 3 分钟后中断，等于**AFF 档至今没有一次完整结果**。
 
@@ -278,18 +278,18 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 | 配置 | Dice | ASSD | HD95 | \|ΔArea\| | 融合分支状态 |
 |---|---|---|---|---|---|
-| 单通道原图基线（bs8） | **0.9092** | **3.809** | **10.022** | **945.1** | — |
-| 三通道早融合（bs8） | 0.9079 | 3.818 | 9.997 | 1017.9 | — |
-| 三通道＋小波引导注意力（bs8） | 0.9087 | 3.892 | 10.041 | 1065.0 | — |
-| 自适应融合 `auto`（bs4+ga2） | 0.9117 | 3.714 | 9.981 | 943.5 | 冻结 |
-| 可变形大核 `deform`（bs4+ga2） | 0.9088 | 3.861 | 10.163 | 986.2 | 冻结 |
-| 自适应＋跨尺度回流 `auto_cs`（bs4+ga2） | 0.9093 | 3.877 | 10.175 | 973.8 | 融合冻结、回流正常 |
-| **窗内融合 `window_rerun1`（bs4+ga2）** | **0.9051** | 3.940 | 10.127 | 1024.8 | **正常学** |
+| 单通道原图基线（bs8） | **90.92%** | **3.809** | **10.022** | **945.1** | — |
+| 三通道早融合（bs8） | 90.79% | 3.818 | 9.997 | 1017.9 | — |
+| 三通道＋小波引导注意力（bs8） | 90.87% | 3.892 | 10.041 | 1065.0 | — |
+| 自适应融合 `auto`（bs4+ga2） | 91.17% | 3.714 | 9.981 | 943.5 | 冻结 |
+| 可变形大核 `deform`（bs4+ga2） | 90.88% | 3.861 | 10.163 | 986.2 | 冻结 |
+| 自适应＋跨尺度回流 `auto_cs`（bs4+ga2） | 90.93% | 3.877 | 10.175 | 973.8 | 融合冻结、回流正常 |
+| **窗内融合 `window_rerun1`（bs4+ga2）** | **90.51%** | 3.940 | 10.127 | 1024.8 | **正常学** |
 
-- 相对单通道基线：Dice **−0.0041（−0.41 个点）**、ASSD +0.131、HD95 +0.105、\|ΔArea\| +79.7，**四项全部变差**；相对三通道早融合 Dice −0.0028。
+- 相对单通道基线：Dice **−0.41%**、ASSD +0.131、HD95 +0.105、\|ΔArea\| +79.7，**四项全部变差**；相对三通道早融合 Dice −0.28%。
 - 不是"后期运气差"：12 个评估点里 10 个低于基线同步 epoch（差最大在 ep50，−1.34 个点；ep70 后收敛到 0.25 个点以内，ep120 为 −0.41），只有 ep20（+0.20）、ep110（+0.04）略高。注意这些 epoch 强相关，不能当独立样本做符号检验，只作方向性参考。
 - γ 实测（`log.txt`，ep1–ep30）：F1 0.07~0.10 / 0.01~0.03，F2 0.02~0.06 / 0.02~0.04，F3 0.05~0.09 / 1e-4~5e-4，F4 0.01~0.02 / **0.0**。前三级双向均在学，最深接点 `gamma_b` 30 个 epoch 一次没离开 0，与 4.5.3 的死亡支路判断一致。
-- **结论口径**：严格表述为「**没有观察到增益，方向上偏向变差**」。不能说"显著变差"——单 seed 无法估计方差，0.004 落在 4.5.2 测得的配置间噪声带量级内。
+- **结论口径**：严格表述为「**没有观察到增益，方向上偏向变差**」。不能说"显著变差"——单 seed 无法估计方差，−0.41% 落在 4.5.2 测得的配置间噪声带量级内。
 - **两个未消掉的混杂**（下一步必须先解掉，否则这条结论仍然不干净）：
   1. **基线口径不一致**：基线/三通道那批是 `bs8` 直接一步，dual 全部是 `bs4 + grad_accum 2`。等效 batch 相同但梯度路径不同（BN 统计、优化器步频），差值的 0.3~0.4 个点里有多少来自这里未知。需要补一个 `bs4+ga2` 的单通道基线。
   2. **单 seed**（1234）。要给"变差"下统计结论，至少 1234 / 2024 / 3407 三个 seed。
@@ -317,7 +317,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 2. **HF 图构造方式可疑**：现状是三个半分辨率子带 `concat` 后双线性上采样到 224²，有 2×2 块状伪影、三通道冗余；XNet / GobletNet 都是 **IDWT 重建一张全分辨率 HF 图（`LL` 置零）**。
 3. 口径未消（baseline `bs8` vs 融合 `bs4 + grad_accum 2`）。
 4. 单 seed + 小测试集，检测 +0.5 Dice 约需 128 对病例（α=0.05, power=0.8）。
-5. 天花板效应：Dice 0.909 / HD95≈10，残差集中在边界几像素；融合改善的是全局语义一致性。
+5. 天花板效应：Dice 90.9% / HD95≈10，残差集中在边界几像素；融合改善的是全局语义一致性。
 6. 颈动脉回声特性：真正难点是钙化后方声影导致的**信号缺失**，频域增强补不回来。
 
 ### 4.6.3 下一轮顺序（**均未开始**）
@@ -350,11 +350,11 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 **指标物理单位化（已实施 + 验证）**：距离指标不再在 224 网格上按像素计——`metrics_carotid.py` 新增 `original_grid_pair()`，把预测最近邻重采样回原分辨率网格，与原分辨率 GT、NIfTI 头 spacing（实测 SPARC 0.065~0.068、Zhongnan 0.067 mm/px，非正方形约 2:3）一起交给 medpy `assd`/`hd95` 的 `voxelspacing` 参数。**assd/hd95 单位 mm，DeltaArea 单位 mm²，Dice 改在原分辨率网格上算（与 224 网格差 <0.6%）**。验证脚本（临时目录，已删）：原网格 GT 膨胀 3px 造模拟预测，校正后相对物理参考 assd 误差 ≤9.2%、hd95 ≤17.4%；**直接传头 zooms 到 224 网格会失真 0.83×~6.67×（随图像尺寸翻转方向），故必须重采样回原网格或逐轴换算 spacing**。改动点：`metrics_carotid.py` 全量、`trainer.py` `_eval_test` 签名/调用/末尾最终评估、`scripts/eval_carotid.py` import 与循环。
 
-**口径断代**：4.5 节全部数字为「旧划分 + 像素口径」双重旧口径；2026-10-26 起的实验为「官方划分 + mm/mm² 口径」。冒烟 summary（2 epoch 基线参考起步）：dice 0.806±0.111、assd 0.338±0.292 mm、hd95 1.014±1.102 mm、|delta_area| 4.95 mm²（n=160）。
+**口径断代**：4.5 节全部数字为「旧划分 + 像素口径」双重旧口径；2026-10-26 起的实验为「官方划分 + mm/mm² 口径」。冒烟 summary（2 epoch 基线参考起步）：dice 80.6%±11.1%、assd 0.338±0.292 mm、hd95 1.014±1.102 mm、|delta_area| 4.95 mm²（n=160）。
 
 **XNet 式低频主路（已实现，实验未跑）**：`--main_input ll`（train.py L67-68 argparse、L129 快照后缀 `_mainLL`、L157 透传；`dual_encoder_model.py` `build_ll_image` + forward 分支），主路吃小波 LL 低频近似图、高频信息全在侧路。待新一轮基线跑完后与双骨干原图对照。
 
-**基线 A 结果与 epoch 决策**：单通道原图基线 200 epoch 跑完，曲线 150 即饱和（dice 0.9049、assd 0.1431 mm、hd95 0.3896 mm @150；150~200 平台噪声内波动，后 50 epoch 无实质贡献）。**固定 epoch = 150（epoch_149.pth），全部后续实验复用**；job 可训到 epoch_149.pth 即停。详见 experiments.md「epoch 选择」。双骨干原图 job 起跑时曾因 forward 单通道分支漏 `raw = x` 崩溃（UnboundLocalError），2026-10-26 已修复，双骨干原图/低频两模式 1 epoch 冒烟均通过（dice 0.768/0.725，融合 γ 梯度非零）后正式开跑。
+**基线 A 结果与 epoch 决策**：单通道原图基线 200 epoch 跑完，曲线 150 即饱和（dice 90.49%、assd 0.1431 mm、hd95 0.3896 mm @150；150~200 平台噪声内波动，后 50 epoch 无实质贡献）。**固定 epoch = 150（epoch_149.pth），全部后续实验复用**；job 可训到 epoch_149.pth 即停。详见 experiments.md「epoch 选择」。双骨干原图 job 起跑时曾因 forward 单通道分支漏 `raw = x` 崩溃（UnboundLocalError），2026-10-26 已修复，双骨干原图/低频两模式 1 epoch 冒烟均通过（dice 76.8%/72.5%，融合 γ 梯度非零）后正式开跑。
 
 ### 4.7 2026-10-27 换机收尾：队列盘点 + 边缘特征融合落地
 
@@ -364,7 +364,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 | 分类 | 数量 | 明细 | 状态 |
 |---|---|---|---|
-| 新口径**已跑完** | 1 | 单通道原图基线 SPARC seed1234（dice 0.9049 / assd 0.1431 mm / hd95 0.3896 mm @ep150） | 结果在案，**权重不在本机**，需重跑才能拿到 `.pth` |
+| 新口径**已跑完** | 1 | 单通道原图基线 SPARC seed1234（dice 90.49% / assd 0.1431 mm / hd95 0.3896 mm @ep150） | 结果在案，**权重不在本机**，需重跑才能拿到 `.pth` |
 | 新口径**正在跑** | 1 | `d1234_sparc`（双骨干 auto seed1234） | 队列第 1 个 job |
 | 新口径**队列内待跑** | 6 | `b2024_sparc`、`b3407_sparc`、`d2024_sparc`、`d3407_sparc`、`b1234_zhongnan`、`d1234_zhongnan` | 已排期 |
 | **状态未知** | 2 | 2026-10-26「双骨干原图 job 正式开跑」的结果未记录在案；基线 seed1234 的权重也不在本机 | 需重跑消歧 |
@@ -384,7 +384,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 接力脚本的等待条件：`无 train.py 进程` **且**（`主队列 status.csv 已写满 7 行` **或** `主队列进程已退出`）→ 后者保证主队列万一被打断时 GPU 也不会空转。**注意：edge 队列是等主队列 7 个 job 全跑完才开跑**（不是插空跑），所以 edge 的第一个结论要到 10-28 早上才有。
 
-**2026-10-27 20:36 实时状态**：`d1234_sparc` 跑到 **epoch 60/200**（iteration 2675 / 8800），曲线 dice 0.8986 / assd 0.1562 mm / hd95 0.4323 mm；GPU 90% util / 4874 MiB（12 GB 卡，够再排一个 job）。作为参照，单通道原图基线 seed1234 在 **ep150** 是 dice 0.9049 / assd 0.1431 mm / hd95 0.3896 mm —— dual 在 ep60 已基本追平量级，ep150 才能下结论。
+**2026-10-27 20:36 实时状态**：`d1234_sparc` 跑到 **epoch 60/200**（iteration 2675 / 8800），曲线 dice 89.86% / assd 0.1562 mm / hd95 0.4323 mm；GPU 90% util / 4874 MiB（12 GB 卡，够再排一个 job）。作为参照，单通道原图基线 seed1234 在 **ep150** 是 dice 90.49% / assd 0.1431 mm / hd95 0.3896 mm —— dual 在 ep60 已基本追平量级，ep150 才能下结论。
 
 #### 4.7.2 边缘特征融合·输入级（已实现 + 冒烟通过）
 
@@ -436,7 +436,7 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 **不可外推的边界（必须随结论一起说）**：
 
 - 小网络 0.061M、20 epoch、无数据增强、单 seed、n=160/187 切片，**不是病例级配对**（同一切片同时出现在两边），无法做病例级配对 Wilcoxon 检验；
-- 真模型基线 Dice 已 **0.9049**，小网络门槛实验的 +0.018 绝对增量在真模型上**大概率远小于 0.018**，甚至可能被 105M 参数的容量优势淹没；
+- 真模型基线 Dice 已 **90.49%**，小网络门槛实验的 +1.8% 绝对增量在真模型上**大概率远小于 1.8%**，甚至可能被 105M 参数的容量优势淹没；
 - 因此 Part B 只回答「信息增不增量」，**不回答「真模型上赚不赚」**——后者必须等正式 200-epoch job 的配对结果（HD95 ↓≥0.5 mm 且 p<0.05）。
 
 #### 4.7.3 隐私处理（病人数据不入仓库）

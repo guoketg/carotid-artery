@@ -186,7 +186,7 @@
 排班依据与两个意外发现：
 
 - **aff / gate / deform 零实现成本**（算子已在 `networks/` 实现且过零初始化等价性），先横评融合算子，与已完成的 `d1234_sparc`（auto）同 seed 配对；
-- **发现 1**：A0 基线 seed1234 的新口径产物（`..._SPARC_c2d/` 的 `test_curve.csv`、`metrics.csv`，§3 epoch 选择即依据它）在本机已不存在——全盘（C:/E:）搜不到。ddbe3 的病例级 Wilcoxon 必须有同 seed 配对对照，故**补跑 job 5**恢复之（aggregate 数字 status.md §3.1 已存档，跑完核对是否复现 0.9049/0.1431/0.3896）；
+- **发现 1**：A0 基线 seed1234 的新口径产物（`..._SPARC_c2d/` 的 `test_curve.csv`、`metrics.csv`，§3 epoch 选择即依据它）在本机已不存在——全盘（C:/E:）搜不到。ddbe3 的病例级 Wilcoxon 必须有同 seed 配对对照，故**补跑 job 5**恢复之（aggregate 数字 status.md §3.1 已存档，跑完核对是否复现 90.49%/0.1431/0.3896）；
 - **发现 2**：`b3407_sparc` 上一轮在 epoch≈50 被中途杀掉（log 止于 iteration 2163、无 `metrics.csv`），但 `queue_c2d.ps1` 的 `-Skip` 把它跳过了、status.md 仍写「排队」——故**补跑 job 6**；
 - **本轮不碰 QKV、不上四级全量 DDBE**：DDBE 只做 level3 单级门槛验证，过了门槛再谈全量（写在跑之前，避免事后解释）。
 
@@ -207,48 +207,48 @@
 - `faff1234`（dual `--fuse_op aff`）在 epoch 5 首次测试时崩溃（exit 1，仅存活 1.8 min）：`_MSCAM` 全局支路的 GroupNorm 在 GAP 后 1×1 空间 + eval batch=1 时校验失败（`input size [1, 8, 1, 1]`）。**修复**：[dual_encoder_model.py](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py) 的 `_MSCAM.glb` 去掉 GroupNorm，改带 bias 的 SE 式 MLP（局部支路保留 GN）；冒烟（eval batch1 前向 + train batch4 反向）通过，批次 0 重跑。
 - **时点错位**：`trainer.py` 末尾 `metrics.csv` 是 ep199 的逐切片指标，与 ep150 判定点不符 → 用 `epoch_149.pth` 重算。[scripts/eval_carotid.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_carotid.py) 已扩展：`build_model` 支持三分支（baseline/dual/fusion + edge_in/ddbe），新增病例级聚合 `_group_by_case`（同病例多切片先取均值再配对，§1.6 口径）与 CLI 全参数；批量驱动 [scripts/eval_batch_ep149.ps1](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_batch_ep149.ps1)。全部 11 个有效快照重算完毕，每个 ~0.3 min，逐切片汇总与 `test_curve.csv` ep150 完全吻合（交叉验证通过）。
 
-**ep150 逐切片汇总**（n=160，SPARC test；Dice / ASSD mm / HD95 mm）：
+**ep150 逐切片汇总**（n=160，SPARC test；Dice % / ASSD mm / HD95 mm）：
 
 | job | 配置 | Dice | ASSD | HD95 |
 |---|---|---|---|---|
-| b1234 | A0 基线 seed1234 | 0.8995 | 0.1498 | 0.3997 |
-| b2024 | A0 基线 seed2024 | 0.9027 | 0.1498 | 0.4146 |
-| b3407 | A0 基线 seed3407 | 0.9026 | 0.1508 | 0.4303 |
-| dauto1234 | dual auto（L1234，双向）s1234 | 0.9040 | 0.1476 | 0.4064 |
-| dauto2024 | dual auto s2024 | 0.9011 | 0.1468 | 0.4036 |
-| dauto3407 | dual auto s3407 | 0.8985 | 0.1570 | 0.4461 |
-| gate1234 | dual gate s1234 | 0.9035 | 0.1434 | 0.4034 |
-| deform1234 | dual deform s1234 | **0.9061** | **0.1412** | **0.3788** |
-| ddbe3 | baseline `--ddbe 3` s1234 | 0.9008 | 0.1513 | 0.4404 |
-| edge1234 | baseline `--edge_in 1` s1234 | 0.9020 | 0.1476 | 0.3973 |
-| edgedual | dual auto + edge_in s1234 | **0.9072** | 0.1416 | 0.3895 |
+| b1234 | A0 基线 seed1234 | 89.95% | 0.1498 | 0.3997 |
+| b2024 | A0 基线 seed2024 | 90.27% | 0.1498 | 0.4146 |
+| b3407 | A0 基线 seed3407 | 90.26% | 0.1508 | 0.4303 |
+| dauto1234 | dual auto（L1234，双向）s1234 | 90.40% | 0.1476 | 0.4064 |
+| dauto2024 | dual auto s2024 | 90.11% | 0.1468 | 0.4036 |
+| dauto3407 | dual auto s3407 | 89.85% | 0.1570 | 0.4461 |
+| gate1234 | dual gate s1234 | 90.35% | 0.1434 | 0.4034 |
+| deform1234 | dual deform s1234 | **90.61%** | **0.1412** | **0.3788** |
+| ddbe3 | baseline `--ddbe 3` s1234 | 90.08% | 0.1513 | 0.4404 |
+| edge1234 | baseline `--edge_in 1` s1234 | 90.20% | 0.1476 | 0.3973 |
+| edgedual | dual auto + edge_in s1234 | **90.72%** | 0.1416 | 0.3895 |
 | faff1234 | dual aff s1234 | ❌ 崩溃（见上），批次 0 重跑 | | |
 
 **病例级配对 Wilcoxon**（43 例，同病例切片先均值再配对；基线 = 对应 seed 的 A0）：
 
 | 比较 | ΔDice（病例级） | p(Dice) | p(ASSD) | p(HD95) |
 |---|---|---|---|---|
-| dauto1234 vs b1234 | +0.0038 | 0.209 | 0.294 | 0.385 |
-| dauto2024 vs b2024 | +0.0000 | 0.816 | 0.586 | 0.385 |
-| dauto3407 vs b3407 | **−0.0049** | **0.0036** ✗ | **0.0097** ✗ | 0.104 |
-| gate1234 vs b1234 | +0.0027 | 0.663 | 0.742 | 0.333 |
-| deform1234 vs b1234 | +0.0059 | 0.113 | 0.154 | 0.276 |
-| ddbe3 vs b1234 | −0.0003 | 0.680 | 0.881 | 0.093 |
-| edge1234 vs b1234 | +0.0027 | 0.595 | 0.447 | 0.891 |
-| edgedual vs b1234 | +0.0062 | 0.069 | 0.223 | 0.791 |
+| dauto1234 vs b1234 | +0.38% | 0.209 | 0.294 | 0.385 |
+| dauto2024 vs b2024 | +0.00% | 0.816 | 0.586 | 0.385 |
+| dauto3407 vs b3407 | **−0.49%** | **0.0036** ✗ | **0.0097** ✗ | 0.104 |
+| gate1234 vs b1234 | +0.27% | 0.663 | 0.742 | 0.333 |
+| deform1234 vs b1234 | +0.59% | 0.113 | 0.154 | 0.276 |
+| ddbe3 vs b1234 | −0.03% | 0.680 | 0.881 | 0.093 |
+| edge1234 vs b1234 | +0.27% | 0.595 | 0.447 | 0.891 |
+| edgedual vs b1234 | +0.62% | 0.069 | 0.223 | 0.791 |
 
 （各 log 中还出现 `delta_area` p<0.001 的行：A0 基线系统性低估面积（−0.90 mm²），多数变体向 0 靠拢——这是**面积偏差校正**方向的真实差异，但反映的是偏置而非边界精度，不计入判定。）
 
 **结论（对照 §1.7 判定规则）**：
 
-1. **融合算子横评（aff/gate/deform vs auto）：全部未通过**（无算子达 HD95 降 ≥0.5 mm 且 p<0.05）→ 融合算子不敏感，维持 auto；deform 是唯二方向一致为正的点（ΔDice +0.0059、HD95 −0.019 mm）但 p=0.113。
-2. **双骨干 3-seed：无增益**。A0 三 seed 均值 0.9016 vs dual auto 0.9012；且 s3407 上 dual **显著变差**（Dice p=0.0036、ASSD p=0.0097，方向为负）。在当前融合设计下双骨干线判负——增益若存在也掩埋在 seed 方差之下。
-3. **ddbe3 单级挂载：未过门槛**（ΔDice −0.0003，HD95 反而 +0.078 mm）→ 与用户判断一致：别人的论文（BDFR-Net）是**四级全挂 + 每级 ACAM**，单级挂载证明不了什么，转批次 1（§1.9）。
-4. **edge 线索保留**：edgedual 是全场最佳点（0.9072/0.1416/0.3895，p=0.069 边缘），deform 次之；两者都只是方向证据，不作为结论。
+1. **融合算子横评（aff/gate/deform vs auto）：全部未通过**（无算子达 HD95 降 ≥0.5 mm 且 p<0.05）→ 融合算子不敏感，维持 auto；deform 是唯二方向一致为正的点（ΔDice +0.59%、HD95 −0.019 mm）但 p=0.113。
+2. **双骨干 3-seed：无增益**。A0 三 seed 均值 90.16% vs dual auto 90.12%；且 s3407 上 dual **显著变差**（Dice p=0.0036、ASSD p=0.0097，方向为负）。在当前融合设计下双骨干线判负——增益若存在也掩埋在 seed 方差之下。
+3. **ddbe3 单级挂载：未过门槛**（ΔDice −0.03%，HD95 反而 +0.078 mm）→ 与用户判断一致：别人的论文（BDFR-Net）是**四级全挂 + 每级 ACAM**，单级挂载证明不了什么，转批次 1（§1.9）。
+4. **edge 线索保留**：edgedual 是全场最佳点（90.72%/0.1416/0.3895，p=0.069 边缘），deform 次之；两者都只是方向证据，不作为结论。
 
 ## 1.9 文献复现计划（2026-10-28 用户批准，批次 0–4）
 
-**复现口径**：本项目只有 Carotid2D 数据（SPARC/Zhongnan 两子集），无法复现论文原数据集 → 「复现」定义为**把论文核心模块移植进现有 TransUNet 管线**，与 A0 基线同口径（官方划分 / bs4+ga2 / 200 epoch poly / 判定点 ep150 / SPARC / seed1234），用 §1.8 的病例级配对 Wilcoxon 比较。基线锚点：A0 s1234 = 0.8995 / 0.1498 / 0.3997。
+**复现口径**：本项目只有 Carotid2D 数据（SPARC/Zhongnan 两子集），无法复现论文原数据集 → 「复现」定义为**把论文核心模块移植进现有 TransUNet 管线**，与 A0 基线同口径（官方划分 / bs4+ga2 / 200 epoch poly / 判定点 ep150 / SPARC / seed1234），用 §1.8 的病例级配对 Wilcoxon 比较。基线锚点：A0 s1234 = 89.95% / 0.1498 / 0.3997。
 
 **判定规则（跑之前写死，每批次同一模板）**：
 
@@ -313,9 +313,9 @@
 
 依据：新口径（官方划分、mm 单位）单通道原图基线 `test_curve.csv`（200 epoch、每 5 epoch 一测，文件 `../model/TU_Carotid224/TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_c2d/`）：
 
-- 曲线 150 epoch 即饱和：dice 25→150 从 0.888 缓升到 0.9049，150~200 区间在 0.904±0.001 内波动（噪声水平）；assd/hd95 在 150（0.1431/0.3896 mm）与 155（0.1427/0.3852 mm）达最优，之后不再改善；
+- 曲线 150 epoch 即饱和：dice 25→150 从 88.8% 缓升到 90.49%，150~200 区间在 90.4%±0.1% 内波动（噪声水平）；assd/hd95 在 150（0.1431/0.3896 mm）与 155（0.1427/0.3852 mm）达最优，之后不再改善；
 - **固定 epoch = 150**（对应存档 `epoch_149.pth`，权重文件名 0 基）：四项指标在可选存档点（149/199）中全面更优，且不贴住单点偶然峰值（155 与 150 差异在噪声内）；
-- 结论：200 epoch 中后 50 个 epoch 无实质贡献（dice 仅 +0.0005），**属曲线余量而非必要训练量**。后续 job 保持 `--max_epochs 200` 不变（poly 衰减总长绑死 max_epochs，A 在 200 调度下跑的 epoch 150，B/C/消融必须在同一调度下取 epoch 150 才可比），**但每个 job 训到出现 `epoch_149.pth` 即可手动停止**（省约 53 min/job），或任其跑完、读数仍取 150。
+- 结论：200 epoch 中后 50 个 epoch 无实质贡献（dice 仅 +0.05%），**属曲线余量而非必要训练量**。后续 job 保持 `--max_epochs 200` 不变（poly 衰减总长绑死 max_epochs，A 在 200 调度下跑的 epoch 150，B/C/消融必须在同一调度下取 epoch 150 才可比），**但每个 job 训到出现 `epoch_149.pth` 即可手动停止**（省约 53 min/job），或任其跑完、读数仍取 150。
 
 
 ## 4. 运行命令

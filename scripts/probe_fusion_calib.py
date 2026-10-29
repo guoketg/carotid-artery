@@ -157,16 +157,16 @@ def main():
         for sd in seeds:
             m = train_one(v, tr_i, tr_l, te_i, te_l, spacings, args.epochs, sd)
             runs.append(m)
-            print(f"  {v:<14} seed {sd}: dice@0.5 {m['dice05']:.4f}  dice@orc {m['dice_orc']:.4f}  "
-                  f"dice@area {m['dice_area']:.4f}  signedΔA {m['signed_area']:+.3f}  "
-                  f"calib_gain {m['calib_gain']:+.4f}  ({m['sec']:.0f}s)")
+            print(f"  {v:<14} seed {sd}: dice@0.5 {m['dice05'] * 100:.2f}%  dice@orc {m['dice_orc'] * 100:.2f}%  "
+                  f"dice@area {m['dice_area'] * 100:.2f}%  signedΔA {m['signed_area']:+.3f}  "
+                  f"calib_gain {(m['dice05'] - m['dice_orc']) * 100:+.2f}%  ({m['sec']:.0f}s)")
         a = {k: float(np.mean([r[k] for r in runs])) for k in
              ["dice05", "dice_orc", "dice_area", "signed_area", "calib_gain"]}
         a["nparam"] = runs[0]["nparam"]
         agg[v] = a
-        print(f"{v:<14} {a['nparam']/1e6:>6.3f}M | dice@0.5 {a['dice05']:.4f} | dice@orc {a['dice_orc']:.4f} "
-              f"| dice@area {a['dice_area']:.4f} | signedΔA {a['signed_area']:+.3f} "
-              f"| calib_gain {a['calib_gain']:+.4f}\n")
+        print(f"{v:<14} {a['nparam']/1e6:>6.3f}M | dice@0.5 {a['dice05'] * 100:.2f}% | dice@orc {a['dice_orc'] * 100:.2f}% "
+              f"| dice@area {a['dice_area'] * 100:.2f}% | signedΔA {a['signed_area']:+.3f} "
+              f"| calib_gain {(a['dice05'] - a['dice_orc']) * 100:+.2f}%\n")
 
     if "raw" in agg:
         b = agg["raw"]
@@ -175,9 +175,9 @@ def main():
             if v == "raw":
                 continue
             a = agg[v]
-            print(f"  {v:<14} Δdice@0.5 {a['dice05']-b['dice05']:+.4f}   "
-                  f"Δdice@orc {a['dice_orc']-b['dice_orc']:+.4f}   "
-                  f"Δdice@area {a['dice_area']-b['dice_area']:+.4f}   "
+            print(f"  {v:<14} Δdice@0.5 {(a['dice05']-b['dice05']) * 100:+.2f}%   "
+                  f"Δdice@orc {(a['dice_orc']-b['dice_orc']) * 100:+.2f}%   "
+                  f"Δdice@area {(a['dice_area']-b['dice_area']) * 100:+.2f}%   "
                   f"ΔsignedΔA {a['signed_area']-b['signed_area']:+.3f}")
 
 
