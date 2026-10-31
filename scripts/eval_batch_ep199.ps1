@@ -1,10 +1,10 @@
-﻿# 批量重算 ep150（epoch_149.pth）逐切片指标并做病例级 Wilcoxon 配对（experiments.md §1.6 口径）。
-# 背景：trainer.py 末尾的 metrics.csv 是 ep199，与本项目的 ep150 判定点错配。
-# 每个 job：eval_carotid.py 产出 <snapshot>\metrics_ep149.csv；变体 job 额外与对应 seed 的 A0 基线 compare。
+﻿# 批量重算**终点 epoch 200（epoch_199.pth）**逐切片指标并做病例级 Wilcoxon 配对（2026-10-30 新口径：判定点统一为 200，不再使用 ep150/epoch_149）。
+# 与 test_curve.csv 的 ep200 行同为最终模型读数（ep149 曾与 ep150 行互验吻合，同一交叉验证逻辑）。
+# 每个 job：eval_carotid.py 产出 <snapshot>\metrics_ep199.csv；变体 job 额外与对应 seed 的 A0 基线 compare。
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep149.ps1 -DryRun
-#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep149.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep149.ps1 -Skip dauto1234
+#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep199.ps1 -DryRun
+#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep199.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep199.ps1 -Skip dauto1234
 param(
     [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
     [string]$Root = "E:\mkl\code\python_code\carotid-artery",
@@ -37,7 +37,9 @@ $jobs = @(
     @{ Name = "ddbe4";      Snap = "${pre}_SPARC_ddbe4_c2d";                    Args = @("--ddbe", "4"); Baseline = "b1234" },
     @{ Name = "ddbefull";   Snap = "${pre}_SPARC_ddbe4_acam_c2d";               Args = @("--ddbe", "4", "--acam", "1"); Baseline = "b1234" },
     @{ Name = "faff";       Snap = "${pre}_SPARC_dual_L1234_aff_c2d";           Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "aff"); Baseline = "b1234" },
-    @{ Name = "mainll";     Snap = "${pre}_SPARC_dual_L1234_auto_mainLL_c2d";   Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--main_input", "ll"); Baseline = "b1234" }
+    @{ Name = "mainll";     Snap = "${pre}_SPARC_dual_L1234_auto_mainLL_c2d";   Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--main_input", "ll"); Baseline = "b1234" },
+    # 补记快照（2026-10-28 手动训练的边缘图+双骨干 deform，原 ep149 批次漏掉）
+    @{ Name = "edgedeform"; Snap = "${pre}_SPARC_edge_dual_L1234_deform_c2d";   Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "deform", "--edge_in", "1"); Baseline = "b1234" }
 )
 
 # 基线查表必须在 -Only/-Skip 过滤之前构建，否则单跑变体 job 时查不到基线快照
@@ -52,38 +54,38 @@ if ($Only -ne "") {
 if ($Skip -ne "") {
     $skipNames = @($Skip -split "," | ForEach-Object { $_.Trim() })
     $jobs = @($jobs | Where-Object { $skipNames -notcontains $_.Name })
-    Write-Host "[eval149] skipping: $($skipNames -join ', ')"
+    Write-Host "[eval199] skipping: $($skipNames -join ', ')"
 }
 
-$statusPath = Join-Path $logDir "eval_batch_ep149_status.csv"
+$statusPath = Join-Path $logDir "eval_batch_ep199_status.csv"
 if (-not (Test-Path $statusPath)) {
     "job,start,end,minutes,exit_code" | Out-File -FilePath $statusPath -Encoding utf8
 }
 
 foreach ($job in $jobs) {
     $snap = Join-Path $modelDir $job.Snap
-    $ckpt = Join-Path $snap "epoch_149.pth"
-    $out = Join-Path $snap "metrics_ep149.csv"
+    $ckpt = Join-Path $snap "epoch_199.pth"
+    $out = Join-Path $snap "metrics_ep199.csv"
     if (-not (Test-Path $ckpt)) {
-        Write-Warning "[eval149] $($job.Name): missing $ckpt, skipped"
+        Write-Warning "[eval199] $($job.Name): missing $ckpt, skipped"
         continue
     }
 
     $args2 = @("scripts\eval_carotid.py", "--subset", "SPARC") + $job.Args + @("--ckpt", $ckpt, "--out", $out)
     if ($job.Baseline -ne "") {
         $baseSnap = $snapOf[$job.Baseline]
-        $baseCsv = Join-Path (Join-Path $modelDir $baseSnap) "metrics_ep149.csv"
+        $baseCsv = Join-Path (Join-Path $modelDir $baseSnap) "metrics_ep199.csv"
         if (Test-Path $baseCsv) {
             $args2 += @("--baseline_csv", $baseCsv)
         } else {
-            Write-Warning "[eval149] $($job.Name): baseline csv missing ($baseCsv), compare skipped"
+            Write-Warning "[eval199] $($job.Name): baseline csv missing ($baseCsv), compare skipped"
         }
     }
 
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-    $jobLog = Join-Path $logDir "eval149_$($job.Name)_$ts.log"
-    Write-Host "[eval149] ===== $($job.Name) ====="
-    Write-Host "[eval149] command: $Python $($args2 -join ' ')"
+    $jobLog = Join-Path $logDir "eval199_$($job.Name)_$ts.log"
+    Write-Host "[eval199] ===== $($job.Name) ====="
+    Write-Host "[eval199] command: $Python $($args2 -join ' ')"
 
     if ($DryRun) { continue }
 
@@ -95,7 +97,7 @@ foreach ($job in $jobs) {
     $end = Get-Date
     $minutes = [math]::Round(($end - $start).TotalMinutes, 1)
     "$($job.Name),$start,$end,$minutes,$code" | Out-File -FilePath $statusPath -Append -Encoding utf8
-    Write-Host "[eval149] ===== end $($job.Name) exit=$code ${minutes}min ====="
+    Write-Host "[eval199] ===== end $($job.Name) exit=$code ${minutes}min ====="
 }
 
-Write-Host "[eval149] all done, status: $statusPath"
+Write-Host "[eval199] all done, status: $statusPath"

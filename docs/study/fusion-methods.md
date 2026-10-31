@@ -98,8 +98,8 @@ F_DDBE = M_sp( M_ch( Conv1x1( concat(F_hf, F_lf, F_ctx) ) ) )
 
 ## 5. 代码与文档位置
 
-- 老师论文：[pdf\3612 Submission.pdf](file:///e:/mkl/code/python_code/carotid-artery/pdf/3612%20Submission.pdf)
-- 已实现的 4 种融合算子：[networks/dual_encoder_model.py](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py)（BidirGate/BidirConcat/BidirCrossAttention/BidirDeform/AFF）
-- 输入级 edge 融合：[networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py) `build_hf_image`
-- 融合轴对照实验：[scripts/probe_fusion_axis.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_fusion_axis.py)（讲解见 [tinycnn-explained.md](tinycnn-explained.md) §6）
-- 方案取舍背景：[docs/technical-design.md](file:///e:/mkl/code/python_code/carotid-artery/docs/technical-design.md)「频率注入位置」一节
+- 老师论文：[pdf\3612 Submission.pdf](../../pdf/3612%20Submission.pdf)
+- 已实现的 4 种融合算子：[networks/dual_encoder_model.py](../../networks/dual_encoder_model.py)（BidirGate/BidirConcat/BidirCrossAttention/BidirDeform/AFF）
+- 输入级 edge 融合：[networks/wavelet.py](../../networks/wavelet.py) `build_hf_image`
+- 融合轴对照实验：[scripts/probe_fusion_axis.py](../../scripts/probe_fusion_axis.py)（讲解见 [tinycnn-explained.md](tinycnn-explained.md) §6）
+- 方案取舍背景：[docs/technical-design.md](../../docs/technical-design.md)「频率注入位置」一节

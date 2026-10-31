@@ -86,6 +86,62 @@ def build_hf_image(x, log_domain=True, lf_weight=0.0):
     return _standardize(hf)
 
 
+# ---------------------------------------------------------------- 边缘算子注册表
+
+
+def _sobel_mag(x):
+    """x: (B,1,H,W) -> Sobel 梯度幅值（与 scripts/probe_edge_signal.py 同名实现一致）"""
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                      device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    ky = kx.transpose(2, 3).contiguous()
+    gx = F.conv2d(x, kx, padding=1)
+    gy = F.conv2d(x, ky, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-8)
+
+
+def _laplacian_mag(x):
+    """x: (B,1,H,W) -> 4 邻域 Laplacian 幅值"""
+    k = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                     device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    return F.conv2d(x, k, padding=1).abs()
+
+
+def _detail_energy(x):
+    """x: (B,1,H,W) -> 细节能量图 sqrt(LH²+HL²+HH²)，半分辨率插值回原尺寸。
+
+    旧方案：只保留「哪里有高频」，丢方向与符号。
+    """
+    x_pos = x - x.amin(dim=(2, 3), keepdim=True) + 1e-3
+    _, details = haar_dwt(torch.log1p(x_pos))
+    e = torch.sqrt(sum(d * d for d in details) + 1e-8)
+    return F.interpolate(e, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+
+EDGE_OPS = ("wavelet", "wavelet_lam", "energy", "sobel", "laplacian")
+
+
+def build_edge_map(x, op="wavelet", lf_weight=0.3):
+    """五个候选边缘算子统一入口，输出都是逐样本标准化的 (B,1,H,W)。
+
+    - wavelet     : 1 级 Haar，LL 置零后 IDWT 重建（项目现用口径，λ=0）
+    - wavelet_lam : 同上但掺回 λ·LL（GobletNet Eq.5，默认 λ=0.3）
+    - energy      : 小波细节能量图 sqrt(LH²+HL²+HH²)（旧方案）
+    - sobel       : Sobel 梯度幅值
+    - laplacian   : 4 邻域 Laplacian 幅值
+    """
+    if op == "wavelet":
+        return build_hf_image(x, log_domain=True, lf_weight=0.0)
+    if op == "wavelet_lam":
+        return build_hf_image(x, log_domain=True, lf_weight=lf_weight)
+    if op == "energy":
+        return _standardize(_detail_energy(x))
+    if op == "sobel":
+        return _standardize(_sobel_mag(x))
+    if op == "laplacian":
+        return _standardize(_laplacian_mag(x))
+    raise ValueError(f"unknown edge op: {op}")
+
+
 def build_three_channel(x, threshold=True):
     """输入 (B,1,H,W) 已归一化图像，输出 (B,3,H,W)：原图 / 小波去噪重建 / 细节能量。
 

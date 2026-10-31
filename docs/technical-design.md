@@ -148,7 +148,7 @@ F_B' = F_B + γ_B · (F_B ⊙ ω_A)
 
 ## 工程环境（记录，非设计）
 
-- 解释器 `venv\Scripts\python.exe`，Python 3.12.10，torch 2.14.1+cu132，RTX 5060 Laptop 8GB。
+- 解释器 `venv\Scripts\python.exe`，Python 3.11.5，torch 2.14.1+cu132，RTX 3060 12GB（当前机器）。
 - 训练入口 `train.py` + `trainer.py`；夜间队列 `scripts\night_queue.ps1`，实际参数 **`--batch_size 8 --max_epochs 120 --eval_test_every 10`**（每次约 50–57 min）。
 - `num_workers=1` + `persistent_workers=True`（Windows 内存限制；不加 persistent 时每 epoch 白等 6–7 s）。
 - 输出目录带方法后缀，禁止覆盖单通道原图基线的权重。

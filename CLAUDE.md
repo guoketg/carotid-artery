@@ -15,7 +15,7 @@
 .\venv\Scripts\Activate.ps1                  # 或激活后使用
 ```
 
-- Python 3.12.10，torch 2.14.1+cu132，RTX 5060 Laptop 8GB。
+- Python 3.11.5，torch 2.14.1+cu132，RTX 3060 12GB。（旧机器 RTX 5060 Laptop 8GB 已弃用，docs 中标注"估算/8GB"的历史实测均来自旧机器）
 - 不新建 conda 环境，不使用 Docker。
 - 新依赖只装进 `venv`，并同步更新 `requirements.txt`。
 - **禁止** 用旧版 `torch==1.4.0` 覆盖现有环境。
@@ -24,7 +24,7 @@
 
 1. 数据划分**必须按病例**（patient-level），禁止切片级随机划分。
 2. 实验输出不得覆盖单通道原图基线权重，目录名带方法后缀。
-3. 训练显存上限 8GB：`img_size=224`、`batch<=8`、开启 AMP；不够就用梯度累积。
+3. 训练显存上限 12GB（RTX 3060）：`img_size=224`、`batch<=8`；不够就用梯度累积。注意 Windows WDDM 换页：峰值逼近专用显存上限时单步耗时会翻倍级劣化，别把显存吃到顶。
 4. 数据加载固定 `num_workers=1`，不要调大：本机内存紧张，WSL 同时开启时会冲到 95%，需要用户手动杀进程。
 5. 指标口径固定：**Dice、ASSD、HD95、DeltaArea**（预测面积 − 真值面积）。
 6. 冒烟测试样本 ≤ 50，避免无意义开销。

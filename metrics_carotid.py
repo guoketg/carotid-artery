@@ -2,7 +2,7 @@ import os
 
 import nibabel as nib
 import numpy as np
-from medpy.metric.binary import assd, dc, hd95
+from medpy.metric.binary import assd, dc, hd, hd95
 from scipy import ndimage as ndi
 
 
@@ -22,21 +22,24 @@ def compute_case_metrics(pred, gt, spacing=None):
     fallback = _surface_fallback(pred.shape, spacing)
 
     if pred_area == 0 and gt_area == 0:
-        return {"dice": 1.0, "assd": 0.0, "hd95": 0.0, "delta_area": 0}
+        return {"dice": 1.0, "assd": 0.0, "hd95": 0.0, "hd": 0.0, "delta_area": 0}
     if pred_area == 0 or gt_area == 0:
-        return {"dice": 0.0, "assd": fallback, "hd95": fallback, "delta_area": delta}
+        return {"dice": 0.0, "assd": fallback, "hd95": fallback, "hd": fallback,
+                "delta_area": delta}
 
     return {
         "dice": float(dc(pred, gt)),
         "assd": float(assd(pred, gt, voxelspacing=spacing)),
         "hd95": float(hd95(pred, gt, voxelspacing=spacing)),
+        # HD(max)：论文 Table 1 的 HD 口径，与 HD95 共用同一张表面距离矩阵
+        "hd": float(hd(pred, gt, voxelspacing=spacing)),
         "delta_area": delta,
     }
 
 
 def summarize(records):
     """records 为 dict 列表，返回均值、标准差与绝对值均值"""
-    keys = ["dice", "assd", "hd95", "delta_area"]
+    keys = ["dice", "assd", "hd95", "hd", "delta_area"]
     summary = {}
     for key in keys:
         values = np.array([r[key] for r in records], dtype=np.float64)

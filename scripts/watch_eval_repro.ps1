@@ -1,6 +1,6 @@
 ﻿# Watcher for queue_c2d_repro: as soon as each job row (exit_code=0) lands in
-# logs/queue/queue_c2d_repro_status.csv, run its ep149 eval + case-level Wilcoxon
-# via eval_batch_ep149.ps1 -Only <job>. Launched via WMI (detached from terminal).
+# logs/queue/queue_c2d_repro_status.csv, run its ep199 eval (终点 epoch 200) + case-level Wilcoxon
+# via eval_batch_ep199.ps1 -Only <job>. Launched via WMI (detached from terminal).
 # Idempotent: rows already processed are never re-run; failed jobs (exit!=0) are
 # logged and skipped. Exits after all 4 targets are processed.
 # Usage (WMI):
@@ -32,10 +32,10 @@ while ($true) {
             $name = $r.job
             if (-not $pending.ContainsKey($name)) { continue }
             if ($r.exit_code -eq "0") {
-                Write-WatchLog "job $name finished (exit 0, $($r.minutes) min) -> run ep149 eval"
+                Write-WatchLog "job $name finished (exit 0, $($r.minutes) min) -> run ep199 eval"
                 $evalLog = Join-Path $Root "logs\queue\watch_eval_$name.log"
                 powershell -ExecutionPolicy Bypass -NoProfile -File `
-                    (Join-Path $Root "scripts\eval_batch_ep149.ps1") -Only $name *> $evalLog
+                    (Join-Path $Root "scripts\eval_batch_ep199.ps1") -Only $name *> $evalLog
                 Write-WatchLog "eval $name done, log: $evalLog"
             }
             else {

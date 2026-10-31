@@ -29,8 +29,20 @@ def build_model(args):
     评估用不到预训练权重加载（直接 load_state_dict 全量覆盖）。"""
     config = copy.deepcopy(CONFIGS[args.vit_name])
     config.n_classes = 2
-    config.n_skip = 3
-    config.patches.grid = (args.img_size // 16, args.img_size // 16)
+    config.n_skip = args.n_skip
+    config.transformer.num_layers = args.vit_layers
+    if "R50" in args.vit_name:
+        config.patches.grid = (args.img_size // 16, args.img_size // 16)
+    if args.arch == "unet":
+        from networks.unet import UNet
+        return UNet(in_channels=1, num_classes=2,
+                    edge_in=bool(args.edge_in), edge_op=args.edge_op)
+    if args.arch == "xnet":
+        from networks.xnet import XNet
+        return XNet(in_channels=1, num_classes=2)
+    if args.arch == "gobletnet":
+        from networks.gobletnet import GobletNet
+        return GobletNet(in_channels=1, num_classes=2, hf_lambda=args.hf_lambda)
     if args.arch == "dual":
         from networks.dual_encoder_model import DualEncoderTransUNet
         return DualEncoderTransUNet(config, img_size=args.img_size, num_classes=2,
@@ -41,6 +53,12 @@ def build_model(args):
                                     cross_scale=bool(args.cross_scale),
                                     main_input=args.main_input,
                                     edge_in=bool(args.edge_in))
+    if args.arch == "split":
+        from networks.split_encoder_model import SplitLocalGlobalTransUNet
+        return SplitLocalGlobalTransUNet(config, img_size=args.img_size, num_classes=2,
+                                         fuse_op=args.fuse_op, window=args.window,
+                                         dk_ratio=args.dk_ratio,
+                                         bidir=bool(args.bidir))
     if args.fusion != "none":
         from networks.wavelet_model import WaveletTransUNet
         return WaveletTransUNet(config, img_size=args.img_size, num_classes=2,
@@ -54,7 +72,12 @@ def build_model(args):
 def eval_ckpt(args):
     net = build_model(args).cuda()
     state = torch.load(args.ckpt, map_location="cuda")
-    net.load_state_dict(state)
+    # 历史 checkpoint 的 BidirFrC 只有 gamma_a（单向）；新代码加了零初始化的 gamma_b，
+    # 缺这个键时保持 0 == 旧行为逐元素等价，其余任何缺失/多余键仍报错
+    missing, unexpected = net.load_state_dict(state, strict=False)
+    bad = [k for k in missing if not k.endswith("gamma_b")]
+    if bad or unexpected:
+        raise RuntimeError(f"state_dict 不匹配: missing={bad} unexpected={list(unexpected)}")
     net.eval()
 
     split_dir = os.path.join(args.list_dir, args.subset)
@@ -67,6 +90,9 @@ def eval_ckpt(args):
     with torch.no_grad():
         for i, batch in enumerate(dl):
             logits = net(batch["image"].cuda())
+            if isinstance(logits, (tuple, list)):
+                # XNet 双输出：评估统一取低频主支（与 trainer._primary_out 同口径）
+                logits = logits[0]
             pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
             pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch["case"][0])
             rec = compute_case_metrics(pred_o, gt_o, spacing=spacing)
@@ -74,7 +100,7 @@ def eval_ckpt(args):
             records.append(rec)
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "delta_area"])
+        w = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd", "delta_area"])
         w.writeheader()
         w.writerows(records)
 
@@ -82,6 +108,7 @@ def eval_ckpt(args):
     print(f"[eval] {args.out}")
     print(f"[eval] n={s['n_cases']} dice={s['dice']['mean'] * 100:.2f}%±{s['dice']['std'] * 100:.2f}% "
           f"assd={s['assd']['mean']:.3f}±{s['assd']['std']:.3f} "
+          f"hd={s['hd']['mean']:.2f}±{s['hd']['std']:.2f} "
           f"hd95={s['hd95']['mean']:.2f}±{s['hd95']['std']:.2f} "
           f"delta_area={s['delta_area']['mean']:.1f}±{s['delta_area']['std']:.1f} "
           f"|delta_area|={s['abs_delta_area']['mean']:.1f}")
@@ -102,7 +129,7 @@ def _group_by_case(rows):
     out = {}
     for cid, rs in buckets.items():
         agg = {"case": cid}
-        for key in ["dice", "assd", "hd95", "delta_area"]:
+        for key in ["dice", "assd", "hd95", "hd", "delta_area"]:
             agg[key] = float(np.mean([float(r[key]) for r in rs]))
         out[cid] = agg
     return out
@@ -119,7 +146,7 @@ def compare(baseline_csv, variant_csv):
     print(f"[compare] variant ={variant_csv}")
     print(f"[compare] paired cases: {len(common)} (case-level, per-case slice mean)")
     print(f"{'metric':<14}{'baseline':>10}{'variant':>10}{'diff':>10}{'p(wilcoxon)':>14}")
-    for key in ["dice", "assd", "hd95", "delta_area"]:
+    for key in ["dice", "assd", "hd95", "hd", "delta_area"]:
         a = np.array([float(base[c][key]) for c in common])
         b = np.array([float(var[c][key]) for c in common])
         p = wilcoxon(b, a).pvalue if np.any(a != b) else 1.0
@@ -135,12 +162,16 @@ def main():
     p.add_argument("--subset", required=True, choices=["SPARC", "Zhongnan"])
     p.add_argument("--use_wavelet", type=int, default=0)
     p.add_argument("--edge_in", type=int, default=0)
+    p.add_argument("--edge_op", default="wavelet",
+                   choices=["wavelet", "wavelet_lam", "energy", "sobel", "laplacian"],
+                   help="输入级边缘图算子，与 train.py 同义（仅 unet 可换）")
     p.add_argument("--fusion", default="none", choices=["none", "se", "cross"])
     p.add_argument("--heads", type=int, default=4)
-    p.add_argument("--arch", default="baseline", choices=["baseline", "dual"])
+    p.add_argument("--arch", default="baseline",
+                   choices=["baseline", "dual", "split", "unet", "xnet", "gobletnet"])
     p.add_argument("--levels", default="1,2,3,4")
     p.add_argument("--fuse_op", default="auto",
-                   choices=["auto", "window", "global", "gate", "concat", "deform", "aff"])
+                   choices=["auto", "window", "global", "gate", "concat", "deform", "aff", "frc"])
     p.add_argument("--window", type=int, default=8)
     p.add_argument("--dk_ratio", type=int, default=2)
     p.add_argument("--bidir", type=int, default=1)
@@ -152,6 +183,8 @@ def main():
     p.add_argument("--hf_branch", type=int, default=0, help="1 = GobletNet 式 HF 支 + FAM，与 train.py 同义（仅 baseline）")
     p.add_argument("--hf_lambda", type=float, default=0.3, help="HF 图低频回灌权重 λ，与 train.py 同义")
     p.add_argument("--vit_name", default="R50-ViT-B_16")
+    p.add_argument("--vit_layers", type=int, default=12, help="ViT 层数，与 train.py 同义")
+    p.add_argument("--n_skip", type=int, default=3, help="skip 数，与 train.py 同义")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--num_workers", type=int, default=1)
     p.add_argument("--root_path", default=r"E:\mkl\code\datasets\Carotid2D")

@@ -23,6 +23,12 @@ def _worker_init(worker_id, seed):
     random.seed(seed + worker_id)
 
 
+def _primary_out(outputs):
+    """XNet 返回 (logits_lf, logits_hf) 双输出：评估/可视化统一取低频主支，
+    不在测试集上挑支；单输出网络原样返回。"""
+    return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+
 @torch.no_grad()
 def _eval_test(model, testloader, root_path):
     """在测试集上逐样本计算四项指标，返回 (records, summary)"""
@@ -31,8 +37,7 @@ def _eval_test(model, testloader, root_path):
     model.eval()
     records = []
     for batch in testloader:
-        logits = model(batch['image'].cuda())
-
+        logits = _primary_out(model(batch['image'].cuda()))
         pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
         pred_o, gt_o, spacing = original_grid_pair(pred, root_path, batch['case'][0])
         record = compute_case_metrics(pred_o, gt_o, spacing=spacing)
@@ -97,9 +102,20 @@ def trainer_synapse(args, model, snapshot_path):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
             outputs = model(image_batch)
-            loss_ce = ce_loss(outputs, label_batch[:].long())
-            loss_dice = dice_loss(outputs, label_batch, softmax=True)
-            loss = 0.5 * loss_ce + 0.5 * loss_dice
+            if isinstance(outputs, (tuple, list)):
+                # XNet 双输出（低频/高频支）：每支各算 0.5CE+0.5Dice，再对支数取平均
+                loss = 0.0
+                loss_ce = 0.0
+                for out in outputs:
+                    ce = ce_loss(out, label_batch[:].long())
+                    loss_ce = loss_ce + ce
+                    loss = loss + 0.5 * ce + 0.5 * dice_loss(out, label_batch, softmax=True)
+                loss = loss / len(outputs)
+                loss_ce = loss_ce / len(outputs)
+            else:
+                loss_ce = ce_loss(outputs, label_batch[:].long())
+                loss_dice = dice_loss(outputs, label_batch, softmax=True)
+                loss = 0.5 * loss_ce + 0.5 * loss_dice
             (loss / grad_accum).backward()
 
             # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次
@@ -122,7 +138,7 @@ def trainer_synapse(args, model, snapshot_path):
                 image = image_batch[1, 0:1, :, :]
                 image = (image - image.min()) / (image.max() - image.min())
                 writer.add_image('train/Image', image, iter_num)
-                outputs = torch.argmax(torch.softmax(outputs, dim=1), dim=1, keepdim=True)
+                outputs = torch.argmax(torch.softmax(_primary_out(outputs), dim=1), dim=1, keepdim=True)
                 writer.add_image('train/Prediction', outputs[1, ...] * 50, iter_num)
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image('train/GroundTruth', labs, iter_num)
@@ -144,16 +160,18 @@ def trainer_synapse(args, model, snapshot_path):
                 "dice": summary["dice"]["mean"],
                 "assd": summary["assd"]["mean"],
                 "hd95": summary["hd95"]["mean"],
+                "hd": summary["hd"]["mean"],
                 "abs_delta_area": summary["abs_delta_area"]["mean"],
             })
             with open(curve_path, "w", newline="", encoding="utf-8") as f:
                 curve_writer = csv.DictWriter(
-                    f, fieldnames=["epoch", "dice", "assd", "hd95", "abs_delta_area"])
+                    f, fieldnames=["epoch", "dice", "assd", "hd95", "hd", "abs_delta_area"])
                 curve_writer.writeheader()
                 curve_writer.writerows(curve_rows)
             row = curve_rows[-1]
-            logging.info("epoch %d test curve: dice=%.2f%% assd=%.3f hd95=%.2f |dA|=%.1f" % (
-                epoch_num + 1, row["dice"] * 100, row["assd"], row["hd95"], row["abs_delta_area"]))
+            logging.info("epoch %d test curve: dice=%.2f%% assd=%.3f hd=%.2f hd95=%.2f |dA|=%.1f" % (
+                epoch_num + 1, row["dice"] * 100, row["assd"], row["hd"],
+                row["hd95"], row["abs_delta_area"]))
 
         save_interval = 50  # int(max_epoch/6)
         if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
@@ -181,7 +199,7 @@ def trainer_synapse(args, model, snapshot_path):
         records = []
         with torch.no_grad():
             for batch in testloader:
-                logits = model(batch['image'].cuda())
+                logits = _primary_out(model(batch['image'].cuda()))
                 pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
                 pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch['case'][0])
                 record = compute_case_metrics(pred_o, gt_o, spacing=spacing)
@@ -189,13 +207,14 @@ def trainer_synapse(args, model, snapshot_path):
                 records.append(record)
         summary = summarize(records)
         with open(os.path.join(snapshot_path, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
-            writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "delta_area"])
+            writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd", "delta_area"])
             writer_csv.writeheader()
             writer_csv.writerows(records)
-        logging.info("test summary: dice=%.2f%%±%.2f%% assd=%.3f±%.3f hd95=%.2f±%.2f "
+        logging.info("test summary: dice=%.2f%%±%.2f%% assd=%.3f±%.3f hd=%.2f±%.2f hd95=%.2f±%.2f "
                      "dA=%.1f±%.1f |dA|=%.1f" % (
                          summary["dice"]["mean"] * 100, summary["dice"]["std"] * 100,
                          summary["assd"]["mean"], summary["assd"]["std"],
+                         summary["hd"]["mean"], summary["hd"]["std"],
                          summary["hd95"]["mean"], summary["hd95"]["std"],
                          summary["delta_area"]["mean"], summary["delta_area"]["std"],
                          summary["abs_delta_area"]["mean"]))

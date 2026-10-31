@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import deform_conv2d
+import math
 
 from networks.vit_seg_modeling import VisionTransformer
 from networks.vit_seg_modeling_resnet_skip import ResNetV2, np2th
@@ -314,6 +315,86 @@ class BidirAFF(nn.Module):
         return A2, B2
 
 
+def _dct_vec(k, n, device, dtype):
+    """1D 正交 DCT-II 基的第 k 个频率分量（长度 n）"""
+    i = torch.arange(n, device=device, dtype=dtype)
+    ref = math.sqrt(1.0 / n) if k == 0 else math.sqrt(2.0 / n)
+    return ref * torch.cos(math.pi * k * (2.0 * i + 1.0) / (2.0 * n))
+
+
+# FcaNet（Qin et al., ICCV 2021）16 组多光谱通道注意力的固定频点表。
+# 直接取 FcaNet 官方 get_freq_indices('top16')：all_top_indices_x[:16] ×
+# all_top_indices_y[:16]，频点坐标定义在 7×7 DCT tile 上（FcaNet 的 dct_h=dct_w=7）。
+_FCANET_TOP16 = (
+    (0, 0), (0, 1), (6, 0), (0, 5), (0, 2), (1, 0), (1, 2), (4, 0),
+    (5, 0), (1, 6), (3, 0), (0, 4), (0, 6), (0, 3), (3, 5), (2, 3),
+)
+_FCANET_TILE = 7
+
+
+class BidirFrC(nn.Module):
+    """Syn-Net（JBHI 2025）FrCFusion 的移植，替换接点处的融合算子（严格按原文）。
+
+    论文 Eq.5-11 三步：
+    1) 通道分 G 组，第 g 组用固定 2D-DCT 频点 (u_g, v_g) 做「特征×基」空间求和，
+       得到每通道频率描述子，按通道拼成 C 维；
+    2) 描述子 → FC → sigmoid 得通道权重，分别重加权两条支路；
+    3) 另一路空间支：两支逐元素相乘 → 1×1 压通道 → 1×1 出单通道 → sigmoid 得
+       空间注意力图；最后 `Freqout = proj(cat[FreS, FreR, A_spatial])`。
+
+    严格化要点（相对第一版移植的三处改动）：
+    - 频点表：改用 FcaNet 官方 top-16 频点（7×7 DCT tile，见 `_FCANET_TOP16`），
+      特征先自适应池化到 7×7 再取描述子 —— FcaNet 的原设定，不再用 4×4 zig-zag；
+    - 回写：双向 `A2 = A + γ_A·Freqout`、`B2 = B + γ_B·Freqout`（原文两支互相更新）；
+      `bidir=False` 只回写 A（单点融合下 B 若没有下游消费者时用）；
+    - 两个 γ 均零初始化 → 第 0 步与未融合的两支逐元素等价。
+    """
+
+    def __init__(self, dim, bidir=True, n_groups=16, r=8):
+        super().__init__()
+        assert dim % n_groups == 0, f"FrC: dim={dim} 不能被 n_groups={n_groups} 整除"
+        self.dim, self.n_groups, self.bidir = dim, n_groups, bidir
+        c_s = max(8, dim // r)
+        self.fc_a = nn.Sequential(nn.Linear(dim, c_s), nn.ReLU(inplace=True), nn.Linear(c_s, dim))
+        self.fc_b = nn.Sequential(nn.Linear(dim, c_s), nn.ReLU(inplace=True), nn.Linear(c_s, dim))
+        self.sp = nn.Sequential(
+            nn.Conv2d(dim, c_s, 1), nn.ReLU(inplace=True), nn.Conv2d(c_s, 1, 1))
+        self.proj = nn.Conv2d(2 * dim + 1, dim, 1)
+        self.gamma_a = nn.Parameter(torch.zeros(1))
+        self.gamma_b = nn.Parameter(torch.zeros(1))
+        self._basis_cache = {}
+
+    def _basis(self, device, dtype):
+        key = (device, dtype)
+        if key not in self._basis_cache:
+            rows = []
+            for u, v in _FCANET_TOP16[:self.n_groups]:
+                rows.append(_dct_vec(u, _FCANET_TILE, device, dtype)[:, None]
+                            * _dct_vec(v, _FCANET_TILE, device, dtype)[None, :])
+            self._basis_cache[key] = torch.stack(rows, dim=0)   # (G,7,7)
+        return self._basis_cache[key]
+
+    def _desc(self, x):
+        """(B,C,H,W) → (B,C) 的逐通道频率描述子（池化到 FcaNet 的 7×7 tile）"""
+        b, c = x.shape[:2]
+        if x.shape[-2:] != (_FCANET_TILE, _FCANET_TILE):
+            x = F.adaptive_avg_pool2d(x, _FCANET_TILE)
+        basis = self._basis(x.device, x.dtype)
+        f = x.reshape(b, self.n_groups, c // self.n_groups, _FCANET_TILE, _FCANET_TILE)
+        d = torch.einsum("bgchw,ghw->bgc", f, basis)
+        return d.reshape(b, c)
+
+    def forward(self, A, B):
+        wa = torch.sigmoid(self.fc_a(self._desc(A)))[:, :, None, None]
+        wb = torch.sigmoid(self.fc_b(self._desc(B)))[:, :, None, None]
+        m = torch.sigmoid(self.sp(A * B))
+        out = self.proj(torch.cat([A * wa, B * wb, m], dim=1))
+        A2 = A + self.gamma_a * out
+        if not self.bidir:
+            return A2, B
+        return A2, B + self.gamma_b * out
+
+
 def make_fusion(kind, dim, heads, dk_ratio, window, bidir, chain=False):
     if kind == "window":
         return BidirCrossAttention(dim, heads, dk_ratio, window, mode="window",
@@ -329,6 +410,8 @@ def make_fusion(kind, dim, heads, dk_ratio, window, bidir, chain=False):
         return BidirDeform(dim, dk_ratio=dk_ratio, bidir=bidir)
     if kind == "aff":
         return BidirAFF(dim, bidir=bidir)
+    if kind == "frc":
+        return BidirFrC(dim, bidir=bidir)
     raise ValueError(f"unknown fusion kind: {kind}")
 
 

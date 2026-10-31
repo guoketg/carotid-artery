@@ -1,7 +1,7 @@
 # GobletNet（TMI 2025）讲解：主路吃原图、小波只补高频——参数对齐后证明「低频多余」
 
 论文：GobletNet: Wavelet-Based High-Frequency Fusion Network for Semantic Segmentation of Electron Microscopy Images，IEEE TMI 44:1058–1069（DOI 10.1109/TMI.2024.3474028），XNet 同团队续作。
-本项目落地代码：[networks/hf_branch.py](file:///e:/mkl/code/python_code/carotid-artery/networks/hf_branch.py)；概念背景：[wavelet-input-routes](wavelet-input-routes.md)、[fusion-operators-explained](fusion-operators-explained.md)；正式精读条目：[literature.md](../literature.md) GobletNet 节；速查表：[paper-reading.md](../paper-reading.md) §5.2。
+本项目落地代码：[networks/hf_branch.py](../../networks/hf_branch.py)；概念背景：[wavelet-input-routes](wavelet-input-routes.md)、[fusion-operators-explained](fusion-operators-explained.md)；正式精读条目：[literature.md](../literature.md) GobletNet 节；速查表：[paper-reading.md](../paper-reading.md) §5.2。
 
 ## 0. 一页版
 
@@ -22,7 +22,7 @@ HF 图当额外输入通道 → 涨 ② 加独立 HF 编码支 → 再涨 ③ �
    λ>0 = 往纯高频里掺回少量低频抑制噪声（Table VI：λ∈[0,0.3] 最优，本项目取 0.3）。H 与原图同分辨率，单独喂 HF 编码支。
 
 **定义消歧**（论文叫法 ↔ 本项目代码里的对应物，不得混称）：
-- 论文「HF 图」= 本项目 `build_hf_image` 输出：对数域 1 级 Haar DWT → LL 置零（λ=0）或回灌 λ·LL → IDWT 重建回原分辨率 → expm1 回原域 → 逐样本 z-score（[wavelet.py L58-86](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L58-L86)）。
+- 论文「HF 图」= 本项目 `build_hf_image` 输出：对数域 1 级 Haar DWT → LL 置零（λ=0）或回灌 λ·LL → IDWT 重建回原分辨率 → expm1 回原域 → 逐样本 z-score（[wavelet.py L58-86](../../networks/wavelet.py#L58-L86)）。
 - 论文消融①「额外输入通道」= 本项目 `--edge_in`（stem 吃 4 通道，输入级注入）。
 - 论文消融②「独立 HF 编码分支」= 本项目批次 2 `--hf_branch`（特征级注入）。
 - 论文的 λ·LL 与 XNet 的「LF 编码器」**不是一回事**：前者是高频图里掺的一味抑噪佐料，后者是独立低频支路。
@@ -43,9 +43,9 @@ HF 图当额外输入通道 → 涨 ② 加独立 HF 编码支 → 再涨 ③ �
 - **融合位置**：编码器每一级，两支同级特征上（消融⑥：全挂最好）。
 - **融合轴向**：空间同位置的**通道门控重标定**，不是 QKV 跨位置注意力。算子一行写死：
   `fused = ReLU(BN(Conv1x1(cat[sem, det])))`；`a1 = Sigmoid(Conv1x1(fused))`，`a2 = Sigmoid(Conv1x1(fused))`；官方输出为 `relu(sem·a1)`、`relu(det·a2)` 直接替换。
-- **通道适配**：官方两支通道相同（都是 lNc）；本项目 sem/det 通道不等（64/256/512 vs 32/64/128），改为 fusion 压到 sem_ch，att1 出 sem_ch、att2 出 det_ch（[hf_branch.py L65-91](file:///e:/mkl/code/python_code/carotid-artery/networks/hf_branch.py#L65-L91)）。
+- **通道适配**：官方两支通道相同（都是 lNc）；本项目 sem/det 通道不等（64/256/512 vs 32/64/128），改为 fusion 压到 sem_ch，att1 出 sem_ch、att2 出 det_ch（[hf_branch.py L65-91](../../networks/hf_branch.py#L65-L91)）。
 - **初始化与残差**：官方「直接替换」在本项目改成 `x + γ·relu(x·a)`，**γ 零初始化**——初始时整条 HF 路对主干逐位恒等，同 seed 基础权重与 baseline 完全对齐（冒烟② max\|Δlogits\|=0）。注意「两个零因子相乘」陷阱：inject（1×1 det→sem）也零初始化，但 det 链在 γ 与 inject **两道零门之后**，step 0 只有 γ/inject 有梯度，3 步 SGD 后全链解锁（LoRA B=0 同款一步延迟，冒烟③已验证，属预期行为）。
-- **时序编排**：FA 后的 det 特征**继续进下一层下采样**（贴官方「FA 后特征继续进下一层」，[vit_seg_modeling.py L455-469](file:///e:/mkl/code/python_code/carotid-artery/networks/vit_seg_modeling.py#L455-L469)）。
+- **时序编排**：FA 后的 det 特征**继续进下一层下采样**（贴官方「FA 后特征继续进下一层」，[vit_seg_modeling.py L455-469](../../networks/vit_seg_modeling.py#L455-L469)）。
 - **参数增量**：本项目 +1.206M（HF 支 +0.29M、FAM +0.84M、inject 微量），相对 105.276M 基线 ≈1.1%，值——这是文献里稳定出增益的第 2 档门控（paper-reading §5.4），比我们 dual 四接点交叉注意力 3.70M 便宜一个量级。
 - **对照档位**：FAM 属门控加权档；论文**没做** gate/concat/attn/deform 横评，所以不能引它证明「FAM 优于其他融合算子」，只能证明「有 FAM 比没有强」。
 
@@ -74,11 +74,11 @@ HF 图当额外输入通道 → 涨 ② 加独立 HF 编码支 → 再涨 ③ �
 
 | 内容 | 位置 |
 |---|---|
-| HFBranch（轻量 HF 支 32@112²/64@56²/128@28²） | [hf_branch.py L37-62](file:///e:/mkl/code/python_code/carotid-artery/networks/hf_branch.py#L37-L62) |
-| FAM（通道适配 + γ 门控残差） | [hf_branch.py L65-91](file:///e:/mkl/code/python_code/carotid-artery/networks/hf_branch.py#L65-L91) |
-| 高频图 H（Eq.5，λ 回灌） | [wavelet.py L58-86](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L58-L86) |
-| 挂载（RNG 对齐纪律）与 forward 浅→深编排 | [vit_seg_modeling.py L422-469](file:///e:/mkl/code/python_code/carotid-artery/networks/vit_seg_modeling.py#L422-L469) |
-| 参数开关（仅 baseline；快照后缀 `_hfbr3`） | [train.py L76-91](file:///e:/mkl/code/python_code/carotid-artery/train.py#L76-L91)、[scripts/eval_carotid.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/eval_carotid.py) |
+| HFBranch（轻量 HF 支 32@112²/64@56²/128@28²） | [hf_branch.py L37-62](../../networks/hf_branch.py#L37-L62) |
+| FAM（通道适配 + γ 门控残差） | [hf_branch.py L65-91](../../networks/hf_branch.py#L65-L91) |
+| 高频图 H（Eq.5，λ 回灌） | [wavelet.py L58-86](../../networks/wavelet.py#L58-L86) |
+| 挂载（RNG 对齐纪律）与 forward 浅→深编排 | [vit_seg_modeling.py L422-469](../../networks/vit_seg_modeling.py#L422-L469) |
+| 参数开关（仅 baseline；快照后缀 `_hfbr3`） | [train.py L76-91](../../train.py#L76-L91)、[scripts/eval_carotid.py](../../scripts/eval_carotid.py) |
 | 冒烟记录（5 项全过，105.276M→106.482M） | [experiments.md](../experiments.md) §1.9 执行记录② |
 
 ## 5. 结论边界与其他

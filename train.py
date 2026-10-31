@@ -35,13 +35,17 @@ parser.add_argument('--use_wavelet', type=int, default=0,
                     help='1 = build 3 channels (raw / wavelet denoised / detail energy)')
 parser.add_argument('--fusion', type=str, default='none', choices=['none', 'se', 'cross'],
                     help='feature fusion between main and wavelet branch')
-parser.add_argument('--arch', type=str, default='baseline', choices=['baseline', 'dual'],
-                    help='baseline = TransUNet / dual = 双骨干交错 + 四级双向融合 (D11)')
+parser.add_argument('--arch', type=str, default='baseline',
+                    choices=['baseline', 'dual', 'split', 'unet', 'xnet', 'gobletnet'],
+                    help='baseline = TransUNet / dual = 双骨干交错 + 四级双向融合 (D11) / '
+                         'split = 局部(R50)与全局(ViT-B/16)彻底分离、14² 单点融合 / '
+                         'unet|xnet|gobletnet = 纯卷积复现网络（各自独立训练，与 baseline 互不混用）')
 parser.add_argument('--levels', type=str, default='1,2,3,4',
                     help='dual 融合接点：1=112²/64, 2=56²/256, 3=28²/512, 4=14²/768')
 parser.add_argument('--fuse_op', type=str, default='auto',
-                    choices=['auto', 'window', 'global', 'gate', 'concat', 'deform', 'aff'],
-                    help='auto = 112/56 窗内 + 28/14 全局；deform = 可变形大核；aff = MS-CAM')
+                    choices=['auto', 'window', 'global', 'gate', 'concat', 'deform', 'aff', 'frc'],
+                    help='auto = 112/56 窗内 + 28/14 全局；deform = 可变形大核；aff = MS-CAM；'
+                         'frc = Syn-Net FrCFusion（DCT 频率通道注意力 + 空间支）')
 parser.add_argument('--window', type=int, default=8, help='112² 接点的窗口边长')
 parser.add_argument('--dk_ratio', type=int, default=2, help='注意力 d_k = C / dk_ratio')
 parser.add_argument('--bidir', type=int, default=1, help='1 = 双向融合；0 = 只侧→主（R7 对照）')
@@ -62,12 +66,19 @@ parser.add_argument('--n_skip', type=int,
                     default=3, help='using number of skip-connect, default is num')
 parser.add_argument('--vit_name', type=str,
                     default='R50-ViT-B_16', help='select one vit model')
+parser.add_argument('--vit_layers', type=int, default=12,
+                    help='ViT 编码器层数；0 = 去掉全局 Transformer 段（纯 R50 局部支拆支实验 L）')
 parser.add_argument('--vit_patches_size', type=int,
                     default=16, help='vit_patches_size, default is 16')
 parser.add_argument('--main_input', type=str, default='raw', choices=['raw', 'll'],
                     help='dual 主路输入：raw = 原图复制 3 通道（现状）；ll = 小波 LL 低频近似图（XNet 式低频/高频双流，高频全在侧路）')
 parser.add_argument('--edge_in', type=int, default=0,
-                    help='1 = 边缘特征融合·输入级：stem 吃 4 通道（原图 3 + 小波高频重建图 1）')
+                    help='1 = 边缘特征融合·输入级：stem 多吃一张边缘图（baseline 拼到 3 通道后；unet 拼到 1 通道后）')
+parser.add_argument('--edge_op', type=str, default='wavelet',
+                    choices=['wavelet', 'wavelet_lam', 'energy', 'sobel', 'laplacian'],
+                    help='输入级边缘图算子（仅 --arch unet --edge_in 1 可换；baseline 固定 wavelet λ=0）：'
+                         'wavelet = Haar 高频 IDWT 重建 / wavelet_lam = 再加 λ·LL 回灌 / '
+                         'energy = 细节能量图 / sobel / laplacian')
 parser.add_argument('--ddbe', type=int, default=0,
                     help='1~3 = 解码器第 N 级输出（28/56/112/224，level3=112×112/64ch）挂 BDFR-Net 式 DDBE；'
                          '4 = 四级全挂 DDBE×4（BDFR-Net 完整版）；0 = 关（仅 baseline）')
@@ -89,6 +100,31 @@ if args.hf_branch and args.arch != 'baseline':
     parser.error('--hf_branch 只接了 baseline 解码器（FAM 挂在 skip 上，dual 未接）')
 if not 0 <= args.hf_lambda <= 1:
     parser.error('--hf_lambda 取值 0~1（GobletNet 论文最优区间 0~0.3）')
+if not 0 <= args.vit_layers <= 12:
+    parser.error('--vit_layers 取值 0~12（预训练只含 12 层权重，0 = 去掉全局 Transformer 段）')
+if args.edge_op != 'wavelet' and not (args.arch == 'unet' and args.edge_in):
+    parser.error('--edge_op 只在 --arch unet --edge_in 1 时生效（baseline 的 edge_in 固定 wavelet λ=0 口径）')
+if args.arch in ('unet', 'xnet', 'gobletnet'):
+    # 三个独立复现网络在 forward 内自算小波输入，数据集必须给 1 通道原图
+    args.use_wavelet = 0
+    if args.ddbe or args.acam or args.hf_branch:
+        parser.error('--ddbe/--acam/--hf_branch 只接了 baseline 解码器，'
+                     'unet/xnet/gobletnet 是独立复现网络')
+    if args.edge_in and args.arch != 'unet':
+        parser.error('--edge_in 只在 unet 上接了（xnet/gobletnet 自带频率支）')
+    if args.fusion != 'none':
+        parser.error('--fusion 只接了 baseline，unet/xnet/gobletnet 是独立复现网络')
+    if args.main_input != 'raw':
+        parser.error('--main_input 只接了 dual')
+if args.arch == 'split':
+    # split 自带完整两路编码器，输入只给 1 通道原图
+    args.use_wavelet = 0
+    if args.edge_in or args.fusion != 'none' or args.ddbe or args.acam or args.hf_branch:
+        parser.error('split 未接 --edge_in/--fusion/--ddbe/--acam/--hf_branch')
+    if args.main_input != 'raw':
+        parser.error('--main_input 只接了 dual')
+    if args.levels != '1,2,3,4':
+        parser.error('split 固定 14² 单点融合，不接受 --levels')
 
 
 if __name__ == "__main__":
@@ -125,6 +161,9 @@ if __name__ == "__main__":
     snapshot_path = snapshot_path + '_pretrain' if args.is_pretrain else snapshot_path
     snapshot_path += '_' + args.vit_name
     snapshot_path = snapshot_path + '_skip' + str(args.n_skip)
+    if args.vit_layers != 12:
+        # 拆支实验 L（--vit_layers 0）必须与 12 层的 A0 分目录
+        snapshot_path += '_vitL' + str(args.vit_layers)
     snapshot_path = snapshot_path + '_vitpatch' + str(args.vit_patches_size) if args.vit_patches_size!=16 else snapshot_path
     snapshot_path = snapshot_path+'_'+str(args.max_iterations)[0:2]+'k' if args.max_iterations != 30000 else snapshot_path
     snapshot_path = snapshot_path + '_epo' +str(args.max_epochs) if args.max_epochs != 30 else snapshot_path
@@ -150,6 +189,16 @@ if __name__ == "__main__":
         if args.hf_branch:
             # λ 量化到 0.1 粒度进快照名（λ=0.3 → _hfbr3）
             snapshot_path += '_hfbr' + str(int(round(args.hf_lambda * 10)))
+        if args.arch in ('unet', 'xnet', 'gobletnet'):
+            snapshot_path += '_' + args.arch
+            if args.arch == 'unet' and args.edge_in:
+                # 边缘算子横扫：五种算子各自独立目录
+                snapshot_path += '_eo' + args.edge_op
+            if args.arch == 'gobletnet' and abs(args.hf_lambda - 0.3) > 1e-9:
+                # λ 非默认 0.3 时进快照名（λ=0.1 → _lam01），避免同目录混权重
+                snapshot_path += '_lam' + str(args.hf_lambda).replace('.', '')
+            if args.tag:
+                snapshot_path += '_' + args.tag
         if args.arch == 'dual':
             # 双骨干自己从原图算子带，数据集只给 1 通道
             args.use_wavelet = 0
@@ -164,6 +213,11 @@ if __name__ == "__main__":
                 snapshot_path += '_sp0'
             if args.tag:
                 snapshot_path += '_' + args.tag
+        if args.arch == 'split':
+            # 局部/全局分离 + 14² 单点融合；算子名必须进目录（同一 arch 多算子对照）
+            snapshot_path += '_split_' + args.fuse_op
+            if args.tag:
+                snapshot_path += '_' + args.tag
         if 'lists_Carotid_dev' in args.list_dir.replace('\\', '/'):
             # 快筛子集的结果绝不能和全量结果混在一起
             snapshot_path += '_dev'
@@ -175,6 +229,7 @@ if __name__ == "__main__":
     config_vit = CONFIGS_ViT_seg[args.vit_name]
     config_vit.n_classes = args.num_classes
     config_vit.n_skip = args.n_skip
+    config_vit.transformer.num_layers = args.vit_layers
     if args.vit_name.find('R50') != -1:
         config_vit.patches.grid = (int(args.img_size / args.vit_patches_size), int(args.img_size / args.vit_patches_size))
     if args.arch == 'dual':
@@ -188,6 +243,28 @@ if __name__ == "__main__":
                                    cross_scale=bool(args.cross_scale),
                                    main_input=args.main_input,
                                    edge_in=bool(args.edge_in)).cuda()
+    elif args.arch == 'split':
+        # 局部 R50 与全局 ViT-B/16 并联，仅 14² 单点融合
+        from networks.split_encoder_model import SplitLocalGlobalTransUNet
+        net = SplitLocalGlobalTransUNet(config_vit, img_size=args.img_size,
+                                        num_classes=config_vit.n_classes,
+                                        fuse_op=args.fuse_op, window=args.window,
+                                        dk_ratio=args.dk_ratio,
+                                        bidir=bool(args.bidir)).cuda()
+    elif args.arch == 'unet':
+        # 容量对齐基线：与 xnet/gobletnet 同积木的纯卷积 U-Net
+        from networks.unet import UNet
+        net = UNet(in_channels=1, num_classes=args.num_classes,
+                   edge_in=bool(args.edge_in), edge_op=args.edge_op).cuda()
+    elif args.arch == 'xnet':
+        # 小波低/高频双分支 + X 形融合，返回 (out_lf, out_hf) 双输出
+        from networks.xnet import XNet
+        net = XNet(in_channels=1, num_classes=args.num_classes).cuda()
+    elif args.arch == 'gobletnet':
+        # 语义 + HF 双编码器，FAM 四级融合，单输出
+        from networks.gobletnet import GobletNet
+        net = GobletNet(in_channels=1, num_classes=args.num_classes,
+                        hf_lambda=args.hf_lambda).cuda()
     elif args.fusion != 'none':
         from networks.wavelet_model import WaveletTransUNet
         net = WaveletTransUNet(config_vit, img_size=args.img_size,

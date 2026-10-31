@@ -1,6 +1,6 @@
 # deform 融合算子深讲：为什么本轮横评它最好，代码逐段怎么读
 
-配套代码：[networks/dual_encoder_model.py L216-L260](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L216-L260)。
+配套代码：[networks/dual_encoder_model.py L216-L260](../../networks/dual_encoder_model.py#L216-L260)。
 六档横评全表与另五个算子的讲解见 [fusion-operators-explained.md](fusion-operators-explained.md)（输入侧、损失、口径不再重复）。
 本文只回答两个问题：**deform 凭什么排第一**、**它的代码每一行在干什么**。
 
@@ -61,7 +61,7 @@ y   = DCN(Red1×1(B), o)           # 聚合：拿 o 到"对方"特征上采样�
 A'  = A + γ_a · GroupNorm(Proj1×1(y))
 ```
 
-逐层表（`__init__` [L229-L247](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L229-L247)）：
+逐层表（`__init__` [L229-L247](../../networks/dual_encoder_model.py#L229-L247)）：
 
 | 名字 | 运算 | 输出 | 作用 |
 |---|---|---|---|
@@ -78,7 +78,7 @@ A'  = A + γ_a · GroupNorm(Proj1×1(y))
 
 ## 4. 代码逐段
 
-### 4.1 单方向三步（`_dir` [L249-L252](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L249-L252)）
+### 4.1 单方向三步（`_dir` [L249-L252](../../networks/dual_encoder_model.py#L249-L252)）
 
 ```python
 o = off(src)      # ① 偏移：由"自己"的降维特征预测 25 组 (Δx,Δy)
@@ -88,12 +88,12 @@ return orig + gamma * norm(proj(y))
                   # ③ 残差：升维 → 归一化 → ×γ → 加回自己
 ```
 
-注意方向：更新 A 时（[forward L254-L260](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L254-L260)），
+注意方向：更新 A 时（[forward L254-L260](../../networks/dual_encoder_model.py#L254-L260)），
 偏移源是 `a = red_a(A)`，内容源是 `b = red_b(B)`——**A 自己决定去 B 的哪里取**。直觉：
 A 知道自己哪个位置处于边界不确定区，就去对方的边缘细节图上把对应位置的响应取过来。
 双向各跑一遍（A 用 off_a/def_a，B 用 off_b/def_b），互不共享卷积权重、只共享降维投影。
 
-### 4.2 deform_conv2d 是什么（[L19](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L19) 导入）
+### 4.2 deform_conv2d 是什么（[L19](../../networks/dual_encoder_model.py#L19) 导入）
 
 - 常规卷积的采样位置固定在 `p0 + pk` 网格；可变形卷积改成 `p0 + pk + o(p)`，o 由输入特征
   算出、坐标可以是小数，取值用双线性插值。这就是"采样点跟着边界走"的实现层含义。
@@ -107,8 +107,8 @@ A 知道自己哪个位置处于边界不确定区，就去对方的边缘细节
 
 ### 4.3 挂接与开关
 
-- 工厂：[make_fusion L317](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L317)，
-  deform 分支 [L329](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L329)。
+- 工厂：[make_fusion L317](../../networks/dual_encoder_model.py#L317)，
+  deform 分支 [L329](../../networks/dual_encoder_model.py#L329)。
 - 开关：`train.py --fuse_op deform`；其余训练口径与所有档完全一致
   （CE+Dice、bs4+ga2、200 epoch、seed 1234、SPARC 官方划分）——横评差值只能归因于算子本身。
 

@@ -44,7 +44,7 @@
 
 **做法**：整张图拆完后，把 `LL`（大轮廓）**全部置零**，再把小波逆变换拼回去 → 得到的就是边缘图。
 
-代码在 [networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py) 的 `build_hf_image()`：
+代码在 [networks/wavelet.py](../../networks/wavelet.py) 的 `build_hf_image()`：
 
 ```python
 ll, details = haar_dwt(xl)              # 拆：拿到大轮廓 + 细节
@@ -53,11 +53,11 @@ hf = haar_idwt(torch.zeros_like(ll), details)   # 大轮廓清零，拼回去
 
 **为什么这么设计**（老师的意见）：之前我们试过把三个细节子带拼成三通道图，但那样会丢分辨率、出现块状伪影。改成"IDWT 重建一张全分辨率的图"（这是 XNet、GobletNet 的做法），干净。
 
-四个候选算子的肉眼对比（红线 = 真值斑块轮廓，大/中/小斑块各一例）：
+候选算子的肉眼对比（红线 = 真值斑块轮廓；行 = 低回声/软斑块、混合斑块、实性斑块各 2 例，按回声对比度自动挑选；列 = 原图、小波低频 LL 重建、小波高频 IDWT 重建、旧方案能量图、Sobel、Laplacian）：
 
 ![边缘算子对比](../assets/edge-fusion/edge-operators-compare.png)
 
-图源 [scripts/vis_edge_operators.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/vis_edge_operators.py)（`python scripts/vis_edge_operators.py` 可重算）。图上能直接看到 §2 定量分数的三件事：能量图把「边界 + 强斑点」一起点亮，所以纯边界定位反而最准（命中率 1.63x/2.02x）；小波 IDWT 重建保留的不只是边界、还有内部纹理与回声（1.42x/1.71x，仍稳压 Sobel 的 1.07x/1.17x）；Laplacian 被斑点噪声主导，命中率 0.44x/0.59x 比瞎猜还差。两者目标不同，见上表第 3 条。
+图源 [scripts/vis_edge_operators.py](../../scripts/vis_edge_operators.py)（`python scripts/vis_edge_operators.py` 可重算）。图上能直接看到 §2 定量分数的三件事：能量图把「边界 + 强斑点」一起点亮，所以纯边界定位反而最准（命中率 1.63x/2.02x）；小波 IDWT 重建保留的不只是边界、还有内部纹理与回声（1.42x/1.71x，仍稳压 Sobel 的 1.07x/1.17x）；Laplacian 被斑点噪声主导，命中率 0.44x/0.59x 比瞎猜还差。两者目标不同，见上表第 3 条。
 
 ### 1.3 送进网络的方式（输入级融合）
 

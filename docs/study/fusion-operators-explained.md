@@ -25,14 +25,14 @@
 ### 1.1 两条支路各吃什么
 
 - 主路：原图复制成 3 通道（可选第 4 通道 = 小波高频重建图，`--edge_in 1`）；
-- 侧路：[build_detail_channels](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L35-L49) ——
+- 侧路：[build_detail_channels](../../networks/dual_encoder_model.py#L35-L49) ——
   对数域 1 级 Haar DWT 后取 **LH/HL/HH 三个方向子带 → 拼成 3 通道** → 上采样到 224 → 逐样本 z-score。
   侧路刻意不含低频，与主路信息不重叠。
 
 ### 1.2 小波 DWT 一句话
 
-[haar_dwt](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L24-L28)：用 4 个固定 2×2 卷积核
-（[wavelet.py L9](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L9)）stride 2 卷一次，
+[haar_dwt](../../networks/wavelet.py#L24-L28)：用 4 个固定 2×2 卷积核
+（[wavelet.py L9](../../networks/wavelet.py#L9)）stride 2 卷一次，
 把每张图拆成 4 张半尺寸的子带：
 
 | 子带 | 卷积核 | 含义 |
@@ -46,9 +46,9 @@
 
 | 做法 | 运算 | 优点 | 缺点 | 本项目里的例子 |
 |---|---|---|---|---|
-| **① 拼接成 3 通道** | `cat([LH,HL,HH])` | 保留全部方向与符号信息，后续卷积自己学怎么组合 | 通道变多 | 侧路输入、DDBE 的 HF 支（[ddbe.py L123](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py#L123)） |
-| ② 能量图合成 1 通道 | `sqrt(LH²+HL²+HH²)` | 单通道、省算力 | **丢方向与符号**，只剩"哪里有高频" | 旧的高频能量图（[build_three_channel C3](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L99)） |
-| ③ 重建回单通道 | LL 置零 → IDWT | 与原图同分辨率同分布，方向信息以干涉形式保留 | 单通道，方向被混在一起 | 老师定的输入级边缘图 [build_hf_image](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py#L58-L82) |
+| **① 拼接成 3 通道** | `cat([LH,HL,HH])` | 保留全部方向与符号信息，后续卷积自己学怎么组合 | 通道变多 | 侧路输入、DDBE 的 HF 支（[ddbe.py L123](../../networks/ddbe.py#L123)） |
+| ② 能量图合成 1 通道 | `sqrt(LH²+HL²+HH²)` | 单通道、省算力 | **丢方向与符号**，只剩"哪里有高频" | 旧的高频能量图（[build_three_channel C3](../../networks/wavelet.py#L99)） |
+| ③ 重建回单通道 | LL 置零 → IDWT | 与原图同分辨率同分布，方向信息以干涉形式保留 | 单通道，方向被混在一起 | 老师定的输入级边缘图 [build_hf_image](../../networks/wavelet.py#L58-L82) |
 
 文献里的普遍情况：**要让网络"分方向处理"就选拼接**（BDFR-Net HF 支、XNet/GobletNet 族都是）；
 **只是把高频当附加输入通道**就选重建或能量图。BDFR-Net 自己也是拼接派——它的 HF 支
@@ -56,13 +56,13 @@
 
 ## 2. 模型与损失
 
-### 2.1 融合算子逐个讲（全部在 [dual_encoder_model.py](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py)）
+### 2.1 融合算子逐个讲（全部在 [dual_encoder_model.py](../../networks/dual_encoder_model.py)）
 
 融合位置：双骨干四个接点 112²/64、56²/256、28²/512、14²/768（`--fuse_op` 选哪个算子，接点不变）。
 所有算子双向对称（A 影响 B、B 影响 A），γ_a、γ_b 各一个标量零初始化——**一条链上只有一个零**，
 保证第 0 步与单通道基线逐元素相同。
 
-**① gate 逐像素门控**（[BidirGate L170](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L170-L195)）
+**① gate 逐像素门控**（[BidirGate L170](../../networks/dual_encoder_model.py#L170-L195)）
 
 ```
 w_b = σ(Conv7×7([mean(B), max(B)]))          # 把 B 压成一张空间权重图
@@ -72,7 +72,7 @@ A'  = A + γ_a · (A ⊙ w_b)                    # 用对方的权重图缩放�
 只调幅度、不重组内容：A 的每个位置值不变，只是被 B 的"哪里重要"乘了个 0~1 的系数。参数量几乎为零。
 conv 权重零初始化 → 初始 w=σ(0)=0.5，非零，门控能学（这是修死锁后的写法）。
 
-**② concat 拼接回投影**（[BidirConcat L198](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L198-L213)）
+**② concat 拼接回投影**（[BidirConcat L198](../../networks/dual_encoder_model.py#L198-L213)）
 
 ```
 A' = A + γ_a · Conv1×1(cat([A, B]))          # 拼接后 1×1 线性混合再压回
@@ -80,7 +80,7 @@ A' = A + γ_a · Conv1×1(cat([A, B]))          # 拼接后 1×1 线性混合再
 
 对照档：区分"跨支交互"与"只是多一路特征"。TinyCNN 门槛实验里它只 +0.005（无效）。
 
-**③ auto / window / global 跨支 QKV 注意力**（[BidirCrossAttention L87](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L87-L167)）
+**③ auto / window / global 跨支 QKV 注意力**（[BidirCrossAttention L87](../../networks/dual_encoder_model.py#L87-L167)）
 
 ```
 A' = A + γ_a · Proj(Attn(Q=A, K=B, V=B))     # A 的每个位置去 B 的所有位置取内容
@@ -90,7 +90,7 @@ A' = A + γ_a · Proj(Attn(Q=A, K=B, V=B))     # A 的每个位置去 B 的所�
 28²/14² 用全局注意力。已测出的坑：侧路喂全零涨幅反而更高 → **涨幅不来自 HF 内容**（fusion-methods.md §3）。
 最深接点用 chain 串联双向，否则 B 无下游消费者、gamma_b 恒 0 悬空。
 
-**④ deform 可变形大核**（[BidirDeform L216](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L216-L260)）
+**④ deform 可变形大核**（[BidirDeform L216](../../networks/dual_encoder_model.py#L216-L260)）
 
 ```
 off = Conv3×3(red(A))                        # 偏移由"自己"的降维特征预测（不是对方）
@@ -102,7 +102,7 @@ A'  = A + γ_a · Proj(DCN(red(B)处内容, off))    # 拿偏移到对方特征�
 术语消歧：torchvision `deform_conv2d` 未传 mask，是 v1 口径（只学偏移、无逐点幅度调制），
 不是 DCNv2。为什么本轮最好＋逐行代码：[deform-fusion-explained.md](deform-fusion-explained.md)。
 
-**⑤ aff 两级注意力融合**（[BidirAFF L287](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L287-L312)，核心是 [MS-CAM L263](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L263-L284)）
+**⑤ aff 两级注意力融合**（[BidirAFF L287](../../networks/dual_encoder_model.py#L287-L312)，核心是 [MS-CAM L263](../../networks/dual_encoder_model.py#L263-L284)）
 
 ```
 m = MS-CAM(A + B)                            # 先相加整合，再算逐通道空间权重
@@ -115,7 +115,7 @@ MS-CAM = 局部支路（保空间分布）+ 全局支路（GAP 抓通道显著�
 `Expected more than 1 value per channel`）；修复 = 全局支路改 SE 式 MLP 不带空间归一化，
 重跑成功。结果 90.17% / 0.1469 / 0.4011，五档垫底——"只调幅度"且权重全局化，比逐像素 gate 更差。
 
-**⑥ DDBE 三分支**（[ddbe.py](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py)，单级挂载，`--ddbe 3`）
+**⑥ DDBE 三分支**（[ddbe.py](../../networks/ddbe.py)，单级挂载，`--ddbe 3`）
 
 ```
 f = ECA(x)                                   # 先 1D 卷积通道注意力压斑点响应
@@ -172,9 +172,9 @@ mm 物理单位，每 5 epoch 评估，取 ep150。同一 seed（1234）下所�
 
 ## 4. 代码实现在哪里
 
-- 五种融合算子 + 工厂：[networks/dual_encoder_model.py L84-L330](file:///e:/mkl/code/python_code/carotid-artery/networks/dual_encoder_model.py#L84-L330)
-- DDBE：[networks/ddbe.py](file:///e:/mkl/code/python_code/carotid-artery/networks/ddbe.py)；挂载点 [vit_seg_modeling.py DecoderCup](file:///e:/mkl/code/python_code/carotid-artery/networks/vit_seg_modeling.py#L399)
-- 小波工具（DWT/IDWT/边缘图）：[networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py)
+- 五种融合算子 + 工厂：[networks/dual_encoder_model.py L84-L330](../../networks/dual_encoder_model.py#L84-L330)
+- DDBE：[networks/ddbe.py](../../networks/ddbe.py)；挂载点 [vit_seg_modeling.py DecoderCup](../../networks/vit_seg_modeling.py#L399)
+- 小波工具（DWT/IDWT/边缘图）：[networks/wavelet.py](../../networks/wavelet.py)
 - 开关：`train.py --fuse_op {auto,window,global,gate,concat,deform,aff}`、`--ddbe 0~4`
 
 ## 5. 结论边界与其他

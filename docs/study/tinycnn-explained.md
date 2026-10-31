@@ -1,7 +1,7 @@
 # TinyCNN 讲解：门槛实验里那个"小网络"到底是什么
 
-配套代码：[scripts/probe_edge_signal.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py)（原始版）
-和 [scripts/probe_fusion_axis.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_fusion_axis.py)（改造版 TinySeg）。
+配套代码：[scripts/probe_edge_signal.py](../../scripts/probe_edge_signal.py)（原始版）
+和 [scripts/probe_fusion_axis.py](../../scripts/probe_fusion_axis.py)（改造版 TinySeg）。
 概念背景（边缘图是什么、门槛实验为什么这么设计）见 [edge-fusion-explained.md](edge-fusion-explained.md)。
 
 ---
@@ -28,7 +28,7 @@ TinyCNN 是一个 **0.06M 参数的极简分割网络**（正式模型 TransUNet
 
 ## 2. 逐层拆解（原始版 TinyCNN）
 
-代码在 [probe_edge_signal.py 第 121-137 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L121-L137)。
+代码在 [probe_edge_signal.py 第 121-137 行](../../scripts/probe_edge_signal.py#L121-L137)。
 输入 `(B, in_ch, 224, 224)`，输出 `(B, 2, 224, 224)`（背景/斑块两类）。
 
 | 层 | 运算 | 输出尺寸 | 说明 |
@@ -49,7 +49,7 @@ TinyCNN 是一个 **0.06M 参数的极简分割网络**（正式模型 TransUNet
 
 ## 3. 三个变体（门槛实验的全部）
 
-同一套结构，只换输入通道（[第 140-148 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L140-L148)）：
+同一套结构，只换输入通道（[第 140-148 行](../../scripts/probe_edge_signal.py#L140-L148)）：
 
 | 变体 | 输入 | 回答的问题 |
 |---|---|---|
@@ -58,9 +58,9 @@ TinyCNN 是一个 **0.06M 参数的极简分割网络**（正式模型 TransUNet
 | `hf` | 只给 HF 边缘图 | HF 自己能做到多少（旁证） |
 
 HF 图不是预先存好的，而是训练时对每个 batch 现算 `build_hf_image(x)`
-（小波高频 IDWT 重建、LL 置零、逐样本 z-score，见 [networks/wavelet.py](file:///e:/mkl/code/python_code/carotid-artery/networks/wavelet.py)）。
+（小波高频 IDWT 重建、LL 置零、逐样本 z-score，见 [networks/wavelet.py](../../networks/wavelet.py)）。
 
-训练配置（[第 168-204 行](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_edge_signal.py#L168-L204)）：
+训练配置（[第 168-204 行](../../scripts/probe_edge_signal.py#L168-L204)）：
 
 - Adam lr=2e-3 + 余弦退火，batch 16，20 epoch；
 - **三个变体用同一个 seed（1234）、同一份 shuffle 顺序**（独立 `torch.Generator`），
@@ -95,7 +95,7 @@ HF 图不是预先存好的，而是训练时对每个 batch 现算 `build_hf_im
 
 ## 6. 改造版：TinySeg（融合轴实验）
 
-[probe_fusion_axis.py](file:///e:/mkl/code/python_code/carotid-artery/scripts/probe_fusion_axis.py)
+[probe_fusion_axis.py](../../scripts/probe_fusion_axis.py)
 把 TinyCNN 拆成可复用的 `encoder()`（与原始版逐层同构），外面套 8 种变体，
 用来回答新问题："HF 该走**通道**还是该走 **QKV 注意力**？"
 
