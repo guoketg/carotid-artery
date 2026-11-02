@@ -1,474 +1,245 @@
-# 实验方案
+# 实验方案与结论
 
-## 1. 消融矩阵
+> 只保留**当前口径、已完成结论、待办**。排队时间、pid、故障修复等过程流水见 git 历史与 `logs/`。
+> 完整指标表见 [results.md](results.md)；融合结构细节见 [technical-design.md](technical-design.md) 与 `docs/study/`。
 
-### 1.1 已完成（2026-10-23 旧版小波引导注意力）
-
-| 编号 | 配置 | 验证目标 |
-|---|---|---|
-| A0 | 单通道原图基线（原图单通道 TransUNet） | 基线参照 |
-| A1 | 三通道早融合（原图通道、去噪重建通道、高频能量通道拼成三通道，直接进主干，无额外融合模块） | 预处理本身是否有效 |
-| A2 | 伪小波支路对照（原图复制三通道 + 小波引导注意力） | 融合结构本身是否有效 |
-| A3 | 三通道＋小波引导注意力（旧版，只在 14×14 单点融合） | 完整方法（结论：无显著增益） |
-
-### 1.2 待跑（2026-10-24 修订，双骨干 + 三级融合）
-
-前提：所有变体统一用固定 epoch 评估（规则见 CLAUDE.md 第 8 条），不再在测试集上调 epoch；
-每次对比都同时报 Params / FLOPs，并做病例级 Wilcoxon。
-
-| 编号 | 配置 | 验证目标 |
-|---|---|---|
-| A4 | **共享权重双输入**（同一 R50+ViT 分别前向原图通道与高频能量通道）+ 深层 28×28 融合 | 零新增参数下，"两路输入"是否有增益 |
-| A5 | **独立同构双骨干**（两套 R50+ViT，均 ImageNet21k 初始化）+ 深层 28×28 融合 | 容量翻倍是否有额外收益（对照共享权重双输入（A4），参数不匹配需注明） |
-| A6 | 共享权重双输入（A4）基础上**三级全开**：浅 112 + 中 56 + 深 28 | 多尺度融合是否好于单点 |
-| A7 | 融合模块替换：AG / CSA(通道+空间) / CGAF(双向跨注意力) 各一次 | 注意力形式本身是否贡献 |
-| A8 | 融合位置单点扫描：仅浅(112) / 仅中(56) / 仅深(28) / 仅瓶颈(14) | 哪个尺度是增益来源 |
-| A9 | 参数匹配对照：第二路换成容量相同但输入为噪声的编码器 | 排除"增益来自参数变多" |
-
-执行约束：
-
-- 独立同构双骨干（A5）需先做 batch 4 + AMP + 梯度累积(2) 的显存冒烟；OOM 则第二骨干降级为 R50-only / ViT-S，保持层级对称。
-- 112×112 与 56×56 不允许全 token 注意力（56×56 全注意力约 45 GFLOP/前向），只允许 AG / CSA / 窗口化注意力。
-- 每个变体两个子集（SPARC / Zhongnan）分开跑，不混合。
-
-附加实验：小波级数（1 vs 2）、软阈值开关、CLAHE 替代去噪重建通道、DoG 替代高频能量通道、去噪重建通道是否保留。
-
-### 1.3 第二轮优先级（2026-10-24 检索后重排，**先跑这一组**）
-
-依据见 `literature.md` 末尾「硬结论」：收益来自第二路**信息源**而不是融合模块（DCLA-Net Table 1、MSFA-Net Table 4），跨支**交互**优于 concat+通道注意力（DEFI-Net Table 4），输入级去噪收益不稳定（denoising benchmark Table V），同图派生视图的双输入增益天花板很低（MS-Net Table 1/2）。由此把共享权重双输入与三级全开提前、独立同构双骨干降级、去噪重建通道移出主路径，并新增两个此前没有的对照（原图通道+高频能量通道双通道早融合门槛、共享权重双输入加 concat 回投影）。
-
-| 编号 | 配置 | 对应旧编号 | 验证目标 |
-|---|---|---|---|
-| **E1** | 原图通道 + 高频能量通道双通道早融合，单骨干、无注意力（第三通道置零以适配 3 通道 patch embedding） | 新增 | **高频能量通道是否存在可被单编码器利用的信息**（最便宜的门槛） |
-| **E2** | 共享权重双输入（同一套 R50+ViT 分别吃原图通道与高频能量通道）+ 跨支门控，仅深 28×28 | ≈A4（共享权重双输入） | 双输入 + 交互，单点够不够 |
-| **E3** | 共享权重双输入 + **concat + 1×1 回投影**，仅深 28×28 | 新增 | 增益来自"注意力"还是"多一路特征" |
-| **E4** | 共享权重双输入 + 跨支门控，**浅 112 + 中 56 + 深 28 三级全开** | ≈A6（三级全开） | 多级是否好于单点 |
-| **E5** | 共享权重双输入 + 跨支门控三级全开（E4）的胜出配置搬到 Zhongnan | — | 跨子集是否复现 |
-
-执行顺序与成本（单次约 50–60 min：120 epoch / batch 8 / `--eval_test_every 10`）：
-
-1. 开发集固定用 **SPARC**，先跑 E1（原图通道+高频能量通道双通道早融合门槛）→ E2（共享权重双输入 + 跨支门控单点）→ E3（其 concat 回投影对照）→ E4（三级全开）（约 4 h）；
-2. 只有三级全开（E4）或单点（E2）达标，才跑 E5（Zhongnan 跨子集复现确认）；
-3. 独立同构双骨干（A5）**降级为最后**：仅在三级全开（E4）证明有效后，用来量化"容量 vs 信息"各占多少；若 E4 无效则直接跳过。
-
-判定规则（写在跑之前，避免事后解释）：
-
-| 检查 | 通过条件 | 不通过时的处置 |
-|---|---|---|
-| 原图通道+高频能量通道双通道早融合（E1） vs 单通道原图基线（A0） | \|ΔDice\| ≥ 0.005 或 HD95 显著下降（p < 0.05，病例级 Wilcoxon） | 高频能量通道单编码器吃不动 → 双支路增益只能来自容量，补参数匹配的噪声第二路对照（A9）定性，不主张"小波有效" |
-| 共享权重双输入 + 跨支门控单点/三级全开（E2/E4） vs 单通道原图基线（A0） | Dice ≥ +0.01 **且** HD95 显著下降 | 判为无增益，转负面结果，融合线停止投入 |
-| 三级全开（E4） vs concat 回投影对照（E3） | E4 优于 concat 对照且 p < 0.05 | 说明"跨支门控"本身不贡献，回退到 concat，结论改写 |
-| 三级全开（E4） vs 单点（E2） | E4 优于单点 | 多级融合无额外收益 → 只保留深 28×28 单点，省算力 |
-| 跨子集复现（E5） vs 三级全开（E4） | 方向一致（不要求幅度相同，两子集设备不同） | 只在 SPARC 成立 → 结论限定为单中心，写进限制 |
-
-预处理增强变体（等上述第二轮门槛与融合对照出结果后再决定是否插入，不预先占队列）：
-
-| 编号 | 增强 | 实现位置 | 预期作用 |
-|---|---|---|---|
-| P1 | CLAHE（clip 2.0，8×8） | 新 `enhance.py`，替换原图通道或作为第 4 通道的候选 | 拉开斑块内部灰度差 |
-| P2 | 二级小波的高频能量（高频能量通道取第 2 级而非第 1 级） | `build_three_channel(detail_level=2)` | 把斑点（第 1 级）与边界（第 2 级）分开 |
-| P3 | 同态滤波（log + 高通） | 新 `enhance.py`，替换去噪重建通道 | 修正声影/近远场亮度差，可能改善 DeltaArea |
-
-> 注意：**"把高频能量通道乘一个增益系数"这种高频增强在现有代码里无效**——`_standardize(energy)` 逐样本减均值除标准差，会抹掉全局幅度。要改变高频权重只能换尺度（改用二级小波高频能量，P2）或换通道构成。
-
-### 1.4 第三轮：双骨干强融合（强融合实验组，2026-10-24，**已入队**）
-
-方案见 [technical-design.md](technical-design.md) 的「双骨干交错四级融合：双编码器 + 四级接点」一节，落地实现见 [dual-encoder-design.md](dual-encoder-design.md)。**2026-10-24 22:55 起已实施并进入夜间队列**，规格选定为独立 R50 侧路版（侧路 BN→GN）。
-
-输入契约（已定）：主路只吃原图通道（复制 3 通道），侧路吃 `LH/HL/HH` 三张方向子带，**输入端不拼原图通道/去噪重建通道/高频能量通道**；四个接点都**双向**（112²/56²/28² 并行双向，14² 串联双向）、按 stage 交错执行。
-
-| 编号 | 配置 | 验证目标 | 状态 |
-|---|---|---|---|
-| **R0** | 探针验证：50 步、不训练、不写权重 | 实测 batch 4/6/8 的峰值显存、单步耗时、BN `running_var` 方差 | ✅ 2026-10-24 完成 |
-| **R1** | 双骨干交错四级融合的独立 R50 侧路（到 stage3）+ 28×28 单点融合 | 双骨干在最强接点是否有效 | ⏳ 本队列实为 4 接点 `auto` 档 |
-| **R2** | 独立 R50 侧路 + 112×112、56×56、28×28 三个融合接点全开 | 多级是否好于单点 | ⏳ 由单点配置（R1）的 `--levels 1,2,3,4` 一并覆盖 |
-| **R3** | 独立 R50 侧路 + 四个融合接点（增加 14×14 接点） | 瓶颈接点是否还有增量 | ⏳ 同上 |
-| **R4** | R50+ViT 双骨干 + 四个融合接点 | 容量 vs 信息（对照四点全开（R3），参数量不匹配需注明） | ⏸ 未排期 |
-| **R5** | 四点全开配置（R3）的胜出配置搬到 Zhongnan | 跨子集是否复现 | ⏳ 本队列每个变体都跑两子集 |
-| **R6** | 112×112、56×56 融合接点的窗内注意力 → 退回逐元素门控 | 窗内注意力的净贡献，防止「只是多了参数」 | ⏳ 即队列中逐元素门控对照 job（`--fuse_op gate`，r2） |
-| **R7** | 四点全开配置（R3）只保留「侧→主」，删掉「主→侧」 | 双向是否必要；检验单向是否退化成三通道＋小波引导注意力（A3）式的单向供体 | ⏳ 队列中单向融合 job（`--bidir 0`，r7） |
-
-实际队列（`scripts/night_queue_dual.ps1`，8 job 串行，batch 4 + `--grad_accum 2`，120 epoch，`--eval_test_every 10`）：
-
-| job | 变体 | 数据集 | 估时 |
-|---|---|---|---|
-| r1_sparc / r1_zhongnan | `--fuse_op auto`（112×112、56×56 接点窗内、28×28、14×14 接点全局，双向） | SPARC / Zhongnan | 72 / 87 min |
-| r2_* | `--fuse_op gate`（即窗内注意力退回逐元素门控的对照） | 同上 | 同上 |
-| r3_* | `--fuse_op concat`（concat 对照） | 同上 | 同上 |
-| r7_* | `--fuse_op auto --bidir 0`（即删掉主路→侧路的单向融合对照） | 同上 | 同上 |
-
-合计约 **10.6 h**。原计划中单点（R1）、三级（R2）、四点（R3）的拆分因实现合并为一次前向（四个接点同时开），改由 `--levels` 事后消融；当前队列先验证「四点全开 vs 单通道原图基线」，层级拆分留待单点配置（R1）达标后补。
-
-强融合追加队列（`scripts/night_queue_dual2.ps1`，6 job，等队列 1 结束后 GPU 空闲 10 min 自动启动，
-同超参：batch 4 + `--grad_accum 2`、120 epoch、`--eval_test_every 10`）：
-
-| job | 变体 | 针对的根因 | 数据集 | 融合模块参数 |
-|---|---|---|---|---|
-| r4_* | `--fuse_op deform`（D-LKA 式可变形大核，见 3.4） | 采样网格固定 | SPARC / Zhongnan | 3.69 M |
-| r5_* | `--fuse_op aff`（AFF MS-CAM） | 只调节幅度、不重组内容 | SPARC / Zhongnan | 0.47 M |
-| r6_* | `--fuse_op auto --cross_scale 1`（BiFPN 式 top-down） | 只在 4 个点融合，时间维度上不传播 | SPARC / Zhongnan | +44 K |
-
-> 编号说明：queue 2 里三个 job 名中的 **r4 / r5 / r6 是 3.4 节新增的融合算子槽位**（可变形大核 / AFF 幅度调制 / 跨尺度回流），与上表计划项
-> R4（R50+ViT 双骨干，⏸ 未排期）、R6（112×112、56×56 接点窗内注意力退回逐元素门控，即 `--fuse_op gate`）**不是同一件事**。
->
-> 三个算子均已通过零初始化等价性（`max|Δ| = 0`）与参数量探针；耗时探针因与队列 1 争用 GPU 未采信。
-
-执行约束：
-
-- 开发集固定 SPARC，按单点（R1）→ 三级（R2）→ 四点（R3）顺序跑；R50+ViT 双骨干（R4）与跨子集复现（R5）只在四点（R3）达标后跑。
-- 单点配置（R1）起就是双编码器，**必须先过探针验证（R0）**；实测不达标则降 batch + 梯度累积，不接受「估算可行」。
-- 侧路 BN 全部换 GroupNorm（主路 BN 与预训练权重不动）。
-- 输出目录追加 `_dualR50` / `_dualViT`，禁止覆盖单通道原图基线（A0）的输出。
-
-判定规则（跑之前写死）：
-
-| 检查 | 通过条件 | 不通过时 |
-|---|---|---|
-| 单点融合（R1） vs 单通道原图基线（A0） | **HD95 下降 ≥ 0.5 mm 且 p < 0.05** | 双骨干在单点无效 → 不追加接点，转负面结果 |
-| 三级全开（R2） vs 单点融合（R1） | HD95 再降 ≥ 0.3 mm 且 p < 0.05 | 多级无额外收益 → 只保留 28×28 单点 |
-| 四点全开（R3） vs 三级全开（R2） | HD95 或 Dice 至少一项显著 | 瓶颈接点冗余 → 删 14×14 接点，省注意力开销 |
-| R50+ViT 双骨干（R4） vs 四点全开（R3） | 差值 < 四点全开（R3）相对单通道原图基线（A0）的增益一半 | 说明增益来自信息而非容量 → 只报独立 R50 侧路版，R50+ViT 双骨干版写进讨论 |
-| 跨子集复现（R5） vs 四点全开（R3） | 方向一致（不要求幅度相同） | 只在 SPARC 成立 → 结论限定单中心 |
-| 窗内注意力退回门控（R6） vs 四点全开（R3） | 窗内注意力显著更好 | 门控够用 → 退回逐元素门控，省算力 |
-| 单向融合（R7） vs 四点全开（R3） | 双向显著更好（HD95 或 Dice） | 双向无差异 → 只保留单向并在文中注明；若单向反而更好，说明侧路被主路污染 |
-
-主指标统一为 **HD95 / ASSD**，Dice 只作参考（与 1.3 一致）；**HD（max）自 2026-10-31 起全量并列报告**，口径对齐论文 Table 1，但不参与判定。
-
-### 1.5 2026-10-24 夜实际执行顺序（**只跑 SPARC，单子集**）
-
-用户决定：不做小样本快筛、不跑第二个子集，直接把全量 SPARC 跑完。实测全量 dual 为 **0.70 s/iter（107 iter/epoch ≈ 75 s/epoch）**，即单个 120-epoch job ≈ **2.5 h**，一夜（23:50 → 08:00）只能排 3 个。故按优先级只排：
-
-| 顺序 | job | 变体 | 目的 | 预计完成 |
-|---|---|---|---|---|
-| 1 | r1_sparc | `--fuse_op auto`（112×112、56×56 接点窗内、28×28、14×14 接点全局，双向） | 主方法，同时产出 120 epoch 测试曲线用于定 epoch | ~02:20 |
-| 2 | r4_sparc | `--fuse_op deform` | 可变形大核是否强于窗内注意力 | ~04:50 |
-| 3 | r5_sparc | `--fuse_op aff` | AFF 式幅度调制是否够用 | ~07:20 |
-| 4 | r6_sparc | `--fuse_op auto --cross_scale 1` | 跨尺度回流（顺延，不保证 8 点前出） | ~09:50 |
-
-- 命令：`night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `night_queue_dual2.ps1 -Skip *zhongnan`。
-- 未排：r2（逐元素门控）/ r3（concat 对照）/ r7（单向融合）与全部 Zhongnan 复现，留待四点全开 job（r1）出结果后再决定。
-- 对比基准：**单通道原图基线（A0，单骨干，120 epoch，SPARC）已有结果**，r1（四点全开） vs 单通道原图基线即主检验。
-- 每晚只改一个因子；`--eval_test_every 10` 让每个 job 都留下 10/20/…/120 的曲线，可在任意公共 epoch 上做配对比较。
-
-> 原「dev 60% 子集快筛」方案（`lists_Carotid_dev` + `night_queue_dev.ps1` + `summarize_dev.py`）已于 23:50 撤销，脚本保留备用，产物已删。
-
-### 1.6 参数与统计口径
-
-- Params / FLOPs：共享权重双输入（同一套 R50+ViT 分别吃原图通道与高频能量通道）与单通道原图基线相同（105M）；共享权重双输入 + concat + 1×1 回投影对照（E3）额外约 1.2M；独立同构双骨干（A5）为 210M。
-- 统计：按病例配对 Wilcoxon（同一病例的多张切片先取均值再配对），每子集独立；不跨设备合并。
-- 主指标 **HD95 / ASSD**，Dice 为次要门槛；DeltaArea 只报带符号均值与 |DeltaArea|，不做显著性。
-
-### 1.7 2026-10-28 夜：融合算子横评 + DDBE 门槛验证 + 基线补跑（**已入队**）
-
-队列脚本：[scripts/queue_c2d_fuse.ps1](../scripts/queue_c2d_fuse.ps1)（第三个接力队列，2026-10-28 00:54 以 WMI 启动，pid 34168；等主队列 `queue_c2d.ps1` 与边缘队列 `queue_c2d_edge.ps1` 全部退出、GPU 空闲后自动开跑）。统一口径 `$common`：SPARC / bs4 + ga2 / 200 epoch / `--eval_test_every 5`，取 ep150，与 1.6 及既有队列完全一致。
-
-**本次改了哪些代码**（DDBE 实现，冒烟全过）：
-
-| 文件 | 改动 |
-|---|---|
-| [networks/ddbe.py](../networks/ddbe.py)（新增） | BDFR-Net 式 DDBE：ECA → HF 支（多通道 Haar DWT 取 LH/HL/HH → concat → 1×1 → 3×3+BN → 转置卷积上采样 → SE）/ LF 支（LL → 5×5+BN → 双线性上采样 → SE）/ CTX 支（7×7+BN → 自门控）→ concat → 1×1（**唯一零初始化点**）→ CBAM → 残差加回。level3 参数量 0.440 M |
-| [networks/vit_seg_modeling.py](../networks/vit_seg_modeling.py) | `DecoderCup` 加 `ddbe/ddbe_idx` 挂载点（forward 中在第 N 级 decoder_block 输出后调用）；`VisionTransformer` 加 `ddbe_level` 参数，**在全部基础权重初始化之后**再建 DDBE（保证同 seed 基础权重逐位不变，RNG 对齐） |
-| [train.py](../train.py) | 加 `--ddbe 0~4`（仅 baseline 接了，dual 会 parser.error）；快照名追加 `_ddbe<N>`（拼在 fusion 后缀之后、dual 块之前） |
-
-冒烟结论（临时脚本 `Temp\smoke_ddbe.py`，已跑 ALL PASS）：① 同 seed 基础权重与不挂 DDBE 版本 `torch.equal`（DDBE 仅新增 35 个张量）；② eval 恒等起步 `max|Δ| = 0`（零初始化 → 初始 logits 与基线逐位相等）；③ train 模式前反向正常；④ level 1~4 四级 forward 均通（解码器四级实际输出 28/56/112/224，level3 = 112×112/64ch，与论文「挂在哪级」无关紧要——先用 level3 做门槛验证）。
-
-**队列 6 个 job（顺序 = 优先级）**：
-
-| # | job | 配置 | 快照目录（与 train.py 逐字对齐） | 对照 | 预计完成 |
-|---|---|---|---|---|---|
-| 1 | `faff1234_sparc` | dual `--fuse_op aff`（AFF MS-CAM，0.47 M） | `..._224_SPARC_dual_L1234_aff_c2d` | d1234 auto（已完成） | ≈ 07:20 |
-| 2 | `fgate1234_sparc` | dual `--fuse_op gate`（逐元素门控，R6 对照） | `..._224_SPARC_dual_L1234_gate_c2d` | 同上 | ≈ 09:00 |
-| 3 | `fdeform1234_sparc` | dual `--fuse_op deform`（D-LKA 可变形大核，3.69 M） | `..._224_SPARC_dual_L1234_deform_c2d` | 同上 | ≈ 10:40 |
-| 4 | `ddbe3_1234_sparc` | baseline `--ddbe 3`（DDBE 挂 112²/64ch 级） | `..._224_SPARC_ddbe3_c2d` | A0 基线 seed1234 | ≈ 12:00 |
-| 5 | `b1234_sparc` | A0 单通道原图基线 seed1234 **重建** | `..._224_SPARC_c2d` | —（见下方发现） | ≈ 13:15 |
-| 6 | `b3407_sparc` | A0 基线 seed3407 **补跑** | `..._224_s3407_SPARC_c2d` | —（见下方发现） | ≈ 14:30 |
-
-排班依据与两个意外发现：
-
-- **aff / gate / deform 零实现成本**（算子已在 `networks/` 实现且过零初始化等价性），先横评融合算子，与已完成的 `d1234_sparc`（auto）同 seed 配对；
-- **发现 1**：A0 基线 seed1234 的新口径产物（`..._SPARC_c2d/` 的 `test_curve.csv`、`metrics.csv`，§3 epoch 选择即依据它）在本机已不存在——全盘（C:/E:）搜不到。ddbe3 的病例级 Wilcoxon 必须有同 seed 配对对照，故**补跑 job 5**恢复之（aggregate 数字 status.md §3.1 已存档，跑完核对是否复现 90.49%/0.1431/0.3896）；
-- **发现 2**：`b3407_sparc` 上一轮在 epoch≈50 被中途杀掉（log 止于 iteration 2163、无 `metrics.csv`），但 `queue_c2d.ps1` 的 `-Skip` 把它跳过了、status.md 仍写「排队」——故**补跑 job 6**；
-- **本轮不碰 QKV、不上四级全量 DDBE**：DDBE 只做 level3 单级门槛验证，过了门槛再谈全量（写在跑之前，避免事后解释）。
-
-判定规则（跑之前写死）：
-
-| 检查 | 通过条件 | 不通过时的处置 |
-|---|---|---|
-| aff / gate / deform vs d1234 auto（同 seed 配对） | 某算子 HD95 下降 ≥ 0.5 mm 且 p < 0.05 | 无显著差异 → 融合算子不敏感，维持 auto，横评线关闭 |
-| ddbe3（DDBE 单级门槛） vs A0 基线 seed1234 | \|ΔDice\| ≥ 0.005 **或** HD95 显著下降（p < 0.05，病例级 Wilcoxon） | 不过门槛 → DDBE 线停止投入，不排四级全量 |
-| b1234 重建 vs status.md §3.1 存档 | ep150 四项指标复现（Dice 差 < 0.005） | 不复现 → 以重建产物为准并核查口径 |
-
-### 1.8 2026-10-28 三个队列跑完：ep150 横评结果与病例级 Wilcoxon（**已收口**）
-
-> **口径注记（2026-10-30）**：本节为历史记录，当时判定点是 ep150。现口径已统一为**终点 epoch 200**（见文末「epoch 选择」一节），最终数字以 [results.md](results.md) 的 ep200 表为准；本节保留过程记录，不改史。
-
-三个队列（`queue_c2d.ps1` 主队列 + `queue_c2d_edge.ps1` 边缘队列 + `queue_c2d_fuse.ps1` 融合队列）全部执行完毕。统一口径：SPARC 官方划分 / bs4 + ga2 / 200 epoch（poly 绑死）/ `--eval_test_every 5`，判定点 **ep150**（存档 `epoch_149.pth`）。
-
-**故障与修复**：
-
-- `faff1234`（dual `--fuse_op aff`）在 epoch 5 首次测试时崩溃（exit 1，仅存活 1.8 min）：`_MSCAM` 全局支路的 GroupNorm 在 GAP 后 1×1 空间 + eval batch=1 时校验失败（`input size [1, 8, 1, 1]`）。**修复**：[dual_encoder_model.py](../networks/dual_encoder_model.py) 的 `_MSCAM.glb` 去掉 GroupNorm，改带 bias 的 SE 式 MLP（局部支路保留 GN）；冒烟（eval batch1 前向 + train batch4 反向）通过，批次 0 重跑。
-- **时点错位**：`trainer.py` 末尾 `metrics.csv` 是 ep199 的逐切片指标，与 ep150 判定点不符 → 用 `epoch_149.pth` 重算。[scripts/eval_carotid.py](../scripts/eval_carotid.py) 已扩展：`build_model` 支持三分支（baseline/dual/fusion + edge_in/ddbe），新增病例级聚合 `_group_by_case`（同病例多切片先取均值再配对，§1.6 口径）与 CLI 全参数；批量驱动 [scripts/eval_batch_ep149.ps1](../scripts/eval_batch_ep149.ps1)。全部 11 个有效快照重算完毕，每个 ~0.3 min，逐切片汇总与 `test_curve.csv` ep150 完全吻合（交叉验证通过）。
-
-**ep150 逐切片汇总**（n=160，SPARC test；Dice % / ASSD mm / HD95 mm）：
-
-| job | 配置 | Dice | ASSD | HD95 |
-|---|---|---|---|---|
-| b1234 | A0 基线 seed1234 | 89.95% | 0.1498 | 0.3997 |
-| b2024 | A0 基线 seed2024 | 90.27% | 0.1498 | 0.4146 |
-| b3407 | A0 基线 seed3407 | 90.26% | 0.1508 | 0.4303 |
-| dauto1234 | dual auto（L1234，双向）s1234 | 90.40% | 0.1476 | 0.4064 |
-| dauto2024 | dual auto s2024 | 90.11% | 0.1468 | 0.4036 |
-| dauto3407 | dual auto s3407 | 89.85% | 0.1570 | 0.4461 |
-| gate1234 | dual gate s1234 | 90.35% | 0.1434 | 0.4034 |
-| deform1234 | dual deform s1234 | **90.61%** | **0.1412** | **0.3788** |
-| ddbe3 | baseline `--ddbe 3` s1234 | 90.08% | 0.1513 | 0.4404 |
-| edge1234 | baseline `--edge_in 1` s1234 | 90.20% | 0.1476 | 0.3973 |
-| edgedual | dual auto + edge_in s1234 | **90.72%** | 0.1416 | 0.3895 |
-| faff1234 | dual aff s1234 | ❌ 崩溃（见上），批次 0 重跑 | | |
-
-**病例级配对 Wilcoxon**（43 例，同病例切片先均值再配对；基线 = 对应 seed 的 A0）：
-
-| 比较 | ΔDice（病例级） | p(Dice) | p(ASSD) | p(HD95) |
-|---|---|---|---|---|
-| dauto1234 vs b1234 | +0.38% | 0.209 | 0.294 | 0.385 |
-| dauto2024 vs b2024 | +0.00% | 0.816 | 0.586 | 0.385 |
-| dauto3407 vs b3407 | **−0.49%** | **0.0036** ✗ | **0.0097** ✗ | 0.104 |
-| gate1234 vs b1234 | +0.27% | 0.663 | 0.742 | 0.333 |
-| deform1234 vs b1234 | +0.59% | 0.113 | 0.154 | 0.276 |
-| ddbe3 vs b1234 | −0.03% | 0.680 | 0.881 | 0.093 |
-| edge1234 vs b1234 | +0.27% | 0.595 | 0.447 | 0.891 |
-| edgedual vs b1234 | +0.62% | 0.069 | 0.223 | 0.791 |
-
-（各 log 中还出现 `delta_area` p<0.001 的行：A0 基线系统性低估面积（−0.90 mm²），多数变体向 0 靠拢——这是**面积偏差校正**方向的真实差异，但反映的是偏置而非边界精度，不计入判定。）
-
-**结论（对照 §1.7 判定规则）**：
-
-1. **融合算子横评（aff/gate/deform vs auto）：全部未通过**（无算子达 HD95 降 ≥0.5 mm 且 p<0.05）→ 融合算子不敏感，维持 auto；deform 是唯二方向一致为正的点（ΔDice +0.59%、HD95 −0.019 mm）但 p=0.113。
-2. **双骨干 3-seed：无增益**。A0 三 seed 均值 90.16% vs dual auto 90.12%；且 s3407 上 dual **显著变差**（Dice p=0.0036、ASSD p=0.0097，方向为负）。在当前融合设计下双骨干线判负——增益若存在也掩埋在 seed 方差之下。
-3. **ddbe3 单级挂载：未过门槛**（ΔDice −0.03%，HD95 反而 +0.078 mm）→ 与用户判断一致：别人的论文（BDFR-Net）是**四级全挂 + 每级 ACAM**，单级挂载证明不了什么，转批次 1（§1.9）。
-4. **edge 线索保留**：edgedual 是全场最佳点（90.72%/0.1416/0.3895，p=0.069 边缘），deform 次之；两者都只是方向证据，不作为结论。
-
-## 1.9 文献复现计划（2026-10-28 用户批准，批次 0–4）
-
-**复现口径**：本项目只有 Carotid2D 数据（SPARC/Zhongnan 两子集），无法复现论文原数据集 → 「复现」定义为**把论文核心模块移植进现有 TransUNet 管线**，与 A0 基线同口径（官方划分 / bs4+ga2 / 200 epoch poly / 判定点**终点 epoch 200**（2026-10-30 起）/ SPARC / seed1234），用 §1.8 的病例级配对 Wilcoxon 比较。基线锚点：A0 s1234 = 90.32% / 0.1457 / HD 0.64 / 0.3924（ep200 重算）。
-
-**判定规则（跑之前写死，每批次同一模板）**：
-
-| 通过条件 | 不通过时的处置 |
-|---|---|
-| \|ΔDice\| ≥ 0.005（病例级）**或** HD95 下降 ≥ 0.5 mm 且 p < 0.05 | 该论文的模块在本任务无效 → 记录负面结果，该线停止投入 |
-
-| 批次 | 内容 | 出处（pdf/） | 实现要点 | 状态 |
-|---|---|---|---|---|
-| **0** | faff 重跑 + 全量 ep149 病例级统计 | 本项目 | AFF GroupNorm 修复（§1.8）；`eval_batch_ep149.ps1` 已跑完 11 快照 | 统计 ✅ 2026-10-28；faff 重跑已入队（队列第 3 位） |
-| **1** | ① `ddbe4`：解码器**四级全挂** DDBE ② `ddbefull`：DDBE×4 + ACAM skip 对齐 | 3612 Submission.pdf（BDFR-Net）p.3「four cascaded stages, each comprising … DDBE … ACAM」、p.5「repeats across all four resolution levels」 | 复用 [networks/ddbe.py](../networks/ddbe.py)（零初始化恒等起步，保同 seed 等价）；ddbe4 = `--ddbe 4` 语义扩展为全四级；ACAM = 解码器逐级对 skip 特征做跨级语义对齐再拼接 | 已实现 ✅（冒烟 5 项全过，参数量 105.3M→114.8M）；已入队在训 |
-| **2** | GobletNet 式：单主干 + 轻量 HF 支 + FAM 逐层融合 | GobletNet.pdf Eq.5 / Table VI / Table X | 单 R50+ViT 主干（不翻容量）：HF 图 `H=HL+LH+HH+λ·LL`（λ=0.3，forward 内现算）→ 轻量 HF 支（32@112/64@56/128@28，+0.29M）→ FAM 逐级与 skip 互标定（官方通道不等适配版，+0.84M）→ `skip = x1_fa + inject(x2_fa)`（inject 零初始化，对应官方 decoder cat(x2_fa)） | 已实现 ✅（冒烟 5 项全过：同 seed 对齐 / 恒等起步 max\|Δ\|=0 / 门控时序验证 / 参数 105.3M→106.5M / λ 回灌行为；详见 §1.9 执行记录②）；待批次 1 结论后入队 |
-| **3** | Syn-Net FrCFusion 融合算子 | Syn-Net.pdf | 落地为 `--fuse_op dct`（频域通道混合），接入现有 dual 四接点框架 | **改方案（2026-10-30）**：老师要求先分别做局部支/全局支、再两个骨干一起验证是否真有涨点，`dct` 暂缓实现，见下方「Syn-Net 局部/全局归因实验」 |
-| **4** | WMREN WRDM 双分支 DWT | WMREN.pdf | 双分支（原图 + DWT 子带）+ WRDM 式权重残差蒸馏融合 | 待实现 |
-| 搭车 | XNet 便宜变体 `--main_input ll`（主路吃 LL 低频图） | XNet.pdf | 零新代码，仅改输入构成 | 已入队（队列第 4 位） |
-
-不复现：WeaveSeg / FcaNet / MFDF / XNet 全量（模块重、与现有框架重叠度高、预期增益低，理由见 [literature.md](literature.md)）。
-
-执行顺序：批次 0 收尾（faff 重跑）→ 批次 1（ddbe4 → ddbefull，先四级 DDBE 消融出「挂几层」结论，再加 ACAM）→ 视结果决定批次 2–4 排期。队列脚本沿用 [queue_c2d_fuse.ps1](../scripts/queue_c2d_fuse.ps1) 模板（接力等待 + jobs 数组 + WMI 启动），WMI 启动纪律不变。
-
-> **执行记录**：批次 0+1 已合并为一个队列 [queue_c2d_repro.ps1](../scripts/queue_c2d_repro.ps1)，2026-10-28 17:16 经 WMI 启动（pid 26772），4 job 顺序：ddbe4 → ddbefull → faff 重跑 → mainLL 搭车，约 12 h；快照名 `_ddbe4` / `_ddbe4_acam`；status CSV `logs/queue/queue_c2d_repro_status.csv`。队列跑完后按 §1.9 判定规则对 4 个快照跑 ep149 eval + 病例级 Wilcoxon。
->
-> **执行记录②（批次 2 实现，2026-10-28 18:00）**：GobletNet 移植完成，趁 GPU 忙碌先行实现（不占队列）。改动：[networks/hf_branch.py](../networks/hf_branch.py)（新建，HFBranch + FAM + `HF_DET_CHANNELS=(32,64,128)`）；[networks/wavelet.py](../networks/wavelet.py) `build_hf_image` 加 `lf_weight=0.0` 参数（λ·LL 回灌，默认 0 与 edge_in 逐位一致）；[networks/vit_seg_modeling.py](../networks/vit_seg_modeling.py) `VisionTransformer` 加 `hf_branch/hf_lambda`（挂载在 ddbe/acam 之后，RNG 纪律；forward 浅→深交错：det 被 FAM 重标定后继续下采样，贴官方「FA 后特征继续进下一层」）；[train.py](../train.py) `--hf_branch / --hf_lambda 0.3`（仅 baseline，快照后缀 `_hfbr3`）；[scripts/eval_carotid.py](../scripts/eval_carotid.py) 同名参数。冒烟 `Temp\smoke_hfbr.py` 5 项全过：①同 seed 基础权重对齐（96 新张量，0 missing/mismatch）②恒等起步 max|Δlogits|=0 ③门控时序：step 0 仅 gamma/inject 有梯度（det 链在两道零门后，LoRA B=0 同款一步延迟，预期行为），3 步 SGD 后全链解锁 ④参数 105.276M→106.482M（+1.206M）⑤λ=0.3 回灌改变 HF 图且有限值。入队命令（批次 1 结论后）：`--hf_branch 1 --hf_lambda 0.3`，快照 `*_SPARC_hfbr3_c2d`。
->
-> **执行记录③（评测流水线就绪，2026-10-28 17:55）**：`eval_batch_ep149.ps1` 追加 4 个新 job 条目（ddbe4 / ddbefull / faff / mainll，Baseline 均配 b1234 的 metrics_ep149.csv，DryRun 验证快照路径全部正确）；新增 [watch_eval_repro.ps1](../scripts/watch_eval_repro.ps1)（WMI 启动，pid 16200）每 5 min 轮询 `queue_c2d_repro_status.csv`，某 job 行落地（exit 0）即自动跑其 ep149 eval + 病例级 Wilcoxon，4 job 处理完自动退出；watcher 日志 `logs/queue/watch_eval_repro.log`，各 job 评测日志 `logs/queue/watch_eval_<job>.log`。进度实测：ddbe4 ~120 iter/min（比 ddbe3 的 290 iter/min 慢，四级挂载计算量更大），17600 iter 预计 ~19:45 跑完，全队列 ~01:30。
-
-### 1.9a Syn-Net 局部/全局归因实验（批次 3 改方案，2026-10-30 老师意见，**代码就绪，待入队**）
-
-老师意见：全局特征 + 局部特征融合（Syn-Net 思路）要**先分别做、再一起做**，确认真有涨点才继续投入。据此把批次 3 从「直接实现 `--fuse_op dct`」改为三步归因：
-
-**核心问题**：A0（R50 局部 + ViT 全局，90.32%）已经是「两个骨干一起」的融合体——所以这不是新增方法，而是**给已有 A0 做拆支消融**，回答「局部、全局、二者融合各值多少分」。
-
-| 步骤 | 配置 | 目的 | 状态 |
-|---|---|---|---|
-| L | **局部单支**：纯 R50 编码器（`--vit_layers 0`，去掉 ViT 段），解码器/口径不变 | 局部（CNN）单独能到多少 | ✅ 2026-10-31 完成：**90.55%**（病例级，与 A0 差 −0.01%，p=0.73） |
-| G | **全局单支**：纯 ViT 编码器（`--vit_name ViT-B_16 --n_skip 0`），解码器/口径不变 | 全局（Transformer）单独能到多少 | ✅ 2026-10-31 完成：**89.32%**（比 A0 低 1.24%，p=0.0001） |
-| L+G | A0 基线（已有） | 融合体 | ✅ 90.32%（3-seed） |
-
-**判定规则（跑前写死）**：
-
-| 检查 | 通过条件 | 不通过时的处置 |
-|---|---|---|
-| A0 vs max(L, G) | A0 显著优于两个单支（Wilcoxon p<0.05 且 \|ΔDice\| ≥ 0.5%） | 局部+全局融合本身无增益 → Syn-Net/frc/双骨干线**全部停止投入**，转负面结果 |
-| 单支 L 或 G 单独 | 至少一支接近 A0（差距在噪声带 \|ΔDice\| < 0.5% 内） | 说明该支冗余，融合方向从「局部+全局」改为保留胜出单支 + 换信息源（子带/边缘） |
-
-**执行纪律**：
-
-- 先单 seed（1234）跑 L、G 两个门槛，用 §1.9 同款 Wilcoxon 比较；两支都过/都不过再考虑补 3-seed——单支不过线就不跑第二支多 seed。
-- 口径：官方划分 SPARC / bs4+ga2 / 200ep；判定统一为**终点 epoch 200**（2026-10-30 起，见文末「epoch 选择」一节）。
-- 已有数据的初判（不可直接当结论）：纯卷积 U-Net（局部代表）86.55% vs A0 90.32%，但混杂了 from scratch vs 预训练 + 容量差异，**不能替代** L/G 同口径消融；dual 3-seed 判负说明「换输入信息源的双路」无增益，与「局部+全局拆支」是两个不同问题。
-- 老师后续指示「把 Syn-Net 的模块直接拿过来，单独的 DCT 效果不明显，没必要」→ 归因（L/G）照跑，同时把完整 FrCFusion 移植成 `--fuse_op frc`（§1.9b 的 D 组），**不**另写独立的 `dct` 通道注意力算子。
-
-### 1.9b 拆支补全 + U-Net 边缘图 + FrCFusion 移植（2026-10-30 入队 / **2026-10-31 全部完成**）
-
-统一口径与 §1.9 相同：SPARC / `--seed 1234` / `--max_epochs 200` / `--eval_test_every 5` / `--batch_size 4 --grad_accum 2`（等效 batch 8）；判定点 ep200，病例级 Wilcoxon（n=43），门槛 \|ΔDice\| ≥ 0.5% 或 HD95 降 ≥ 0.5 mm，seed 噪声带 ±0.3%。
-
-四个 run（串行执行，顺序 = 优先级）。队列脚本 [scripts/queue_c2d_split.ps1](../scripts/queue_c2d_split.ps1)，8 个 job 串行（A → B → C×5 → D），2026-10-31 00:06 启动（实测 76 s/epoch，单 job 200 epoch）。快照名按 train.py L150-211 的拼接顺序写死：
-
-| 编号 | 名称 | 命令要点 | 快照后缀 | 对照 | 状态 |
-|---|---|---|---|---|---|
-| A | `cnn_only` | `--vit_layers 0`（R50 保留，ViT 段清零） | `_skip3_vitL0` | A0 90.32% | ✅ 完成（90.55%） |
-| B | `vit_only` | `--vit_name ViT-B_16 --n_skip 0` | `ViT-B_16_skip0` | A0 90.32% | ✅ 完成（89.32%） |
-| C | `unet_edge` | `--arch unet --edge_in 1 --edge_op <算子>`（5 个算子横扫） | `_edge_unet_eo<算子>` | U-Net 86.55%（无边缘） | ✅ 全部完成，见下表 |
-| D | `dual_frc` | `--arch dual --fuse_op frc`（四级全开） | `_dual_L1234_frc` | dual auto 90.32% / A0 90.32% | ✅ 完成（90.43%） |
-
-入队前已对四条路径各跑 1 epoch 实测（`--max_epochs 1`，产物已删）：A 77.58% / B 62.62% / C(sobel) 44.48% / D(frc) 76.25%（ep1 Dice，仅证明能跑通，不代表收敛水平）。
-
-实际用时（`logs/queue/queue_c2d_split_status.csv`，8 job 全部 exit 0，00:06:47 → 10:05:06，合计 **599 min ≈ 10.0 h**）：A 27.1 / B 39.9 / C1 91.9 / C2 91.7 / C3 91.7 / C4 91.8 / C5 91.6 / D 72.5 min。B（纯 ViT、无 skip）与 A（无 Transformer 段）明显更省时；五个 U-Net 变体耗时锁定在 91.6~91.9 min，说明算子切换本身不带来额外计算。
-
-各 run 的目的与判定：
-
-1. **A `cnn_only`（拆支 L）**：只用 R50 局部编码器（`Encoder` 的 `num_layers=0`，patch embedding 与 encoder_norm 保留，预训练 R50 权重照常载入），回答「局部支单独值多少」。与 A0 比：若 A0 − A ≥ 0.5%，说明 ViT 全局段有贡献；若 |A0 − A| < 0.5%，说明全局段冗余。
-2. **B `vit_only`（拆支 G）**：纯 ViT-B/16 全局编码器 + 无 skip 解码器（`n_skip=0` → `skip_channels=[0,0,0,0]`，解码器只吃 token 特征），回答「全局支单独值多少」。与 A0 比同理；A/B 两支合起来即「局部 + 全局」的完整归因。
-3. **C `unet_edge`**：验证「边缘图 + 小网络」是否真涨点。U-Net stem 由 1 通道改吃 2 通道（原图 + 边缘图），边缘算子可换（见下表）。这是 §2(5) 那条「小网络 +1.81%、大预训练骨干零增益」证据链的第三段：同一个 λ=0 小波高频算子在 from-scratch 纯 CNN 上的增益。
-4. **D `dual_frc`**：把 Syn-Net 的 FrCFusion 整模块移植成第 8 个融合算子（DCT 频率通道注意力 + 空间支），在既有双骨干四点框架内与 `auto` / `aff` / `deform` 同台比较。**两处论文未明说的假设**：①只有主路 `A2 = A + γ·Freqout`，侧路原值返回（论文的融合是单向供体结构，γ 零初始化 → 第 0 步与 baseline 逐元素等价）；②DCT 频点表用 4×4 网格按 (u+v,u,v) zig-zag 取前 16 个低频频点，替代 FcaNet 的 top-16 表（那张表是 224 分辨率 ImageNet 排序产物，本项目特征只有 14²~112²）。参数量：level1~4 分别 0.011 / 0.173 / 0.690 / 1.552 M，合计 +2.43 M。
-
-#### 结果（ep200 / `epoch_199.pth`，160 张切片、43 例）
-
-主表读数为全切片均值；Δ 与 p 为病例级（同病例切片先取均值，n=43）与对照的配对 Wilcoxon。三行对照：A0 `_SPARC_c2d` 90.56%、dual auto 90.62%、U-Net 无边缘 86.99%（均为病例级）。
-
-| run | Dice (%) | HD (mm) | HD95 (mm) | ASSD (mm) | 对照 | ΔDice (病例级) | p (Dice) |
-|---|---|---|---|---|---|---|---|
-| A `cnn_only` | 90.49 | 0.71 | 0.42 | 0.145 | A0 90.56 | −0.01 | 0.73 |
-| B `vit_only` | 89.19 | 0.78 | 0.48 | 0.167 | A0 90.56 | **−1.24** | **0.0001** |
-| D `dual_frc` | 90.40 | 0.67 | 0.42 | 0.147 | dual auto 90.62 | −0.19 | 0.59 |
-| D `dual_frc` | — | — | — | — | A0 90.56 | −0.13 | 0.68 |
-
-**HD（max）已全量补齐（2026-10-31）**：论文 Table 1 的 HD 是最大表面距离（medpy `hd`），不是 HD95；`metrics_carotid.py` / `trainer.py` / `scripts/eval_carotid.py` 已同时输出 `hd`，27 个已有 checkpoint（3-seed 基线 + dual 全系 + 全部变体 + 三个复现网络）已全部用 `epoch_199.pth` 重推理，[results.md](results.md) 与本文件各表均带 HD 列。**判定口径不变，仍是 HD95 / ASSD**——HD 只看单点最大偏移，对个别离群切片敏感，仅作与论文对齐的并列展示。上表 HD 为切片级（n=160）；病例级（n=43）HD：A0 **0.62**、A 0.68、B 0.76、D `frc` 0.70、D `auto` 0.63、U-Net 1.11 mm，对 A0 的配对 Wilcoxon p：A 0.036、B <0.001、D `frc` 0.385、D `auto` 0.242、U-Net <0.001。HD ≈ 1.6×HD95，排序与 HD95 基本一致；与论文 TransUNet（HD 0.98±0.81）比，A0 的 0.62 更低。
-
-
-结论（按跑前写死的判定）：
-
-1. **A ≈ A0（差 0.01%，p=0.73）→ ViT 全局段在本任务上零贡献**。去掉 12 层 Transformer，Dice 不变、HD95 略差 0.03 mm（p=0.08，未过显著），说明 A0 的分数几乎全部来自 R50 局部支。判定表「A0 vs max(L, G)」一条的处置随之生效：**局部+全局融合无增益，Syn-Net / frc / 双骨干线停止追加投入**。（参考：HD 口径下 A 为 0.68 vs 0.62、p=0.036 恰好过线，但幅度仅 0.06 mm ≈ 1 px，不改判定。）
-2. **B 显著更差（−1.24%，p=0.0001；HD95 0.48 vs 0.39，p<0.001，p 为病例级检验）**。全局支能单独跑（89.19%）但补不上局部支；`n_skip=0` 的解码器没有 skip，边界锐度明显掉，这与 HD95 的差距一致。
-3. **D `frc` 与 `auto` 等价（−0.19%，p=0.59；HD95 0.42 vs 0.40，p=0.86）**。FrCFusion 的 DCT 频率通道注意力 + 空间支在本数据上没有超过窗内注意力，多花的 2.43 M 参数没换来指标；与 A0 比也仍是 −0.13%（p=0.68）。即 Syn-Net 的模块本身不是缺失的那块，**问题在「换信息源」这条路，而不是融合算子形式**——与 §1.9 的 dual 3-seed 判负一致。
-
-#### C 组：边缘算子横扫（已出结果）
-
-U-Net 无边缘基线 = 86.55%（全切片）/ 86.99%（病例级）。五个算子的定义与实现位置：
-
-| # | 算子 | 定义 | 实现 |
-|---|---|---|---|
-| 1 | `wavelet` | 对数域 1 级 Haar，**LL 置零后 IDWT 重建**（λ=0），逐样本标准化 | `build_hf_image(x, lf_weight=0)` |
-| 2 | `wavelet_lam` | 同上但掺回 **λ·LL**（GobletNet Eq.5，λ=0.3），缓解纯高频信息稀疏 | `build_hf_image(x, lf_weight=0.3)` |
-| 3 | `energy` | 小波**细节能量图** √(LH²+HL²+HH²)，半分辨率插值回原尺寸（旧方案，丢方向） | `_detail_energy` |
-| 4 | `sobel` | Sobel 梯度幅值 √(gx²+gy²) | `_sobel_mag` |
-| 5 | `laplacian` | 4 邻域 Laplacian 幅值 | `_laplacian_mag` |
-
-统一入口 `build_edge_map(x, op)` 在 [networks/wavelet.py](../networks/wavelet.py)；五个算子都输出逐样本标准化的 (B,1,H,W)，除算子本身外**网络结构、参数量、超参完全一致**（60.298 M）。
-
-| # | 算子 | Dice (%) | HD (mm) | HD95 (mm) | ASSD (mm) | Δ vs 无边缘 | 结论 |
-|---|---|---|---|---|---|---|---|
-| 1 | `wavelet` | 87.42 | 1.16 | 0.70 | 0.205 | +0.81（p=0.013） | 过门槛，但 ASSD 仅 −0.023（p=0.022）、HD95 −0.12 mm 不显著（p=0.23） |
-| 2 | `wavelet_lam` | 86.78 | 1.09 | 0.70 | 0.214 | +0.14（p=0.61） | 落在噪声带内，λ·LL 回灌等于没加 |
-| 3 | `energy` | 85.62 | 1.26 | 0.82 | 0.240 | −0.43（p=0.23） | 低于基线，**唯一负增益**：丢方向 + 半分辨率上采样把边缘抹平 |
-| 4 | `sobel` | 87.52 | 1.06 | 0.63 | 0.199 | +0.96（p=0.002） | 过门槛，HD95 −0.17 mm（p=0.018）、ASSD −0.024（p=0.016）三项全显著 |
-| 5 | `laplacian` | 87.90 | 1.25 | 0.63 | 0.195 | **+1.21（p<0.001）** | **五者最优**，HD95 −0.16 mm（p=0.003）、ASSD −0.031（p=0.0001）三项全显著 |
-
-U-Net 无边缘基线 HD = 1.14 mm。**HD（max）与 HD95 在 C 组不同序**：`sobel` 1.06 最优，`laplacian` 却 1.25（比基线还差），`wavelet_lam` 1.09 / `wavelet` 1.16 / `energy` 1.26。差别来自 HD 只取单点最大表面距离、对个别离群切片极敏感；`laplacian` 的 Dice 与 HD95（0.63，与 `sobel` 并列最优）都最好，说明它的整体边界更准、只是个别切片出现大偏移。故判定仍按 Dice / HD95，HD 列只作对照。
-
-C 组结论：
-
-1. **算子确实有影响，不是「随便一张边缘图就行」**。五者 Dice 跨度 87.90 − 85.62 = **2.28%**，约为 seed 噪声带（±0.3%，即 0.6% 全幅）的 **3.8 倍**；最好（`laplacian` 87.90）与最差（`energy` 85.62）差 2.28%，差的不是运气。
-2. **梯度类算子（`laplacian` / `sobel`）全面优于小波类（`wavelet` / `wavelet_lam`）**：Dice 高 0.5%~1.1%，且只有这两个算子在 HD95 上显著（p=0.003 / 0.018）。原因：梯度算子保留**方向信息**和原分辨率相位，而 `energy` 把三个方向平方和后只剩幅度、还要从半分辨率插值回来，边界位置被模糊——这也是它成为唯一负增益的原因。
-3. **λ·LL 回灌（`wavelet_lam`）在 from-scratch U-Net 上无效**（+0.14%，p=0.61）。λ=0.3 只在 GobletNet 那种深层网络上被报告有效，这里把低频掺回来后反而稀释了高频，且与 `wavelet`（λ=0）比更差 0.64%。
-4. **但所有算子都补不上架构差距**：最好的 `laplacian` 87.90% 仍比 A0（90.56%，病例级）低 **2.66%**；即使与 U-Net 无边缘基线（86.99%）相比也只涨 1.21%，这与 [results.md](results.md) §3(1)「小网络 +1.81%」和 §2(5)「大预训练骨干上边缘图零增益」一致：**边缘图是有用的输入自由度，但它补不上骨干家族的差距。**
-5. **对后续实验的处置建议**：边缘算子选 **`laplacian`（或 `sobel`）**，不再沿用现在的 λ=0 小波高频，`energy` 弃用。但注意本次只在 from-scratch U-Net 上横扫，TransUNet 骨干上「换梯度算子」是否同样有优势**未验证**——若打算在主方法上换，需补 A0+edge(laplacian) 对照，否则不回改 §2(5) 的既有结论（那里 wavelet 边缘图在 A0 上零增益）。
-
-> 判定：以 `wavelet`（项目现用口径、也是 TransUNet edge_in 用的同一算子）为参照，其余四个只用来回答「是不是小波高频本身在起作用，还是任何边缘图都行」。若五个算子的 Dice 差值都落在 seed 噪声带 ±0.3% 内，结论写成「U-Net 吃的是『多一张边缘图』这个自由度，与具体算子无关」；若某个非小波算子显著更好，则 §2(5) 的边缘算子选择需要改写并补 TransUNet 对照。
-
-> 判定回执（跑完后回填）：分布**不**落在噪声带内（跨度 2.28% vs 0.6%），且非小波算子（`laplacian` / `sobel`）显著更好 → 走第二分支。后续若要在主方法上换成梯度算子，按第 5 条需先补 TransUNet 骨干的 A0+edge(laplacian) 对照；本次**未做**，留作待补项。
-
-**已完成的代码改动（冒烟全过，`Temp/smoke_edge_frc.py`）**：
-
-| 文件 | 改动 |
-|---|---|
-| [networks/wavelet.py](../networks/wavelet.py) | 新增 `EDGE_OPS` 注册表、`_sobel_mag` / `_laplacian_mag` / `_detail_energy`、统一入口 `build_edge_map` |
-| [networks/unet.py](../networks/unet.py) | `UNet` 加 `edge_in / edge_op`：stem 输入 `1 → 2` 通道，forward 内拼 `build_edge_map(x)` |
-| [networks/dual_encoder_model.py](../networks/dual_encoder_model.py) | 新增 `BidirFrC`（FrCFusion 移植）+ `make_fusion` 的 `frc` 分支 |
-| [train.py](../train.py) | 加 `--vit_layers`（0~12）与 `--edge_op`；`--fuse_op` 加 `frc`；放开 `--arch unet` 的 `--edge_in`；快照名追加 `_vitL<n>` / `_eo<算子>` |
-| [scripts/eval_carotid.py](../scripts/eval_carotid.py) | 同步 `--vit_layers / --n_skip / --edge_op / fuse_op frc`，`patches.grid` 仅 R50 才设 |
-
-冒烟结论：① 五个算子的边缘图均 (B,1,224,224)、有限值、均值 0 / 标准差 1；② U-Net 五个算子前向通过且参数量一致（60.298 M）；③ `BidirFrC` 四级 dim（64/256/512/768）γ=0 时输出与输入 `torch.equal`（恒等起步），γ=1 时改变输出；④ 双骨干 `--fuse_op frc` 四级全开前向通过（120.385 M）；⑤ `--vit_layers 0` 能载入 R50+ViT 权重并前向（`len(encoder.layer)=0`）；⑥ 纯 `ViT-B_16 + n_skip 0` 能载入 ViT 权重并前向。
-
-
-## 2. 评估协议
-
-- **两个子集分开**：SPARC 与 Zhongnan 各自训练、各自测试，不混合。
-- 暂不设验证集，训练固定轮数后直接用测试集评估；最终标准待老师给出后按其定义重跑。
-- 指标：Dice、ASSD、HD、HD95、DeltaArea（预测面积 − 真值面积）。**HD = medpy `hd`（最大表面距离），即论文 Table 1 的口径，2026-10-31 起全量产出、与 HD95 并列报告；判定仍用 HD95。** **2026-10-26 起切换物理单位：ASSD/HD/HD95 为 mm、DeltaArea 为 mm²（预测重采样回原分辨率网格后按 NIfTI 头 spacing 计算，明细见 [dataset.md](dataset.md) §6）；此前全部数字为 224 网格像素口径，与 mm 口径不可直接比。**
-- 显著性：paired t-test 或 Wilcoxon signed-rank，p < 0.05。
-- 必须同时报告 Params、FLOPs、单张推理时延，排除"涨点来自更大模型"。
-- 斑块为小目标：损失用 `Dice + BCE`（或 CE+Dice），重点看 HD95 与 DeltaArea 的偏差方向。
-- 失败案例：低回声斑块、声影区、钙化伴声影、增益过曝。
-
-## 3. 训练超参（以夜间队列实际跑过的配置为准）
-
-训练入口统一使用官方 [train.py](file:///f:/code/MyPython/TransUNet/train.py) + [trainer.py](file:///f:/code/MyPython/TransUNet/trainer.py)，只把数据换成了颈动脉数据集。
+## 0. 统一口径（当前有效）
 
 | 项 | 值 |
 |---|---|
-| 输入 | 224×224，单通道原图（单通道原图基线） |
-| batch | **8**（`--batch_size 8`，8GB 内的实测峰值约 3.3GB） |
-| epoch | **120**（`--max_epochs 120`；代码默认 200，队列显式覆盖） |
-| 优化器 | **SGD**，lr 0.01，momentum 0.9，weight_decay 1e-4，poly 衰减（power 0.9） |
-| 损失 | 0.5 × CE + 0.5 × Dice |
-| 预训练 | **启用**：`R50+ViT-B_16.npz`（ImageNet21k） |
-| 数据加载 | `num_workers=1`（Windows 内存限制），`persistent_workers=True`（避免每 epoch 重建 worker 造成 GPU 空转） |
-| AMP | **尚未接入**（trainer 里没有 autocast/GradScaler）；batch 8 显存够用，暂不引入 |
-| test 曲线 | 每 **10** 个 epoch 在测试集上算一次四项指标（`--eval_test_every 10`，0 关闭；代码默认 5） |
-| 单次耗时 | 约 50–57 min（120 epoch / batch 8） |
+| 数据 | SPARC / Zhongnan 分开训练、分开测试，不混合；开发集固定 SPARC |
+| 输入 | 224×224；基线单通道灰度 repeat 3 通道；变体按需加通道（边缘图 / 方向子带） |
+| 训练 | `--batch_size 4 --grad_accum 2`（等效 bs8）；`--max_epochs 200`（poly 衰减总长绑死，禁止中途停）；`--eval_test_every 5` |
+| 优化 | SGD，lr 0.01，momentum 0.9，wd 1e-4；loss = 0.5·CE + 0.5·Dice |
+| 预训练 | R50+ViT-B_16（ImageNet21k） |
+| 读数 | **终点 ep200**：`test_curve.csv` 末行，或 `epoch_199.pth`（权重名 0 基）重推理 |
+| 指标 | **Dice / ASSD / HD / DeltaArea**；ASSD、HD 单位 mm，DeltaArea mm²。距离指标**只用 HD（最大表面距离）**，不用 95 分位版本 |
+| 判定 | 主看 ASSD / HD；两项方向一致才认边界改善 |
+| 统计 | **一次只报整个测试集的一个数**：SPARC 测试集全部 160 张切片直接平均；**不做病例聚合、不做 Wilcoxon/显著性检验** |
+| 门槛 | **\|ΔDice\| ≥ 0.5% 或 HD 降 ≥ 0.1 mm**；seed 噪声带 ±0.3% |
+| 报告 | 每个变体同时给 Params / FLOPs / 单张时延 |
 
-### epoch 选择策略（用户指定）
+## 1. 已完成实验
 
-1. 先用一轮 120 epoch 的训练，每 10 epoch 记录一次测试集指标，写入 `test_curve.csv`；
-2. 从曲线上挑一个**整数 epoch**（Dice 高、HD95/ASSD 不过差的区间中点，避免贴住偶然峰值）；
-3. 之后所有消融实验统一固定该 epoch 训练，不再在测试集上早停或调 epoch：原图通道+高频能量通道双通道早融合（E1）、共享权重双输入 + 跨支门控单点（E2）、其 concat 回投影对照（E3）、三级全开（E4）、Zhongnan 跨子集复现（E5），两个子集均同。
+### 1.1 基线（A0，ep200）
 
-### epoch 选择（**2026-10-30 终口径：终点 epoch = 200**，全部后续实验复用；作废 2026-10-26 的 ep150 口径）
+| seed | Dice | ASSD | HD |
+|---|---|---|---|
+| 1234 | 90.32 | 0.146 | 0.64 |
+| 2024 | 90.23 | 0.149 | 0.66 |
+| 3407 | 90.40 | 0.144 | 0.61 |
+| **均值** | **90.32** | 0.146 | 0.64 |
 
-用户决定统一读**训练终点 epoch 200**，不再取中途点，杜绝「训到哪停到哪」的额外自由度：
+单骨干 TransUNet：R50 局部 + ViT 全局串联，解码器拼 R50 skip。
 
-- 读数方式：`test_curve.csv` 最后一行（ep200 行），或用存档 `epoch_199.pth`（权重文件名 0 基）+ `scripts/eval_carotid.py` 重算，产 `metrics_ep199.csv`。ep149 重算值曾与在线评估 ep150 行逐位互验吻合，两种读数同源。
-- 训练一律 `--max_epochs 200` 跑完（poly 衰减总长绑死 max_epochs，任何提前停训都会改变调度，故不允许中途手动停）。
-- 历史依据（ep150 口径的分析，仅存档）：曲线 150 epoch 即饱和，150~200 区间在噪声内波动；据此当时选 150。现统一为 200 读数，所有对比仍在同一调度下，公平性不受影响。
-- 批量重算 + 病例级 Wilcoxon 脚本：[scripts/eval_batch_ep199.ps1](../scripts/eval_batch_ep199.ps1)。
+### 1.2 预处理与早期融合（2026-10-23，已关闭）
 
+A1 三通道早融合 / A2 伪小波支路 / A3 14×14 小波引导注意力。三者 Dice、ASSD 与 A0 的差异全部落在 seed 噪声带内；唯一方向明确的是 A0→A1 的 DeltaArea（预测面积更小，负向）。**结论：单路特征 + 一次重加权无效，该线停止。**
 
-## 4. 运行命令
+### 1.3 双骨干与融合算子（2026-10-24 ~ 10-28）
+
+结构：主路 = A0 吃原图；侧路 = 独立 R50 吃 LH/HL/HH 三方向子带；112²/56²/28²/14² 四点双向跨支注意力，零初始化 γ 残差；解码器只接主路。
+
+| 配置 | Dice | ASSD | HD | 判定 |
+|---|---|---|---|---|
+| dual auto s1234 / s2024 / s3407 | 90.46 / 90.37 / 90.12 | 0.146 / 0.146 / 0.153 | 0.65 / 0.67 / 0.70 | 3-seed 均值 90.32 = A0；s3407 掉到噪声带之外 → **判负** |
+| dual gate | 90.24 | 0.146 | 0.67 | 未过门槛 |
+| dual aff | 90.35 | 0.144 | 0.64 | 未过门槛 |
+| dual deform | 90.60 | 0.142 | 0.61 | 方向为正但未过门槛，不作结论 |
+| edge（主路 + 边缘图第 4 通道） | 90.32 | 0.146 | 0.61 | 零增益 |
+| edgedual | **90.74** | 0.140 | 0.63 | 单 seed 方向证据，未过门槛 |
+| edgedeform | 90.60 | 0.141 | 0.61 | 单 seed 方向证据 |
+| mainLL（主路吃 LL 低频图） | 90.39 | 0.148 | 0.65 | 无增益 |
+
+**结论：融合算子（gate / aff / deform / frc）均未过 §0 门槛；dual 3-seed 均值与 A0 持平、单 seed 掉出噪声带 → 双骨干线停止追加投入。**
+
+### 1.4 DDBE / ACAM（BDFR-Net）
+
+| 配置 | Dice | ASSD | HD | 判定 |
+|---|---|---|---|---|
+| ddbe3（单级门槛） | 90.13 | 0.151 | 0.72 | 未过门槛，反而变差（HD 升 0.08） |
+| ddbe4（解码器四级全挂） | 90.31 | 0.144 | 0.64 | 无增益 |
+| ddbefull（四级 DDBE + ACAM） | 90.65 | 0.142 | 0.61 | 单 seed 方向证据，不作结论 |
+
+### 1.5 文献复现三网络（seed1234，from scratch，ep200）
+
+| 网络 | 参数量 | Dice | ASSD | HD |
+|---|---|---|---|---|
+| U-Net | 60.3 M | 86.55 | 0.225 | 1.14 |
+| XNet | 326.2 M | 87.06 | 0.212 | 1.11 |
+| GobletNet | 133.3 M | 86.28 | 0.229 | 1.22 |
+
+三者都比 A0 低约 3.5~4 点（骨干家族差异），**只在复现线内部互比**。GobletNet 垫底：其设计假设（无散斑、边界=锐利高频）不匹配颈动脉超声，高频支补进来的是斑点噪声，参数 2 倍仍倒退。
+
+### 1.6 拆支归因 + 边缘算子横扫 + FrCFusion（2026-10-31 完成）
+
+口径同 §0；8 个 job 串行，00:06→10:05，全部 exit 0（约 10 h）。队列脚本 [queue_c2d_split.ps1](../scripts/queue_c2d_split.ps1)。F1 / S1 两行于 2026-11-01 16:12→18:24 补跑（[queue_c2d_syn_fds.ps1](../scripts/queue_c2d_syn_fds.ps1)）。
+
+| 编号 | 名称 | 配置 | Dice | HD mm | 对照 ΔDice |
+|---|---|---|---|---|---|
+| A | `cnn_only` | `--vit_layers 0`（R50 保留，ViT 清零） | 90.49 | 0.71 | A0 90.32：+0.17 |
+| B | `vit_only` | `--vit_name ViT-B_16 --n_skip 0` | 89.19 | 0.78 | A0：**−1.13** |
+| D | `dual_frc` | `--arch dual --fuse_op frc`（四级） | 90.40 | 0.67 | dual auto（s1234）90.46：−0.06 |
+| F1 | `dual_frc_fds` | `--arch dual --fuse_op frc --fds 1`：四级 frc 不变，14²/28²/56² 加深监督（0.2/0.3/0.5），主损失仍 0.5CE+0.5Dice | 90.80 | 0.60 | D 90.40：+0.40；A0 90.32：+0.48 |
+| S1 | `syn_split_fds` | `--arch split --fuse_op frc_s --fds 1 --loss bce_wiou`：R50 局部支 + ViT-B/16 全局支，两支均吃原图；FrCFusion 严格版；FDS；损失 mean(BCE+wIoU) | 88.40 | 0.84 | split_frc 88.34：+0.06；A0 90.32：−1.92 |
+
+**判定**：
+
+1. **A ≈ A0（+0.17，在 ±0.3 噪声带内）→ ViT 全局段在本任务零贡献**，A0 的分数几乎全部来自 R50 局部支。Syn-Net / frc / 双骨干线全部停止投入。
+2. **B 明显更差（−1.13%）**：全局支能单独跑，但 `n_skip=0` 的解码器缺 skip，边界锐度明显下降。
+3. **D frc 与 auto 等价（−0.06）**：FrCFusion 的 DCT 频率通道注意力 + 空间支没有超过窗内注意力，多花 2.43 M 参数无收益。问题在「换信息源」这条路，不在融合算子形式。
+4. **F1（FDS 深监督）是这条线上唯一正向的一块**：D→F1 为 +0.40（Dice 90.40→90.80），HD 0.67→0.60（−0.07 mm）、ASSD 0.147→0.139（−8%）、|ΔArea| 2.15→2.06。方向一致但幅度仍在 ±0.3 噪声带附近，且 F1 相对 A0 也只有 +0.48，**不足以支撑把 FDS 迁到主方法**。
+5. **S1 与 split_frc 持平（+0.06）**：FDS + BCE+wIoU 在「R50 局部支 + ViT 全局支、单点 14² 融合」的骨架上完全不生效（88.34→88.40），HD 0.84 也与 split 线同量级。说明该论文的两块改动只对它有 DCT 频率支的融合结构有效，换回本项目骨干后收益消失。
+
+F1 / S1 是把该论文剩下的两块（FDS 深监督、BCE+weighted IoU）补到 D 行上，看换成本项目骨干与颈动脉数据后是否真涨点。结构边界先写死、防止回填时外推：全局支是单尺度 ViT-B/16（14²/196 token），FrCFusion 只能落 14²，「三级融合」退化为 FDS 的三级监督；DCT 频点沿用 FcaNet top-16，weighted IoU 权重取 `w = 1 + 5·|gt − mean(gt)|`；两支均吃原图，112²/56²/28² 不存在局部-全局互补；主输出另加权重 1.0；保留 ImageNet21k 预训练（论文为 from scratch）。
+
+#### C 组：U-Net 边缘算子横扫
+
+U-Net 无边缘基线 86.55%。网络结构、参数量（60.298 M）、超参完全一致，只换输入第 2 通道的算子。
+
+| 算子 | 定义 | Dice | HD mm | ASSD mm | ΔArea mm²（均值±标准差） | ΔDice | 判定 |
+|---|---|---|---|---|---|---|---|
+| 无边缘（基线） | 单通道原图 | 86.55 | 1.14 | 0.225 | +0.7±7.1 | — | 参照 |
+| `wavelet` | 对数域 1 级 Haar，LL 置零后 IDWT（λ=0） | 87.42 | 1.16 | 0.205 | −0.7±4.0 | +0.87 | 过 Dice 门槛，HD 升 0.02，边界未改善 |
+| `wavelet_lam` | 同上，掺回 λ·LL（λ=0.3） | 86.78 | **1.09** | 0.214 | +0.6±5.6 | +0.23 | 落在噪声带内 |
+| `energy` | 细节能量 √(LH²+HL²+HH²)，半分辨率插值 | 85.62 | 1.26 | 0.240 | −0.3±5.4 | −0.93 | 唯一负增益，弃用 |
+| `sobel` | Sobel 梯度幅值 | 87.52 | **1.06** | 0.199 | −0.4±4.9 | +0.97 | 过 Dice 门槛，HD 降 0.08，方向一致 |
+| `laplacian` | 4 邻域 Laplacian 幅值 | **87.90** | 1.25 | **0.195** | −0.0±3.8 | **+1.35** | Dice 最好但 HD 升 0.11，边界变差 |
+
+**结论**：
+
+- 算子确实有影响：Dice 跨度 2.28%，是 seed 噪声带（0.6% 全幅）的 3.8 倍。
+- **梯度类（laplacian / sobel）全面优于小波类**：保留方向与原分辨率相位；`energy` 丢方向 + 半分辨率上采样，唯一负增益，弃用。
+- `λ·LL` 回灌在 from-scratch U-Net 上无效（+0.23%）。
+- **所有算子都补不上架构差距**：最好 87.90 仍比 A0 低 2.42 点，比 U-Net 基线只涨 1.35%。边缘图是有用的输入自由度，但补不上骨干家族差距。
+- 后续若在主方法上换梯度算子，需补 A0+edge(laplacian) 对照；本次**未做**，留作待补项。
+
+#### 代码改动（冒烟全过）
+
+| 文件 | 改动 |
+|---|---|
+| [networks/wavelet.py](../networks/wavelet.py) | `EDGE_OPS` 注册表、`_sobel_mag` / `_laplacian_mag` / `_detail_energy`、统一入口 `build_edge_map`；`build_hf_image` 加 `lf_weight` |
+| [networks/unet.py](../networks/unet.py) | `UNet` 加 `edge_in / edge_op`：stem 1→2 通道，forward 内拼边缘图 |
+| [networks/dual_encoder_model.py](../networks/dual_encoder_model.py) | 新增 `BidirFrC`（FrCFusion 移植）、`make_fusion` 的 `frc` 分支；`_MSCAM.glb` 去 GroupNorm（修 eval batch=1 崩溃） |
+| [networks/ddbe.py](../networks/ddbe.py) | BDFR-Net 式 DDBE（HF / LF / CTX 三支 + 零初始化 + CBAM 残差） |
+| [networks/hf_branch.py](../networks/hf_branch.py) | GobletNet 式 HFBranch + FAM（已实现，未入队） |
+| [networks/vit_seg_modeling.py](../networks/vit_seg_modeling.py) | `DecoderCup` 加 ddbe 挂载点；`VisionTransformer` 加 `ddbe_level / hf_branch / hf_lambda` |
+| [train.py](../train.py) | 加 `--vit_layers`、`--edge_op`、`--fuse_op frc`、`--ddbe`、`--hf_branch / --hf_lambda`；快照名追加对应后缀 |
+| [scripts/eval_carotid.py](../scripts/eval_carotid.py) | 同步上述参数；输出 HD |
+
+### 1.7 2026-11-01 队列：解码器整体替换 + 领域适配损失（完成）
+
+**本轮设计依据（两条独立结论，别混为一谈）**：
+
+1. **噪声与伪影确实存在**——散斑（乘性、空间相关，实测残差 lag-1 自相关 0.78）、混响、搏动/探头运动伪影、设备与操作者域差异。不能再假设图像干净。
+2. **边界不锐利**——前景/背景 CNR 中位数 0.95、GT 边界带梯度仅全图平均 1.90 倍、5×5 残差高频能量只占方差 0.3%。所以「边界 = 锐利高频」的频域先验在本数据上不成立。
+
+痛点来源、证据级别（已读 / 仅摘要）与逐项实测数字见 [literature.md](literature.md)「二维颈动脉超声的成像痛点」；硬约束见 [CLAUDE.md](../CLAUDE.md) 第 3 节第 12 条。本轮由此得出：**设计只能依赖 GT 几何与低对比度下的形状/面积先验**，不依赖任何「边缘/高频显著」的图像假设。
+
+**GT 几何实测（决定损失设计，先测后设计）**：SPARC 训练集前 30 张，前景面积中位数 4540 px，等效半宽 2A/P 中位数 **18.2 px**（11.3~33.2），**全部 > 10 px → 实心厚块**，不是细管状结构。
+
+据此**否决 clDice**：官方软骨架（方向腐蚀 + 开运算差）在实心区域上恒为空集，实测 `skel_gt.sum = 0`，损失恒等于 1、梯度≈0（已冒烟验证）。这正是「套用文献先验」的典型失败，与 CLAUDE.md 第 3 节第 12 条一致。
+
+**采用 `--domain_loss 1`（只依赖 GT 与预测自身的几何，不假设任何图像层面的边界/噪声特性）**：
+
+| 项 | 权重 | 作用 | 冒烟表现（厚块 GT） |
+|---|---|---|---|
+| 边界带加权 CE（GT 膨胀−腐蚀带 ±2 px，λ=3） | 0.5 | 误差集中在 GT 边界，抬升该带损失 | 完美预测 0；全背景 4.44 |
+| Dice | 0.5 | 区域重合（原有用） | 完美 0 |
+| 面积一致性 \|Σp−Σgt\|/Σgt | 0.05 | 直接压 DeltaArea | 半面积 0.50，等面积平移 0 |
+| 远处假阳性（GT 膨胀 10 px 之外的预测前沿质量占比） | 0.1 | 压 HD 尾部：漂浮小岛/断裂 | 等面积平移 40 px → 0.375，完美 0 |
+
+**队列**（[queue_c2d_domain_loss.ps1](../scripts/queue_c2d_domain_loss.ps1)，等前面两个队列与所有 `train.py` 退出后接力；约 2.7 h/job）：
+
+| 编号 | 配置 | 对照 |
+|---|---|---|
+| U1 | `--arch unet --ddbe 4` | U-Net 86.55 |
+| U2 | `--arch unet --ddbe 4 --acam 1` | U1；A0 上 BDFR 完整版 90.65 |
+| W1 | `--arch wmren`（**已作废**：旧版缺 MLKM、WRDM 右支仅单层 3×3 s2、REM 只两级带 CBAM） | U-Net 86.55 |
+| W2 | `--arch wmren` 完整版（4×WRMM = WRDM 双支 + MLKM，3×REM = CBAM+CREM+SAFM，58.1 M） | W1；U-Net 86.55 |
+| D1 | `--arch baseline --domain_loss 1` | A0 90.32 / HD 0.64 |
+| D2 | `--arch unet --domain_loss 1` | U-Net 86.55 |
+| V1 | `--arch unet --asr 1`（WeaveSeg ICCV 2025 ASR 替换 28²/56²/112² 的 up_conv，57.4 M） | U-Net 86.55 |
+
+**结果（2026-11-01 全部 exit 0；下表为 `test_curve.csv` ep200 训练内读数，整测试集切片直接平均）**：
+
+| 编号 | 配置 | Dice% | ASSD mm | HD mm | \|ΔArea\| mm² | 对照 ΔDice |
+|---|---|---|---|---|---|---|
+| — | A0 基线 | 90.32 | 0.146 | 0.64 | 2.11 | — |
+| D1 | A0 + 领域损失 | **90.73** | **0.141** | 0.65 | 2.16 | +0.41 |
+| — | U-Net 基线 | 86.55 | 0.225 | 1.14 | 3.36 | — |
+| D2 | U-Net + 领域损失 | **87.01** | **0.202** | **0.99** | 3.02 | +0.46 |
+| U1 | U-Net + 四级 DDBE | 86.34 | 0.217 | 1.09 | 3.34 | −0.21 |
+| U2 | U1 + ACAM（= BDFR 完整版） | 86.20 | 0.224 | 1.08 | 3.50 | −0.35 |
+| W1 | WMREN 骨架整体替换（**不完整版，作废**：缺 MLKM、右支无残差块、REM 非完整三件套） | 86.77 | 0.220 | 1.07 | 3.34 | +0.22 |
+| W2 | WMREN 完整版（4×WRMM + 3×REM，58.1 M） | **87.14** | **0.201** | **0.93** | **2.90** | W1：+0.37；U-Net：+0.59 |
+| X1 | U-Net + 完整 BDFR + 领域损失 | 86.81 | 0.216 | 1.10 | 3.22 | U2：+0.61；D2：−0.20 |
+| X2 | A0 + 完整 BDFR + 领域损失 | 90.67 | 0.142 | 0.64 | 2.06 | ddbefull：+0.02；D1：−0.06 |
+| V1 | U-Net + ASR 上采样替换（WeaveSeg ICCV 2025） | 81.30 | 0.335 | 1.63 | 5.16 | U-Net：**−5.25** |
+
+判定：
+
+1. **WMREN 完整版是本轮唯一同时过 §0 两项门槛的结构替换**：W2 87.14 比 U-Net 86.55 高 +0.59（≥0.5%），HD 1.14→0.93（−0.21 mm），ASSD 0.225→0.201、\|ΔArea\| 3.36→2.90 同向；相对自身的不完整版 W1 为 +0.37 / HD 1.07→0.93。补齐 MLKM、WRDM 双支与三级 REM 确实带来了差距。**仅 seed 1234 单次，需复跑 seed 2024 才能定论**；且它仍在纯卷积骨干家族内，与 A0 的 90.32 差 3.2 点，不能跨族比较。
+2. **BDFR 完整版（DDBE×4 + ACAM）在纯卷积 U-Net 上不复制它在 A0 的 +0.33**：U1 −0.21、U2 −0.35，X1（再叠领域损失）相对 D2 仍为 −0.20；HD 依次 1.09 / 1.08 / 1.10，全部差于 D2 的 0.99。ACAM 归因 U2 − U1 = −0.14，本任务上是负贡献。
+3. **领域适配损失是唯一两骨座同向为正的改动**：D1 +0.41、D2 +0.46，D2 的 ASSD 降 10%、HD 由 1.14 降到 0.99（−0.15 mm）。但均未达 §0 门槛（\|ΔDice\| ≥ 0.5% 或 HD 降 ≥ 0.1 mm）。
+4. **结构改造与损失改造不叠加**：X2 90.67 vs ddbefull 90.65（+0.02）、vs D1 90.73（−0.06），A0 上两块互不增强；X1 的 +0.61 相对 U2 基本由领域损失单独贡献（D2 单独 +0.46），结构项净贡献落在噪声带内。
+5. **ASR（V1 81.30，−5.25）判为实现不等价，暂不作论文结论**：曲线平滑收敛到 81.3 而非发散，排除训练不稳定，指向结构语义偏差——当前实现有三处已知降低自由度（每像素 K² 权重组内共享、核在 H×W 预测后再 PixelShuffle、偏移 clamp ±4），且参数量比 U-Net 少 2.93 M（57.4 M）。要判定 ASR 本身有效与否，必须按官方代码重核后再跑一次。
+
+**接力（2026-11-01 12:20 起，seed 1234，已跑完、结果见上表 X1/X2 行）**：完整 BDFR + 领域损失的两组组合实验，检验“结构改造”与“损失改造”能否叠加：
+
+| 编号 | 配置 | 快照后缀 | 对照 |
+|---|---|---|---|
+| X1 | `--arch unet --ddbe 4 --acam 1 --domain_loss 1` | `_ddbe4_acam_dl_unet_c2d` | U2 86.20；D2 87.01 |
+| X2 | `--arch baseline --ddbe 4 --acam 1 --domain_loss 1` | `_ddbe4_acam_dl_c2d` | A0 上 ddbefull 90.65；D1 90.73 |
+
+## 2. 待办 / 未排期
+
+| 项 | 状态 |
+|---|---|
+| GobletNet 式 HFBranch + FAM 移植（批次 2） | 代码已实现、冒烟通过，**未入队** |
+| WMREN WRDM 双分支 DWT（批次 4） | 已实现（`networks/unet_wmren.py`，4×WRMM + 3×REM），W2 已跑；**待复跑 seed 2024 确认 +0.59** |
+| WeaveSeg ASR 实现重核（V1 81.30 判为实现不等价） | **v2 已重写并排队**（逐通道自适应核 C·K²、1×1→PixelShuffle 拆开、偏移改 tanh 软约束；CPU + 整网冒烟通过，60.10 M）；`scripts/queue_c2d_asr2.ps1` 等第二轮 sweep 退出后接力跑 `_asr2_unet_c2d` |
+| A0 + edge(laplacian/sobel) 对照 | **已入队**（[queue_c2d_edge_union.ps1](../scripts/queue_c2d_edge_union.ps1) E1/E2）：`ViT_seg` 已透传 `--edge_op`（`build_edge_map` 统一入口，wavelet 路径与旧 `build_hf_image` 逐位一致，A0 复现不受影响；CPU 整网前向通过）。依据：A0+edge(wavelet)=90.32 零增益，但梯度算子只在 U-Net 上测过（sobel 87.52 / laplacian 87.90 vs wavelet 87.42） |
+| 多中心联合训练（SPARC 350 + Zhongnan 448 = 798） | **已入队**（同队列 E3）：`lists/lists_Carotid2D_union`（train 798 行、test 仍为 SPARC test 160，ep200 可与 A0 90.32 直接比）；快照 `_mcUnion_c2d`。预期 +0.5~1.5（训练集翻倍），训完用 `eval_cross_center.py` 补 Zhongnan test |
+| Zhongnan 跨子集复现（dual / edge 线） | 未跑；换信息源线已判负，优先级最低 |
+| split 架构 + frc（`split_frc_frcstrict`，2026-10-31 11:39 跑完） | 结果 88.34%，低于 A0 约 2.2 点；HD 未重算；**尚未收口入档** |
+| 损失基线对比（A0 骨干 × Focal / Tversky / Boundary / wIoU） | 代码已接（`--loss` 取 focal / tversky / boundary / bce_wiou，CPU 冒烟通过、梯度有限）；[queue_c2d_loss_baselines.ps1](../scripts/queue_c2d_loss_baselines.ps1) Phase 1，4 个 job，排在 ASR2 之后 |
+| 领域损失消融（去边界带 λ=0 / 去面积项 / 去远假阳项） | 同队列 Phase 2，3 个 job；`$dlBestArgs` 待 sweep 结果出来后改这一行 |
+| 领域损失主配置补 seed 2024 / 3407 | 同队列 Phase 3，2 个 job；跨 seed 稳定性（§1.1 噪声带 ±0.3%） |
+| 跨中心零样本评测 | [eval_cross_center.py](../eval_cross_center.py) 已出 5 条，写入 `logs/queue/cross_center_eval.csv`。**跨中心全线不掉点**（A0 90.32→90.75、U-Net +1.90、W2 +2.15），D1 在 Zhongnan 91.18（相对 A0 +0.43）。待补：反向 Zhongnan→SPARC（需先训 Zhongnan 权重）、dual/split 分支 |
+| 双边界平行性先验（平行曲线 / 管壁连续性正则） | **已测，判负**（[stat_priors.py](../scripts/stat_priors.py)，SPARC train 350 张、有效 290）：沿主轴分箱后厚度 CV 中位 **0.333**（IQR 0.272~0.380），两侧边界切向夹角中位 **20.8°**（IQR 16.6~25.1）→ 两条边界不平行，平行曲线正则的前提不成立。附注：相邻箱厚度变化仅 0.039，说明是**沿长轴平滑渐变**而非平行 |
+| 后方声影 / 衰减先验（钙化斑块深侧暗区） | **已测，判负**（有效 202/350）：斑块带/同深度侧方参考带比值，下方中位 1.10、上方 0.89，below−above 中位 +0.50 且 **36% 为负** → 无一致方向性。参考区几何存在组织类型混杂，此项只能作弱结论 |
+| 输入分辨率敏感性（320 vs 224） | 未做，**且不作为论文卖点**（分辨率是超参数）；若补，须所有对比方法同口径 |
+
+## 3. 运行命令
 
 ```powershell
-# 生成病例级划分（每个子集独立，train/test）
+# 病例级划分（每个子集独立 train/test）
 .\venv\Scripts\python.exe datasets\dataset_carotid.py
 
-# 夜间队列（顺序执行，一次只跑一个）
-powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1 -DryRun   # 只打印计划
-powershell -ExecutionPolicy Bypass -File scripts\night_queue.ps1            # 正式执行
+# 训练队列（串行，一次一个 job；先 -DryRun 看计划）
+powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_split.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_split.ps1
 
-# 融合算子横评 + DDBE 门槛 + 基线补跑（第三个接力队列，2026-10-28 00:54 已 WMI 启动 pid 34168，详见 §1.7）
-powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_fuse.ps1 -DryRun   # 只打印 6 条计划
-powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_fuse.ps1            # 正式执行（等主/edge 队列全退出后自动接力）
+# 单条训练（统一口径）
+.\venv\Scripts\python.exe train.py --subset SPARC --seed 1234 `
+  --batch_size 4 --grad_accum 2 --max_epochs 200 --eval_test_every 5
 
-# dev 快筛（**已撤销，仅保留备用**；16 个单变量 job，约 4 h）
-# .\venv\Scripts\python.exe scripts\build_dev_subset.py --subset SPARC --ratio 0.4
-# powershell -ExecutionPolicy Bypass -File scripts\night_queue_dev.ps1 -DryRun
-# powershell -ExecutionPolicy Bypass -File scripts\night_queue_dev.ps1
-# .\venv\Scripts\python.exe scripts\summarize_dev.py      # 汇总排序表
+# 领域适配损失（边界带加权 CE + Dice + 面积一致性 + 远处假阳性；快照名追加 _dl）
+.\venv\Scripts\python.exe train.py --subset SPARC --seed 1234 --arch baseline --domain_loss 1 `
+  --batch_size 4 --grad_accum 2 --max_epochs 200 --eval_test_every 5
 
-# 单通道原图基线（A0）：两个子集分别跑（官方 train.py，120 epoch / batch 8 / SGD / workers 1）
-.\venv\Scripts\python.exe train.py --subset SPARC --max_epochs 120 --batch_size 8 --eval_test_every 10
-.\venv\Scripts\python.exe train.py --subset Zhongnan --max_epochs 120 --batch_size 8 --eval_test_every 10
+# 批量评测（ep200 / epoch_199.pth，整测试集切片直接平均）
+powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep199.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts\eval_batch_ep199.ps1
 ```
 
-## 5. 日志与产物
+## 4. 日志与产物
 
-- 输出目录：`../model/TU_Carotid224/TU_pretrain_R50-ViT-B_16_skip3_epo120_bs8_224_<subset>/`
+- 快照目录：`../model/TU_Carotid224/TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_<变体>_c2d/`
   - `log.txt`：完整训练日志
-  - `epoch_*.pth`：**后半程每 50 个 epoch** + 最后一轮（trainer.py 的 `save_interval = 50`）
-  - `metrics.csv`：测试集逐样本四项指标（trainer 末尾自动执行）
-  - `log/`：tensorboardX 事件
-- 禁止复用单通道原图基线（baseline）的目录名，避免权重互相覆盖。
+  - `test_curve.csv`：每 5 epoch 的测试集指标（末行即 ep200 读数）
+  - `metrics.csv`：逐切片四项指标
+  - `epoch_199.pth`：终点权重（另有每 50 epoch 的中途快照）
+- 队列日志与状态：`logs/queue/<job>_<ts>.log`、`logs/queue/queue_*_status.csv`
+- 禁止复用基线目录名，避免权重覆盖。

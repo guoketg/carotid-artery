@@ -84,7 +84,7 @@ F_DDBE = M_sp( M_ch( Conv1x1( concat(F_hf, F_lf, F_ctx) ) ) )
 |---|---|---|
 | TinyCNN 门槛：raw vs raw+HF | +0.0181（SPARC）/ +0.0183（中南），两轮独立复现 | probe_edge_signal.py |
 | 融合轴：通道 vs 注意力 | raw_hf +0.015；feat_concat +0.005；feat_attn +0.24 但 feat_attn_zero +0.27 → **注意力涨幅不来自 HF** | probe_fusion_axis.py |
-| 双骨干正式模型 | d1234_sparc 已跑完（102 min），**待与基线 seed1234 配对分析** | logs/queue/ |
+| 双骨干正式模型 | d1234_sparc 已跑完（102 min），**待与基线 seed1234 逐步对比** | logs/queue/ |
 | BDFR 消融（论文自己的数据） | 高频支路是单件最大增益 +0.79 Dice | 3612 Submission.pdf Table 2 |
 
 ## 4. 建议的尝试顺序（等你确认后才动代码）

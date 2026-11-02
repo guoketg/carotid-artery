@@ -26,7 +26,7 @@
 |---|---|---|
 | Dice | `2|P∩G| / (|P|+|G|)`，双空记 1 | 无量纲 |
 | ASSD | medpy `assd`，NIfTI 头 spacing | mm |
-| HD95 | medpy `hd95`，同上 | mm |
+| HD | medpy `hd`，最大表面距离，同上 | mm |
 | DeltaArea | `area(P) − area(G)`，正值=预测偏大 | mm² |
 
 - 预测经 `ndi.zoom` 最近邻重采样回原分辨率网格再计算（[metrics_carotid.py](../metrics_carotid.py) `original_grid_pair`）。

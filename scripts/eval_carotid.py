@@ -36,7 +36,12 @@ def build_model(args):
     if args.arch == "unet":
         from networks.unet import UNet
         return UNet(in_channels=1, num_classes=2,
-                    edge_in=bool(args.edge_in), edge_op=args.edge_op)
+                    edge_in=bool(args.edge_in), edge_op=args.edge_op,
+                    ddbe_level=args.ddbe, acam=bool(args.acam),
+                    asr=bool(args.asr))
+    if args.arch == "wmren":
+        from networks.unet_wmren import UNetWMREN
+        return UNetWMREN(in_channels=1, num_classes=2)
     if args.arch == "xnet":
         from networks.xnet import XNet
         return XNet(in_channels=1, num_classes=2)
@@ -52,13 +57,15 @@ def build_model(args):
                                     side_pretrained=bool(args.side_pretrained),
                                     cross_scale=bool(args.cross_scale),
                                     main_input=args.main_input,
-                                    edge_in=bool(args.edge_in))
+                                    edge_in=bool(args.edge_in),
+                                    fds=bool(args.fds))
     if args.arch == "split":
         from networks.split_encoder_model import SplitLocalGlobalTransUNet
         return SplitLocalGlobalTransUNet(config, img_size=args.img_size, num_classes=2,
                                          fuse_op=args.fuse_op, window=args.window,
                                          dk_ratio=args.dk_ratio,
-                                         bidir=bool(args.bidir))
+                                         bidir=bool(args.bidir),
+                                         fds=bool(args.fds))
     if args.fusion != "none":
         from networks.wavelet_model import WaveletTransUNet
         return WaveletTransUNet(config, img_size=args.img_size, num_classes=2,
@@ -90,6 +97,9 @@ def eval_ckpt(args):
     with torch.no_grad():
         for i, batch in enumerate(dl):
             logits = net(batch["image"].cuda())
+            if isinstance(logits, dict):
+                # FDS 网络：只取主输出
+                logits = logits["out"]
             if isinstance(logits, (tuple, list)):
                 # XNet 双输出：评估统一取低频主支（与 trainer._primary_out 同口径）
                 logits = logits[0]
@@ -168,10 +178,10 @@ def main():
     p.add_argument("--fusion", default="none", choices=["none", "se", "cross"])
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--arch", default="baseline",
-                   choices=["baseline", "dual", "split", "unet", "xnet", "gobletnet"])
+                   choices=["baseline", "dual", "split", "unet", "xnet", "gobletnet", "wmren"])
     p.add_argument("--levels", default="1,2,3,4")
     p.add_argument("--fuse_op", default="auto",
-                   choices=["auto", "window", "global", "gate", "concat", "deform", "aff", "frc"])
+                   choices=["auto", "window", "global", "gate", "concat", "deform", "aff", "frc", "frc_s"])
     p.add_argument("--window", type=int, default=8)
     p.add_argument("--dk_ratio", type=int, default=2)
     p.add_argument("--bidir", type=int, default=1)
@@ -180,8 +190,10 @@ def main():
     p.add_argument("--main_input", default="raw", choices=["raw", "ll"])
     p.add_argument("--ddbe", type=int, default=0, help="0~4，与 train.py 同义（仅 baseline）")
     p.add_argument("--acam", type=int, default=0, help="1 = ACAM skip 对齐，与 train.py 同义（仅 baseline）")
+    p.add_argument("--asr", type=int, default=0, help="1 = unet 解码器前三级挂 ASR，与 train.py 同义（仅 unet）")
     p.add_argument("--hf_branch", type=int, default=0, help="1 = GobletNet 式 HF 支 + FAM，与 train.py 同义（仅 baseline）")
     p.add_argument("--hf_lambda", type=float, default=0.3, help="HF 图低频回灌权重 λ，与 train.py 同义")
+    p.add_argument("--fds", type=int, default=0, help="1 = 模型带三级 FDS 辅助头（仅 dual/split）")
     p.add_argument("--vit_name", default="R50-ViT-B_16")
     p.add_argument("--vit_layers", type=int, default=12, help="ViT 层数，与 train.py 同义")
     p.add_argument("--n_skip", type=int, default=3, help="skip 数，与 train.py 同义")

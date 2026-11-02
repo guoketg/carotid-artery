@@ -26,6 +26,8 @@ num_classes 类 logits。作为 XNet/GobletNet 的容量对齐基线：两篇论
 import torch
 import torch.nn as nn
 
+from networks.asr import ASR
+from networks.ddbe import ACAM, DDBE
 from networks.wavelet import build_edge_map
 
 
@@ -66,6 +68,25 @@ class up_conv(nn.Module):
 
     def forward(self, x):
         return self.up(x)
+
+
+class asr_up(nn.Module):
+    """ASR 版上采样（WeaveSeg ICCV 2025）：1×1+BN+ReLU 通道对齐 → ASR(feat, skip)
+
+    输出 (B, ch_out, 2H, 2W)，与 skip 同形状同通道，后续 cat + DBB 不变。
+    """
+
+    def __init__(self, ch_in, ch_out):
+        super(asr_up, self).__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(ch_in, ch_out, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(ch_out, momentum=BN_MOMENTUM),
+            nn.ReLU(inplace=True),
+        )
+        self.asr = ASR(ch_out)
+
+    def forward(self, feat, skip):
+        return self.asr(self.proj(feat), skip)
 
 
 class same_conv(nn.Module):
@@ -166,9 +187,18 @@ class UNet(nn.Module):
     编码 l1(l1_1 stem)→l5 与 GobletNet 语义支完全同构；解码为标准两路
     skip（up + encoder skip → DBB），与 GobletNet 的三路 skip 解码相比只
     少了高频支那份 skip —— 这正是两篇论文声称的增量来源。
+
+    asr=True 时接入 WeaveSeg (ICCV 2025) 的 ASR：把解码器每级的 up_conv
+    换成 1×1 通道对齐 + ASR(F_high, skip)，其后的 cat + DBB 结构原样不动，
+    所以下游参数形状不变、可做单变量对照。默认只在解码器前三级
+    （28²/512、56²/256、112²/128）启用，224²/64 那一级保留原 up_conv：
+    该级 F_low 是 224²×64，自适应核 + 相似度图在这个分辨率上显存代价最高，
+    而 ASR 主要解决的是深层语义特征上采样时的边界细节丢失。
+    asr=False（默认）时不新增任何模块，state_dict 与老 checkpoint 逐键一致。
     """
 
-    def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet"):
+    def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
+                 ddbe_level=0, acam=False, asr=False):
         super(UNet, self).__init__()
         l1c, l2c, l3c, l4c, l5c = 64, 128, 256, 512, 1024
         # edge_in：stem 多吃一张边缘图（与 TransUNet edge_in 同一算子、同一 λ=0 口径）
@@ -196,7 +226,53 @@ class UNet(nn.Module):
         self.d2_2 = up_conv(l2c, l1c)
         self.d1_1 = DoubleBasicBlock(l1c * 2, l1c, make_downsample(l1c * 2, l1c))
         self.d1_2 = nn.Conv2d(l1c, num_classes, kernel_size=1, stride=1, padding=0)
+        # BDFR-Net 式解码器改造（与 baseline 的 --ddbe/--acam 同语义）：
+        # 解码器四级按 28²/512 → 56²/256 → 112²/128 → 224²/64 编号，
+        # ddbe_level=1~3 只挂单级，4 = 四级全挂；acam 对每级 skip 做跨级对齐。
+        dec_chs = (l4c, l3c, l2c, l1c)
+        self.ddbe_modules = None
+        if ddbe_level:
+            if ddbe_level == 4:
+                self.ddbe_modules = nn.ModuleList([DDBE(c) for c in dec_chs])
+            else:
+                modules = [nn.Identity() for _ in dec_chs]
+                modules[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1])
+                self.ddbe_modules = nn.ModuleList(modules)
+        self.acams = nn.ModuleList([ACAM(c, c) for c in dec_chs]) if acam else None
+        # ASR（WeaveSeg ICCV 2025）：把解码器前三级的上采样算子原地替换成
+        # 1×1+BN+ReLU 通道对齐 → ASR(低分辨率特征, 同通道 skip)，模块名不变。
+        self.asr_levels = ()
+        if asr:
+            # (ch_in, ch_out) 与四级 up_conv 一一对应：28²/512 → 56²/256 → 112²/128 → 224²/64
+            dec_pairs = ((l5c, l4c), (l4c, l3c), (l3c, l2c), (l2c, l1c))
+            up_names = ('d5_1', 'd4_2', 'd3_2', 'd2_2')
+            self.asr_levels = (0, 1, 2)
+            for level in self.asr_levels:
+                c_in, c_out = dec_pairs[level]
+                setattr(self, up_names[level], asr_up(c_in, c_out))
         init_kaiming(self)
+        # init_kaiming 会覆盖 DDBE.fuse 的零初始化，这里恢复（保证同 seed 与基线等价起步）
+        if self.ddbe_modules is not None:
+            for module in self.ddbe_modules.modules():
+                if isinstance(module, DDBE):
+                    nn.init.zeros_(module.fuse.weight)
+                    nn.init.zeros_(module.fuse.bias)
+
+    def _up(self, level, feat, skip):
+        """单级上采样：该级挂了 ASR 就用 ASR(feat, skip)，否则用原 up_conv"""
+        ups = (self.d5_1, self.d4_2, self.d3_2, self.d2_2)
+        if level in self.asr_levels:
+            return ups[level](feat, skip)
+        return ups[level](feat)
+
+    def _decode(self, up, skip, fuse, level):
+        """单级解码：ACAM 对齐 skip → concat → DBB →（可选）DDBE。"""
+        if self.acams is not None:
+            skip = self.acams[level](skip, up)
+        out = fuse(torch.cat([up, skip], dim=1))
+        if self.ddbe_modules is not None:
+            out = self.ddbe_modules[level](out)
+        return out
 
     def forward(self, x):
         if x.dim() == 3:
@@ -208,10 +284,10 @@ class UNet(nn.Module):
         x3 = self.l3_1(self.l2_2(x2))        # 56²/256
         x4 = self.l4_1(self.l3_2(x3))        # 28²/512
         x5 = self.l5_1(self.l4_2(x4))        # 14²/1024
-        d4 = self.d4_1(torch.cat([self.d5_1(x5), x4], dim=1))
-        d3 = self.d3_1(torch.cat([self.d4_2(d4), x3], dim=1))
-        d2 = self.d2_1(torch.cat([self.d3_2(d3), x2], dim=1))
-        d1 = self.d1_1(torch.cat([self.d2_2(d2), x1], dim=1))
+        d4 = self._decode(self._up(0, x5, x4), x4, self.d4_1, 0)
+        d3 = self._decode(self._up(1, d4, x3), x3, self.d3_1, 1)
+        d2 = self._decode(self._up(2, d3, x2), x2, self.d2_1, 2)
+        d1 = self._decode(self._up(3, d2, x1), x1, self.d1_1, 3)
         return self.d1_2(d1)
 
     def load_from(self, weights):

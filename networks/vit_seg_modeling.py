@@ -20,7 +20,7 @@ from torch.nn.modules.utils import _pair
 from scipy import ndimage
 from . import vit_seg_configs as configs
 from .vit_seg_modeling_resnet_skip import ResNetV2
-from .wavelet import build_hf_image
+from .wavelet import build_hf_image, build_edge_map
 from .ddbe import DDBE, ACAM
 from .hf_branch import HFBranch, FAM, HF_DET_CHANNELS
 
@@ -363,6 +363,8 @@ class DecoderCup(nn.Module):
         self.ddbe_idx = -1
         self.ddbe_all = None
         self.acams = None
+        # FDS（Syn-Net Eq.13）：非空时 forward 额外返回三级辅助 logits
+        self.fds = None
 
     def forward(self, hidden_states, features=None):
         B, n_patch, hidden = hidden_states.size()  # reshape from (B, n_patch, hidden) to (B, h, w, hidden)
@@ -370,6 +372,9 @@ class DecoderCup(nn.Module):
         x = hidden_states.permute(0, 2, 1)
         x = x.contiguous().view(B, hidden, h, w)
         x = self.conv_more(x)
+        aux = [] if self.fds is not None else None
+        if aux is not None:
+            aux.append(x)          # 14² / 512（conv_more 输出）
         for i, decoder_block in enumerate(self.blocks):
             if features is not None:
                 skip = features[i] if (i < self.config.n_skip) else None
@@ -383,18 +388,42 @@ class DecoderCup(nn.Module):
                 x = self.ddbe(x)
             if self.ddbe_all is not None:
                 x = self.ddbe_all[i](x)
+            if aux is not None and i in (0, 1):
+                aux.append(x)      # 28² / 256（block0 后）、56² / 128（block1 后）
+        if aux is not None:
+            return x, self.fds(aux)
         return x
+
+
+class FDSHeads(nn.Module):
+    """Flux Deep Supervision（Syn-Net Eq.13）的三级辅助头。
+
+    挂在解码器 14²/512、28²/256、56²/128 上，各 1×1 卷积出 logits；
+    返回 [(logits, weight), ...]，权重 0.2 / 0.3 / 0.5（论文由深到浅递增）。
+    辅助 logits 由 trainer 双线性上采样到 GT 分辨率后算损失。
+    """
+
+    def __init__(self, channels=(512, 256, 128), num_classes=2, weights=(0.2, 0.3, 0.5)):
+        super(FDSHeads, self).__init__()
+        self.heads = nn.ModuleList([nn.Conv2d(c, num_classes, 1) for c in channels])
+        self.weights = weights
+
+    def forward(self, feats):
+        return [(head(f), w) for head, f, w in zip(self.heads, feats, self.weights)]
 
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 edge_in=False, ddbe_level=0, acam=False, hf_branch=False, hf_lambda=0.3):
+                 edge_in=False, edge_op="wavelet", ddbe_level=0, acam=False,
+                 hf_branch=False, hf_lambda=0.3):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.classifier = config.classifier
-        # edge_in：stem 吃 4 通道（原图 3 + 小波高频重建图 1），边缘特征融合的输入级版本
+        # edge_in：stem 吃 4 通道（原图 3 + 边缘图 1），边缘特征融合的输入级版本
+        # edge_op：边缘图算子，wavelet（默认，λ=0，与旧行为逐位一致）/ sobel / laplacian 等
         self.edge_in = edge_in
+        self.edge_op = edge_op
         self.transformer = Transformer(config, img_size, vis,
                                        in_channels=4 if edge_in else 3)
         self.decoder = DecoderCup(config)
@@ -447,8 +476,8 @@ class VisionTransformer(nn.Module):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
         if x.size()[1] == 1:
             if self.edge_in:
-                # 第 4 通道：小波高频重建图（LL 置零），与原图同分辨率
-                x = torch.cat([x.repeat(1, 3, 1, 1), build_hf_image(x)], dim=1)
+                # 第 4 通道：边缘图（默认 wavelet 高频重建，LL 置零），与原图同分辨率
+                x = torch.cat([x.repeat(1, 3, 1, 1), build_edge_map(x, self.edge_op)], dim=1)
             else:
                 x = x.repeat(1,3,1,1)
         x, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)

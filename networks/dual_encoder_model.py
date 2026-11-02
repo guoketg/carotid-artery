@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torchvision.ops import deform_conv2d
 import math
 
-from networks.vit_seg_modeling import VisionTransformer
+from networks.vit_seg_modeling import FDSHeads, VisionTransformer
 from networks.vit_seg_modeling_resnet_skip import ResNetV2, np2th
 from networks.wavelet import haar_dwt, build_hf_image
 
@@ -395,6 +395,34 @@ class BidirFrC(nn.Module):
         return A2, B + self.gamma_b * out
 
 
+class BidirFrCStrict(BidirFrC):
+    """Syn-Net FrCFusion 的严格版（S1 专用，`frc_s`）。
+
+    相对 `frc`（旧版移植，D 的 checkpoint 依赖它，行为不得改）的三处收紧：
+    1) 通道权重用单层 `Linear(C,C)`，不再走 C→C/8→C 的瓶颈 MLP；
+    2) 空间支去掉 ReLU（论文 Eq.10 只有 1×1 → 1×1 → sigmoid）；
+    3) 纯残差回写 `A2 = A + Freqout`，不再用零初始化 γ（γ 会让前三 epoch 融合整支不学）。
+    频点表与 7×7 池化仍沿用 FcaNet top-16（论文未给表，见 §1.6 边界）。
+    """
+
+    def __init__(self, dim, bidir=True, n_groups=16):
+        super().__init__(dim, bidir=bidir, n_groups=n_groups)
+        self.fc_a = nn.Linear(dim, dim)
+        self.fc_b = nn.Linear(dim, dim)
+        self.sp = nn.Sequential(nn.Conv2d(dim, dim, 1), nn.Conv2d(dim, 1, 1))
+        del self.gamma_a, self.gamma_b
+
+    def forward(self, A, B):
+        wa = torch.sigmoid(self.fc_a(self._desc(A)))[:, :, None, None]
+        wb = torch.sigmoid(self.fc_b(self._desc(B)))[:, :, None, None]
+        m = torch.sigmoid(self.sp(A * B))
+        out = self.proj(torch.cat([A * wa, B * wb, m], dim=1))
+        A2 = A + out
+        if not self.bidir:
+            return A2, B
+        return A2, B + out
+
+
 def make_fusion(kind, dim, heads, dk_ratio, window, bidir, chain=False):
     if kind == "window":
         return BidirCrossAttention(dim, heads, dk_ratio, window, mode="window",
@@ -412,6 +440,8 @@ def make_fusion(kind, dim, heads, dk_ratio, window, bidir, chain=False):
         return BidirAFF(dim, bidir=bidir)
     if kind == "frc":
         return BidirFrC(dim, bidir=bidir)
+    if kind == "frc_s":
+        return BidirFrCStrict(dim, bidir=bidir)
     raise ValueError(f"unknown fusion kind: {kind}")
 
 
@@ -428,15 +458,21 @@ class DualEncoderTransUNet(VisionTransformer):
     def __init__(self, config, img_size=224, num_classes=2, levels="1,2,3,4",
                  fuse_op="auto", window=8, dk_ratio=2, bidir=True,
                  side_pretrained=True, cross_scale=False, main_input="raw",
-                 edge_in=False):
+                 edge_in=False, fds=False):
         super().__init__(config, img_size, num_classes, edge_in=edge_in)
         self.img_size = img_size
+        self.fds = bool(fds)
         self.levels = [int(v) for v in str(levels).split(",") if str(v).strip()]
         self.fuse_op = fuse_op
         self.bidir = bidir
         self.side_pretrained = side_pretrained
         self.cross_scale = cross_scale
         self.main_input=main_input
+        if self.fds:
+            # 三级深监督：14²/512、28²/256、56²/128
+            self.decoder.fds = FDSHeads(
+                channels=(512, config.decoder_channels[0], config.decoder_channels[1]),
+                num_classes=num_classes)
 
         width = int(64 * config.resnet.width_factor)
         hidden = config.hidden_size
@@ -593,6 +629,9 @@ class DualEncoderTransUNet(VisionTransformer):
 
         encoded, features = self._encode_interleaved(main_in, side_in)
         out = self.decoder(encoded, features)
+        if self.fds:
+            out, aux = out
+            return {'out': self.segmentation_head(out), 'aux': aux}
         return self.segmentation_head(out)
 
     # ------------------------------------------------------------ 权重

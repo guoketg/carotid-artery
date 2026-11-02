@@ -9,6 +9,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
@@ -24,8 +25,10 @@ def _worker_init(worker_id, seed):
 
 
 def _primary_out(outputs):
-    """XNet 返回 (logits_lf, logits_hf) 双输出：评估/可视化统一取低频主支，
-    不在测试集上挑支；单输出网络原样返回。"""
+    """统一取主输出：FDS 网络返回 {'out', 'aux'}；XNet 返回 (logits_lf, logits_hf)
+    双输出，评估/可视化统一取低频主支；单输出网络原样返回。"""
+    if isinstance(outputs, dict):
+        return outputs['out']
     return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
 
@@ -86,6 +89,59 @@ def trainer_synapse(args, model, snapshot_path):
     model.train()
     ce_loss = CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes)
+    use_domain_loss = bool(getattr(args, 'domain_loss', 0))
+    loss_name = getattr(args, 'loss', 'ce_dice')
+    if use_domain_loss:
+        from utils import BoundaryWeightedCELoss, area_consistency_loss, far_fp_loss
+        ce_bw = BoundaryWeightedCELoss(lam=float(getattr(args, 'dl_lambda', 3.0)),
+                                       radius=int(getattr(args, 'dl_radius', 2)))
+        dl_area_w = float(getattr(args, 'dl_area_w', 0.05))
+        dl_far_w = float(getattr(args, 'dl_far_w', 0.1))
+        dl_margin = int(getattr(args, 'dl_margin', 10))
+
+        def seg_loss(out, label):
+            """领域适配：边界带加权 CE + Dice + 面积一致性 + 远处假阳性惩罚。"""
+            l_ce = ce_bw(out, label.long())
+            l_dice = dice_loss(out, label, softmax=True)
+            l_area = area_consistency_loss(out, label)
+            l_fp = far_fp_loss(out, label, margin=dl_margin)
+            return (0.5 * l_ce + 0.5 * l_dice + dl_area_w * l_area
+                    + dl_far_w * l_fp), l_ce
+    elif loss_name == 'bce_wiou':
+        from utils import BCEWIoULoss
+        bce_wiou = BCEWIoULoss()
+
+        def seg_loss(out, label):
+            """Syn-Net 口径：mean(BCE + weighted IoU)，主输出与三级 FDS 共用。"""
+            return bce_wiou(out, label), torch.zeros((), device=label.device)
+    elif loss_name == 'focal':
+        from utils import FocalLoss
+        focal = FocalLoss()
+
+        def seg_loss(out, label):
+            """损失基线：0.5·Focal(γ=2,α=0.25) + 0.5·Dice。"""
+            return (0.5 * focal(out, label) + 0.5 * dice_loss(out, label, softmax=True),
+                    torch.zeros((), device=label.device))
+    elif loss_name == 'tversky':
+        from utils import TverskyLoss
+        tversky = TverskyLoss()
+
+        def seg_loss(out, label):
+            """损失基线：Tversky(α=0.3,β=0.7) 单独使用（自身已含区域重合）。"""
+            return tversky(out, label), torch.zeros((), device=label.device)
+    elif loss_name == 'boundary':
+        from utils import BoundaryLoss
+        boundary = BoundaryLoss()
+
+        def seg_loss(out, label):
+            """损失基线：0.5·CE + 0.5·Dice + 0.5·Boundary（Kervadec 距离图加权）。"""
+            l_ce = ce_loss(out, label[:].long())
+            return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
+                    + 0.5 * boundary(out, label)), l_ce
+    else:
+        def seg_loss(out, label):
+            l_ce = ce_loss(out, label[:].long())
+            return 0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True), l_ce
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
@@ -102,20 +158,31 @@ def trainer_synapse(args, model, snapshot_path):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
             outputs = model(image_batch)
+            aux = None
+            if isinstance(outputs, dict):
+                # FDS：主输出 + 三级辅助 logits（各自上采样到 GT 分辨率后再算损失）
+                aux = outputs.get('aux')
+                outputs = outputs['out']
             if isinstance(outputs, (tuple, list)):
-                # XNet 双输出（低频/高频支）：每支各算 0.5CE+0.5Dice，再对支数取平均
+                # XNet 双输出（低频/高频支）：每支各算一次分割损失，再对支数取平均
                 loss = 0.0
                 loss_ce = 0.0
                 for out in outputs:
-                    ce = ce_loss(out, label_batch[:].long())
-                    loss_ce = loss_ce + ce
-                    loss = loss + 0.5 * ce + 0.5 * dice_loss(out, label_batch, softmax=True)
+                    l, c = seg_loss(out, label_batch)
+                    loss = loss + l
+                    loss_ce = loss_ce + c
                 loss = loss / len(outputs)
                 loss_ce = loss_ce / len(outputs)
             else:
-                loss_ce = ce_loss(outputs, label_batch[:].long())
-                loss_dice = dice_loss(outputs, label_batch, softmax=True)
-                loss = 0.5 * loss_ce + 0.5 * loss_dice
+                loss, loss_ce = seg_loss(outputs, label_batch)
+            if aux:
+                hw = label_batch.shape[-2:]
+                for aux_logits, w_aux in aux:
+                    if aux_logits.shape[-2:] != hw:
+                        aux_logits = F.interpolate(aux_logits, size=hw, mode='bilinear',
+                                                   align_corners=False)
+                    l_aux, _ = seg_loss(aux_logits, label_batch)
+                    loss = loss + w_aux * l_aux
             (loss / grad_accum).backward()
 
             # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次

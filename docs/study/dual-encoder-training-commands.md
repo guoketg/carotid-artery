@@ -89,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File scripts\night_queue_dual2.ps1 -Skip r4_
 | `--fuse_op` | `aff` / `gate` / `auto` / `deform` / `concat` / `window` / `global` | 见第 0 节，死锁档位不要拿来下结论 |
 | `--batch_size 4 --grad_accum 2` | 固定 | 等效 batch 8；直接给 batch 8 会触发 WDDM 换页，单步慢 2.6 倍 |
 | `--max_epochs 120` | 与历史实验一致 | 超过 60 才会每 50 epoch 存一次中间权重 |
-| `--eval_test_every 10` | 建议 10 | 每 10 epoch 在测试集上算 Dice、ASSD、HD95、DeltaArea，写入 `test_curve.csv` |
+| `--eval_test_every 10` | 建议 10 | 每 10 epoch 在测试集上算 Dice、ASSD、HD、DeltaArea，写入 `test_curve.csv` |
 | `--tag` | 每次换一个 | **只在 `--arch dual` 时生效** |
 | `--bidir 0` | 单向对照才给 | 融合只改写主路，侧路原样传出 |
 | `--side_pretrained 0` | 侧路权重消融才给 | 侧路不加载 ImageNet21k R50 |

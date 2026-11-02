@@ -31,7 +31,7 @@
 | `queue_c2d.ps1`（主队列） | 6 | 单骨干基线 seed2024/3407、双骨干跨支 QKV 注意力 seed2024/3407、输入级边缘图（基线+1 通道）、边缘图+双骨干 | `logs/queue/queue_c2d_status.csv` |
 | `queue_c2d_fuse.ps1`（融合算子横评） | 6 | AFF（崩溃 1 次）、gate 门控、deform 可变形大核、DDBE 单级挂载、基线 seed1234/3407 | `logs/queue/queue_c2d_fuse_status.csv` |
 | `queue_c2d_repro.ps1`（批次 0+1） | 4 | DDBE 四级全挂、DDBE×4+ACAM（BDFR 完整版）、AFF 重跑、主路吃 LL 低频图（XNet 便宜变体） | `logs/queue/queue_c2d_repro_status.csv` |
-| `eval_batch_ep199.ps1`（评测） | 16 | 终点 epoch 200 重算 + 病例级 Wilcoxon，16 个全部 exit 0（含补记快照 edgedeform） | `logs/queue/eval_batch_ep199_status.csv` |
+| `eval_batch_ep199.ps1`（评测） | 16 | 终点 epoch 200 重算，16 个全部 exit 0（含补记快照 edgedeform） | `logs/queue/eval_batch_ep199_status.csv` |
 | `queue_repro_nets.ps1`（文献复现） | 3 | 纯卷积 U-Net / XNet / GobletNet（官方划分 SPARC、seed1234、200ep），全部 exit 0 | `logs/queue/queue_repro_nets_status.csv` |
 
 **队列启动方式必须用 WMI**（否则训练会被终端回收，踩过坑）：
@@ -49,8 +49,8 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 **全部结果数字（3-seed 基线/双骨干、单 seed 变体横评、复现三网络）统一见 [results.md](results.md) §1–§4**，此处只留读法：
 
 - A0 三 seed 均值 **90.32%**、dual auto 三 seed 均值 **90.32%**（完全持平）→ 双骨干判负。
-- 单 seed 横评最佳点：edgedual **90.74%** → ddbefull 90.65% → deform / edgedeform 90.60%——均为单 seed 方向证据，无一达到幅度门槛（|ΔDice| ≥ 0.5% 或 HD95 降 ≥ 0.5 mm）。
-- 补记快照 `*_SPARC_edge_dual_L1234_deform_c2d`（边缘图 + 双骨干 deform）已纳入本轮 epoch_199 评测，90.60% / 0.1410 / 0.61 / 0.3769（见 results.md §2）。
+- 单 seed 横评最佳点：edgedual **90.74%** → ddbefull 90.65% → deform / edgedeform 90.60%——均为单 seed 方向证据，无一达到幅度门槛（|ΔDice| ≥ 0.5% 或 HD 降 ≥ 0.1 mm）。
+- 补记快照 `*_SPARC_edge_dual_L1234_deform_c2d`（边缘图 + 双骨干 deform）已纳入本轮 epoch_199 评测，90.60% / 0.1410 / 0.61（见 results.md §2）。
 
 ### 3.2 边缘融合（输入级）：信息增量确认，正式训练未过门槛
 
@@ -71,12 +71,12 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{Comman
 
 论文底座复现线：XNet（ICCV 2023 小波低/高频双分支 + X 形融合，双输出各自监督）、GobletNet（TMI 2024 双编码器 + FAM 逐级融合）、以及与两者同积木同容量的纯卷积 U-Net 基线。三个网络各自独立训练（`--arch unet|xnet|gobletnet`），与 baseline/dual 线互不混用；官方划分 SPARC、seed1234、200 epoch、等效 batch 8、全部 from scratch（无预训练可载——自定义 block 架构与任何公开 checkpoint 不匹配，且两篇论文官方协议即从头训）。
 
-ep200 指标（Dice / ASSD / HD / HD95、参数量、训练耗时）**完整表见 [results.md](results.md) §4**，读法：
+ep200 指标（Dice / ASSD / HD、参数量、训练耗时）**完整表见 [results.md](results.md) §4**，读法：
 
 1. **XNet vs 同底座 U-Net 基线：方向为正**（87.06% vs 86.55%，+0.5%）——低频/高频双分支 + X 形融合在这个数据上没有兑现论文声称的收益，方向证据保留、不作结论。
 2. **GobletNet 更差**（86.28%，比 U-Net 低 0.3%，边界两项也更差），133M 参数但双编码器 + FAM 在小数据上更难训（ep5-10 曲线也落后）。
 3. **纯卷积复现线整体比 TransUNet 基线（90.32%）低约 4 个点**：这是不同骨干家族的容量/归纳偏置差异，**不是**实验结论的直接比较对象——复现线内部（U-Net ↔ XNet ↔ GobletNet）同积木同口径互比才有效。
-4. 口径注意：本线读数（含 2026-10-31 补算的 HD）取 `epoch_199.pth` 重推理，dice/assd/hd95 与 `test_curve.csv` ep200 行一致（终点 epoch 200，与全项目口径一致）；跨线比较只看方向不看小数位。
+4. 口径注意：本线读数（含 2026-10-31 补算的 HD）取 `epoch_199.pth` 重推理，dice/assd/hd 与 `test_curve.csv` ep200 行一致（终点 epoch 200，与全项目口径一致）；跨线比较只看方向不看小数位。
 
 快照目录（权重根 `E:\mkl\code\python_code\model\TU_Carotid224\`）：`..._epo200_bs4_ga2_224_SPARC_unet_c2d`、`..._epo200_bs2_ga4_224_SPARC_xnet_c2d`、`..._epo200_bs4_ga2_224_SPARC_gobletnet_c2d`。队列脚本 [scripts/queue_repro_nets.ps1](../scripts/queue_repro_nets.ps1)，状态 `logs/queue/queue_repro_nets_status.csv`。网络实现：[networks/unet.py](../networks/unet.py)、[networks/xnet.py](../networks/xnet.py)、[networks/gobletnet.py](../networks/gobletnet.py)。
 
@@ -86,7 +86,7 @@ ep200 指标（Dice / ASSD / HD / HD95、参数量、训练耗时）**完整表�
 
 1. **批次 2 已实现未入队**（GobletNet 式：单主干 + 轻 HF 支 + FAM 逐层）：冒烟 5 项全过（恒等起步 max|Δlogits|=0、+1.206M 参数），入队命令 `--hf_branch 1 --hf_lambda 0.3`（快照 `*_SPARC_hfbr3_c2d`），批次 0+1 结论已落，可入队。实现细节见 [experiments.md](experiments.md) §1.9 执行记录②。
 2. **批次 3（Syn-Net）改方案待定**：老师要求先分别做局部支/全局支、再两个骨干一起看是否有真涨点——方案讨论中，`--fuse_op dct` 暂缓实现（见 experiments.md §1.9 批次 3）。批次 4（WMREN WRDM）视结论排期。
-3. 全部结论目前只在 SPARC 单子集成立；尚无变体达到幅度门槛（|ΔDice| ≥ 0.5% 或 HD95 降 ≥ 0.5 mm）——edgedual / ddbefull / deform / edgedeform 四个方向为正的点，择优去 Zhongnan 复现。
+3. 全部结论目前只在 SPARC 单子集成立；尚无变体达到幅度门槛（|ΔDice| ≥ 0.5% 或 HD 降 ≥ 0.1 mm）——edgedual / ddbefull / deform / edgedeform 四个方向为正的点，择优去 Zhongnan 复现。
 4. 病人图像仍在 git 历史里，彻底清除需 `git filter-repo` 重写历史（会改全部 commit hash，**待用户批准**）。
 
 ---

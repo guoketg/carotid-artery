@@ -9,7 +9,6 @@
 |---|---|---|---|
 | 终端直接起后台进程 | 训练跑到 iteration 71 被无痕杀掉 | 终端关闭/超时会回收子进程树 | **必须用 WMI 脱离进程树启动**：`Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='powershell -ExecutionPolicy Bypass -NoProfile -File "...\queue_xxx.ps1"'}` |
 | 队列不自动续跑 | 机器重启/断电后队列停在中途 | 队列脚本无断点续跑逻辑 | 按 `logs/queue/*_status.csv` 手工 `-Skip` 已完成项重启 |
-| watcher `-Only` 单跑 eval 跳过 Wilcoxon | 单独重跑某个变体时没有 p 值 | `$snapOf` 基线查表在 `-Only` 过滤**之后**才构建，查不到基线快照 | 基线查表必须在 `-Only`/`-Skip` 过滤**之前**构建（已修，2026-10-28） |
 
 ## 2. Windows / PowerShell 环境
 
@@ -42,4 +41,3 @@
 |---|---|---|---|
 | 旧划分/像素口径数字混入 | 10-25 前的 90.49% 和现在的数字对不上 | 划分方式和指标单位都变了 | 旧口径结果不进 results.md；以 [results.md](results.md) 为唯一结果来源 |
 | 病人图像进 git 历史 | 工作区已删但 git 历史仍可 checkout | `git rm` 只清当前索引 | 彻底清除需 `git filter-repo` 重写历史（会改全部 commit hash，**待用户批准**后执行） |
-| 病例级 vs 逐切片口径混读 | Wilcoxon 表的 Dice（90.56%）和横评表（90.32%）对不上 | 前者 43 病例先均值再平均，后者 160 切片直接平均 | 两种口径都对，比较时**只在同口径内比**，表头已标注 |

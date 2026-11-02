@@ -36,16 +36,17 @@ parser.add_argument('--use_wavelet', type=int, default=0,
 parser.add_argument('--fusion', type=str, default='none', choices=['none', 'se', 'cross'],
                     help='feature fusion between main and wavelet branch')
 parser.add_argument('--arch', type=str, default='baseline',
-                    choices=['baseline', 'dual', 'split', 'unet', 'xnet', 'gobletnet'],
+                    choices=['baseline', 'dual', 'split', 'unet', 'xnet', 'gobletnet', 'wmren'],
                     help='baseline = TransUNet / dual = 双骨干交错 + 四级双向融合 (D11) / '
                          'split = 局部(R50)与全局(ViT-B/16)彻底分离、14² 单点融合 / '
                          'unet|xnet|gobletnet = 纯卷积复现网络（各自独立训练，与 baseline 互不混用）')
 parser.add_argument('--levels', type=str, default='1,2,3,4',
                     help='dual 融合接点：1=112²/64, 2=56²/256, 3=28²/512, 4=14²/768')
 parser.add_argument('--fuse_op', type=str, default='auto',
-                    choices=['auto', 'window', 'global', 'gate', 'concat', 'deform', 'aff', 'frc'],
+                    choices=['auto', 'window', 'global', 'gate', 'concat', 'deform', 'aff', 'frc', 'frc_s'],
                     help='auto = 112/56 窗内 + 28/14 全局；deform = 可变形大核；aff = MS-CAM；'
-                         'frc = Syn-Net FrCFusion（DCT 频率通道注意力 + 空间支）')
+                         'frc = Syn-Net FrCFusion（DCT 频率通道注意力 + 空间支）；'
+                         'frc_s = 严格版（单层 Linear 通道权重、空间支无 ReLU、纯残差）')
 parser.add_argument('--window', type=int, default=8, help='112² 接点的窗口边长')
 parser.add_argument('--dk_ratio', type=int, default=2, help='注意力 d_k = C / dk_ratio')
 parser.add_argument('--bidir', type=int, default=1, help='1 = 双向融合；0 = 只侧→主（R7 对照）')
@@ -76,7 +77,7 @@ parser.add_argument('--edge_in', type=int, default=0,
                     help='1 = 边缘特征融合·输入级：stem 多吃一张边缘图（baseline 拼到 3 通道后；unet 拼到 1 通道后）')
 parser.add_argument('--edge_op', type=str, default='wavelet',
                     choices=['wavelet', 'wavelet_lam', 'energy', 'sobel', 'laplacian'],
-                    help='输入级边缘图算子（仅 --arch unet --edge_in 1 可换；baseline 固定 wavelet λ=0）：'
+                    help='输入级边缘图算子（--arch unet/baseline 且 --edge_in 1 时可换）：'
                          'wavelet = Haar 高频 IDWT 重建 / wavelet_lam = 再加 λ·LL 回灌 / '
                          'energy = 细节能量图 / sobel / laplacian')
 parser.add_argument('--ddbe', type=int, default=0,
@@ -84,32 +85,61 @@ parser.add_argument('--ddbe', type=int, default=0,
                          '4 = 四级全挂 DDBE×4（BDFR-Net 完整版）；0 = 关（仅 baseline）')
 parser.add_argument('--acam', type=int, default=0,
                     help='1 = 每个 decoder 级对 skip 特征做 ACAM 跨级语义对齐（ddbefull = --ddbe 4 --acam 1；仅 baseline）')
+parser.add_argument('--asr', type=int, default=0,
+                    help='1 = unet 解码器前三级（28²/56²/112²）把 up_conv 换成 WeaveSeg ICCV 2025 的 '
+                         'ASR 自适应光谱细节精炼（cat + DBB 结构不变）')
 parser.add_argument('--hf_branch', type=int, default=0,
                     help='1 = GobletNet 式：轻量 HF 支 + FAM 与 skip 逐级互标定（仅 baseline）')
 parser.add_argument('--hf_lambda', type=float, default=0.3,
                     help='HF 图低频回灌权重 λ（GobletNet Eq.5：H=HL+LH+HH+λ·LL，论文最优 0~0.3）')
+parser.add_argument('--domain_loss', type=int, default=0,
+                    help='1 = 颈动脉超声领域适配损失：边界带加权 CE + clDice + 面积一致性 '
+                         '（替代原 0.5CE+0.5Dice：0.5*ce_bw + 0.5*dice + 0.3*(1-clDice) + 0.05*area）')
+parser.add_argument('--dl_lambda', type=float, default=3.0,
+                    help='领域损失：边界带加权系数 λ（权重 1+λ·band），扫参用')
+parser.add_argument('--dl_radius', type=int, default=2,
+                    help='领域损失：边界带宽 ±radius 像素')
+parser.add_argument('--dl_area_w', type=float, default=0.05,
+                    help='领域损失：面积一致性项权重（压 DeltaArea）')
+parser.add_argument('--dl_far_w', type=float, default=0.1,
+                    help='领域损失：远处假阳性项权重（压 HD 尾部）')
+parser.add_argument('--dl_margin', type=int, default=10,
+                    help='领域损失：远处假阳性的 GT 膨胀 margin（像素）')
+parser.add_argument('--fds', type=int, default=0,
+                    help='1 = Syn-Net Flux Deep Supervision：解码器 14²/28²/56² 三级辅助监督 '
+                         '(0.2/0.3/0.5)，辅助 logits 上采样到 GT 分辨率算损失；仅 dual/split')
+parser.add_argument('--loss', type=str, default='ce_dice',
+                    choices=['ce_dice', 'bce_wiou', 'focal', 'tversky', 'boundary'],
+                    help='ce_dice = 0.5CE+0.5Dice（§0 口径）；bce_wiou = Syn-Net 的 mean(BCE+wIoU)；'
+                         'focal = 0.5Focal+0.5Dice；tversky = Tversky(0.3/0.7)；'
+                         'boundary = 0.5CE+0.5Dice+0.5Boundary（损失基线，均为 §0 其余口径不变）')
 args = parser.parse_args()
 
-if args.ddbe and args.arch != 'baseline':
-    parser.error('--ddbe 只接了 baseline 解码器（dual 的融合在编码器接点，未接 DDBE）')
+if args.ddbe and args.arch not in ('baseline', 'unet'):
+    parser.error('--ddbe 只接了 baseline/unet 解码器（dual 的融合在编码器接点，未接 DDBE）')
 if not 0 <= args.ddbe <= 4:
     parser.error('--ddbe 取值 0~4')
-if args.acam and args.arch != 'baseline':
-    parser.error('--acam 只接了 baseline 解码器（与 --ddbe 同挂载面）')
+if args.acam and args.arch not in ('baseline', 'unet'):
+    parser.error('--acam 只接了 baseline/unet 解码器（与 --ddbe 同挂载面）')
+if args.asr and args.arch != 'unet':
+    parser.error('--asr 只接了 unet 解码器（替换 up_conv，baseline/dual/split/xnet/gobletnet 未接）')
 if args.hf_branch and args.arch != 'baseline':
     parser.error('--hf_branch 只接了 baseline 解码器（FAM 挂在 skip 上，dual 未接）')
 if not 0 <= args.hf_lambda <= 1:
     parser.error('--hf_lambda 取值 0~1（GobletNet 论文最优区间 0~0.3）')
 if not 0 <= args.vit_layers <= 12:
     parser.error('--vit_layers 取值 0~12（预训练只含 12 层权重，0 = 去掉全局 Transformer 段）')
-if args.edge_op != 'wavelet' and not (args.arch == 'unet' and args.edge_in):
-    parser.error('--edge_op 只在 --arch unet --edge_in 1 时生效（baseline 的 edge_in 固定 wavelet λ=0 口径）')
-if args.arch in ('unet', 'xnet', 'gobletnet'):
-    # 三个独立复现网络在 forward 内自算小波输入，数据集必须给 1 通道原图
+if args.edge_op != 'wavelet' and not (args.arch in ('unet', 'baseline') and args.edge_in):
+    parser.error('--edge_op 只在 --arch unet/baseline --edge_in 1 时生效')
+if args.fds and args.arch not in ('dual', 'split'):
+    parser.error('--fds 只接了 dual/split 的解码器（baseline/unet 的解码器未挂三级辅助头）')
+if args.loss == 'bce_wiou' and args.arch not in ('baseline', 'dual', 'split'):
+    parser.error('--loss bce_wiou 只接了 baseline/dual/split（unet 等复现网络未接）')
+if args.arch in ('unet', 'xnet', 'gobletnet', 'wmren'):
+    # 独立复现网络在 forward 内自算小波输入，数据集必须给 1 通道原图
     args.use_wavelet = 0
-    if args.ddbe or args.acam or args.hf_branch:
-        parser.error('--ddbe/--acam/--hf_branch 只接了 baseline 解码器，'
-                     'unet/xnet/gobletnet 是独立复现网络')
+    if args.hf_branch:
+        parser.error('--hf_branch 只接了 baseline 解码器（FAM 挂在 skip 上，unet/xnet/gobletnet 未接）')
     if args.edge_in and args.arch != 'unet':
         parser.error('--edge_in 只在 unet 上接了（xnet/gobletnet 自带频率支）')
     if args.fusion != 'none':
@@ -179,6 +209,9 @@ if __name__ == "__main__":
             snapshot_path += '_w3'
         if args.edge_in:
             snapshot_path += '_edge'
+            if args.edge_op != 'wavelet':
+                # 算子非默认（wavelet λ=0）时进目录名，同一 arch 多算子对照不互相覆盖
+                snapshot_path += '_eo' + args.edge_op
         if args.fusion != 'none':
             snapshot_path += '_' + args.fusion
         if args.ddbe:
@@ -186,13 +219,27 @@ if __name__ == "__main__":
             snapshot_path += '_ddbe' + str(args.ddbe)
         if args.acam:
             snapshot_path += '_acam'
+        if args.asr:
+            # v1（分组共享核 8 组）为 _asr；v2 逐通道核 + 软偏移，必须分目录
+            snapshot_path += '_asr2'
         if args.hf_branch:
             # λ 量化到 0.1 粒度进快照名（λ=0.3 → _hfbr3）
             snapshot_path += '_hfbr' + str(int(round(args.hf_lambda * 10)))
-        if args.arch in ('unet', 'xnet', 'gobletnet'):
+        if args.domain_loss:
+            # 损失口径不同必须分目录，否则与 0.5CE+0.5Dice 的权重混在一起
+            snapshot_path += '_dl'
+            # 扫参时非默认超参必须进目录名，否则多次 sweep 互相覆盖
+            dl_tag = 'L%sR%dA%sF%sM%d' % (args.dl_lambda, args.dl_radius,
+                                          args.dl_area_w, args.dl_far_w, args.dl_margin)
+            if dl_tag != 'L3.0R2A0.05F0.1M10':
+                snapshot_path += dl_tag
+        if args.loss != 'ce_dice':
+            # 任何非 §0 损失都必须与 0.5CE+0.5Dice 的权重分目录（避免写进 A0 目录）
+            snapshot_path += '_l' + args.loss.replace('_', '')
+        if args.arch in ('unet', 'xnet', 'gobletnet', 'wmren'):
             snapshot_path += '_' + args.arch
-            if args.arch == 'unet' and args.edge_in:
-                # 边缘算子横扫：五种算子各自独立目录
+            if args.arch == 'unet' and args.edge_in and args.edge_op == 'wavelet':
+                # unet 的边缘算子横扫：默认 wavelet 沿用历史目录名 _eowavelet（非默认算子已在上方加过）
                 snapshot_path += '_eo' + args.edge_op
             if args.arch == 'gobletnet' and abs(args.hf_lambda - 0.3) > 1e-9:
                 # λ 非默认 0.3 时进快照名（λ=0.1 → _lam01），避免同目录混权重
@@ -211,16 +258,23 @@ if __name__ == "__main__":
                 snapshot_path += '_mainLL'
             if not args.side_pretrained:
                 snapshot_path += '_sp0'
+            if args.fds:
+                snapshot_path += '_fds'
             if args.tag:
                 snapshot_path += '_' + args.tag
         if args.arch == 'split':
             # 局部/全局分离 + 14² 单点融合；算子名必须进目录（同一 arch 多算子对照）
             snapshot_path += '_split_' + args.fuse_op
+            if args.fds:
+                snapshot_path += '_fds'
             if args.tag:
                 snapshot_path += '_' + args.tag
         if 'lists_Carotid_dev' in args.list_dir.replace('\\', '/'):
             # 快筛子集的结果绝不能和全量结果混在一起
             snapshot_path += '_dev'
+        if 'lists_Carotid2D_union' in args.list_dir.replace('\\', '/'):
+            # 多中心联合训练（SPARC 350 + Zhongnan 448），必须与单中心 A0 分目录
+            snapshot_path += '_mcUnion'
         if 'lists_Carotid2D' in args.list_dir.replace('\\', '/'):
             snapshot_path+='_c2d'
 
@@ -242,7 +296,8 @@ if __name__ == "__main__":
                                    side_pretrained=bool(args.side_pretrained),
                                    cross_scale=bool(args.cross_scale),
                                    main_input=args.main_input,
-                                   edge_in=bool(args.edge_in)).cuda()
+                                   edge_in=bool(args.edge_in),
+                                   fds=bool(args.fds)).cuda()
     elif args.arch == 'split':
         # 局部 R50 与全局 ViT-B/16 并联，仅 14² 单点融合
         from networks.split_encoder_model import SplitLocalGlobalTransUNet
@@ -250,12 +305,19 @@ if __name__ == "__main__":
                                         num_classes=config_vit.n_classes,
                                         fuse_op=args.fuse_op, window=args.window,
                                         dk_ratio=args.dk_ratio,
-                                        bidir=bool(args.bidir)).cuda()
+                                        bidir=bool(args.bidir),
+                                        fds=bool(args.fds)).cuda()
     elif args.arch == 'unet':
         # 容量对齐基线：与 xnet/gobletnet 同积木的纯卷积 U-Net
         from networks.unet import UNet
         net = UNet(in_channels=1, num_classes=args.num_classes,
-                   edge_in=bool(args.edge_in), edge_op=args.edge_op).cuda()
+                   edge_in=bool(args.edge_in), edge_op=args.edge_op,
+                   ddbe_level=args.ddbe, acam=bool(args.acam),
+                   asr=bool(args.asr)).cuda()
+    elif args.arch == 'wmren':
+        # WMREN 骨架替换：4×WRMM（WRDM + MLKM）编码 + 3×REM 解码（U-Net 底座 60.3M → 58.1M）
+        from networks.unet_wmren import UNetWMREN
+        net = UNetWMREN(in_channels=1, num_classes=args.num_classes).cuda()
     elif args.arch == 'xnet':
         # 小波低/高频双分支 + X 形融合，返回 (out_lf, out_hf) 双输出
         from networks.xnet import XNet
@@ -272,7 +334,8 @@ if __name__ == "__main__":
                                fusion=args.fusion, heads=args.heads).cuda()
     else:
         net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes,
-                      edge_in=bool(args.edge_in), ddbe_level=args.ddbe, acam=bool(args.acam),
+                      edge_in=bool(args.edge_in), edge_op=args.edge_op,
+                      ddbe_level=args.ddbe, acam=bool(args.acam),
                       hf_branch=bool(args.hf_branch), hf_lambda=args.hf_lambda).cuda()
     net.load_from(weights=np.load(config_vit.pretrained_path))
 

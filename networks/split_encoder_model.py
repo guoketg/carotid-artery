@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from networks.dual_encoder_model import make_fusion
 from networks.vit_seg_configs import get_b16_config
-from networks.vit_seg_modeling import DecoderCup, Embeddings, Encoder, SegmentationHead
+from networks.vit_seg_modeling import DecoderCup, Embeddings, Encoder, FDSHeads, SegmentationHead
 from networks.vit_seg_modeling_resnet_skip import ResNetV2, np2th
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,14 @@ class SplitLocalGlobalTransUNet(nn.Module):
     """
 
     def __init__(self, config, img_size=224, num_classes=2, fuse_op='frc',
-                 window=8, dk_ratio=2, bidir=False, vit_pretrained=VIT_B16_NPZ):
+                 window=8, dk_ratio=2, bidir=False, vit_pretrained=VIT_B16_NPZ,
+                 fds=False):
         super().__init__()
         assert img_size == 224, 'split 依赖 16×16 patch → 14×14 token 网格'
         self.img_size = img_size
         self.fuse_op = fuse_op
         self.vit_pretrained = vit_pretrained
+        self.fds = bool(fds)
 
         width = int(64 * config.resnet.width_factor)
         hidden = config.hidden_size
@@ -71,6 +73,11 @@ class SplitLocalGlobalTransUNet(nn.Module):
             out_channels=num_classes,
             kernel_size=3,
         )
+        if self.fds:
+            # 三级深监督：14²/512、28²/256、56²/128（与 DecoderCup 的 aux 顺序一致）
+            self.decoder.fds = FDSHeads(
+                channels=(512, dec_cfg.decoder_channels[0], dec_cfg.decoder_channels[1]),
+                num_classes=num_classes)
 
     def forward(self, x):
         if x.dim() == 3:
@@ -94,6 +101,9 @@ class SplitLocalGlobalTransUNet(nn.Module):
         t = a.flatten(2).transpose(1, 2).contiguous()
 
         out = self.decoder(t, features)
+        if self.fds:
+            out, aux = out
+            return {'out': self.segmentation_head(out), 'aux': aux}
         return self.segmentation_head(out)
 
     # ------------------------------------------------------------ 权重
