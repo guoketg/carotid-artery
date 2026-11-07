@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .wavelet import _HAAR
+from .wavelet import _HAAR, laplacian_pyramid_channels, laplacian_split_channels
 
 
 def dwt_haar(x):
@@ -92,8 +92,11 @@ class CBAM(nn.Module):
 class DDBE(nn.Module):
     """双域解耦三分支：输入输出同形 (B,C,H,W)，H/W 为偶数。"""
 
-    def __init__(self, channels):
+    def __init__(self, channels, hf_op='haar'):
         super().__init__()
+        if hf_op not in ('haar', 'lap', 'pyr', 'none'):
+            raise ValueError('unknown hf_op: %r' % (hf_op,))
+        self.hf_op = hf_op
         C = channels
         self.eca = ECA()
         # HF 支
@@ -118,11 +121,24 @@ class DDBE(nn.Module):
 
     def forward(self, x):
         f = self.eca(x)
-        ll, lh, hl, hh = dwt_haar(f)
-        # HF：细节子带上采样回原分辨率
-        hf = torch.cat([lh, hl, hh], dim=1)
-        hf = self.hf_up(self.hf_bn(self.hf_conv(self.hf_in(hf))))
-        hf = self.hf_ca(hf)
+        if self.hf_op == 'lap':
+            # 高频基换成同一口径的拉普拉斯分解；LF 仍吃 Haar LL（只换高频支）
+            ll, details = laplacian_split_channels(f)
+            lh, hl, hh = details
+        elif self.hf_op == 'pyr':
+            # 正统拉普拉斯金字塔：三个真实尺度、保留符号（§1.12 的公平版拉普拉斯臂）
+            ll, details = laplacian_pyramid_channels(f)
+            lh, hl, hh = details
+        else:
+            ll, lh, hl, hh = dwt_haar(f)
+        if self.hf_op == 'none':
+            # 控制臂：整条 HF 支置零（参数保留，参数量与 Haar 版逐位一致）
+            hf = torch.zeros_like(f)
+        else:
+            # HF：细节子带上采样回原分辨率
+            hf = torch.cat([lh, hl, hh], dim=1)
+            hf = self.hf_up(self.hf_bn(self.hf_conv(self.hf_in(hf))))
+            hf = self.hf_ca(hf)
         # LF：近似子带双线性上采样
         lf = self.lf_bn(self.lf_in(ll))
         lf = F.interpolate(lf, scale_factor=2, mode="bilinear", align_corners=False)

@@ -9,6 +9,7 @@
 |---|---|---|---|
 | 终端直接起后台进程 | 训练跑到 iteration 71 被无痕杀掉 | 终端关闭/超时会回收子进程树 | **必须用 WMI 脱离进程树启动**：`Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='powershell -ExecutionPolicy Bypass -NoProfile -File "...\queue_xxx.ps1"'}` |
 | 队列不自动续跑 | 机器重启/断电后队列停在中途 | 队列脚本无断点续跑逻辑 | 按 `logs/queue/*_status.csv` 手工 `-Skip` 已完成项重启 |
+| 误判"重复训练进程" | 杀掉一个"重复"的 python 后，正在跑的任务一起死（2026-11-04 CCFR A1 死于 stage2 ep11） | `venv\Scripts\python.exe` 只是启动器，会以**子进程**再拉起 `C:\Python\Python311\python.exe` 执行同一命令；`Get-Process python` 里两个同名进程属于**同一个 job** | 判重只看 `ParentProcessId` 与 `CreationDate`：子进程的父是 venv 那个即是同一任务；真正的重复任务表现为两个**互不为父子**的 train.py 根进程 |
 
 ## 2. Windows / PowerShell 环境
 

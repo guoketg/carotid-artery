@@ -198,12 +198,15 @@ class UNet(nn.Module):
     """
 
     def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
-                 ddbe_level=0, acam=False, asr=False):
+                 wavelet_basis="haar", ddbe_level=0, acam=False, asr=False,
+                 ddbe_hf_op="haar"):
         super(UNet, self).__init__()
         l1c, l2c, l3c, l4c, l5c = 64, 128, 256, 512, 1024
         # edge_in：stem 多吃一张边缘图（与 TransUNet edge_in 同一算子、同一 λ=0 口径）
         self.edge_in = edge_in
         self.edge_op = edge_op
+        # wavelet_basis：小波基选择实验（只作用于 edge_op=wavelet/wavelet_lam）
+        self.wavelet_basis = wavelet_basis
         stem_in = in_channels + 1 if edge_in else in_channels
         # encoder：l1 stem（两层 3×3 + 残差块），l2-l4 各一个 DBB，l5 一个 BasicBlock
         self.l1_1 = nn.Sequential(
@@ -233,10 +236,10 @@ class UNet(nn.Module):
         self.ddbe_modules = None
         if ddbe_level:
             if ddbe_level == 4:
-                self.ddbe_modules = nn.ModuleList([DDBE(c) for c in dec_chs])
+                self.ddbe_modules = nn.ModuleList([DDBE(c, hf_op=ddbe_hf_op) for c in dec_chs])
             else:
                 modules = [nn.Identity() for _ in dec_chs]
-                modules[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1])
+                modules[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1], hf_op=ddbe_hf_op)
                 self.ddbe_modules = nn.ModuleList(modules)
         self.acams = nn.ModuleList([ACAM(c, c) for c in dec_chs]) if acam else None
         # ASR（WeaveSeg ICCV 2025）：把解码器前三级的上采样算子原地替换成
@@ -278,7 +281,8 @@ class UNet(nn.Module):
         if x.dim() == 3:
             x = x.unsqueeze(1)
         if self.edge_in:
-            x = torch.cat([x, build_edge_map(x, self.edge_op)], dim=1)
+            x = torch.cat([x, build_edge_map(x, self.edge_op,
+                                             basis=self.wavelet_basis)], dim=1)
         x1 = self.l1_1(x)                    # 224²/64
         x2 = self.l2_1(self.l1_2(x1))        # 112²/128
         x3 = self.l3_1(self.l2_2(x2))        # 56²/256

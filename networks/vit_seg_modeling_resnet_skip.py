@@ -11,7 +11,13 @@ import torch.nn.functional as F
 
 
 def np2th(weights, conv=False):
-    """Possibly convert HWIO to OIHW."""
+    """Possibly convert HWIO to OIHW.
+    
+    把 NumPy 权重数组转成 PyTorch 张量，
+    并按需把卷积核的维度从 HWIO 改成 OIHW。
+    
+    """
+
     if conv:
         weights = weights.transpose([3, 2, 0, 1])
     return torch.from_numpy(weights)

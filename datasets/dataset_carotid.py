@@ -58,12 +58,15 @@ def resize_pair(image, label, size):
 class CarotidDataset(Dataset):
     """颈动脉斑块 2D 超声切片数据集，返回单通道图像与二值标签"""
 
-    def __init__(self, root, list_file, split="train", img_size=224, augment=True, use_wavelet=False):
+    def __init__(self, root, list_file, split="train", img_size=224, augment=True, use_wavelet=False,
+                 gamma_aug=False):
         self.root = root
         self.split = split
         self.img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
         self.augment = augment and split == "train"
         self.use_wavelet = use_wavelet
+        # BDFR-Net 论文的 augmentation 含 gamma 扰动；默认关，保持既有实验口径不变
+        self.gamma_aug = gamma_aug
         self.samples = read_list(list_file)
         if not self.samples:
             raise RuntimeError(f"列表为空: {list_file}")
@@ -83,6 +86,12 @@ class CarotidDataset(Dataset):
             angle = random.uniform(-15, 15)
             image = ndimage.rotate(image, angle, order=3, reshape=False, mode="nearest")
             label = ndimage.rotate(label, angle, order=0, reshape=False, mode="nearest")
+        if self.gamma_aug and random.random() < 0.5:
+            # gamma 增强（论文 augmentation 之一）：在 [0,1] 上做幂变换再映回原灰度范围
+            lo, hi = float(image.min()), float(image.max())
+            if hi > lo:
+                g = random.uniform(0.7, 1.4)
+                image = np.power((image - lo) / (hi - lo), g) * (hi - lo) + lo
         return np.ascontiguousarray(image), np.ascontiguousarray(label)
 
     def __getitem__(self, index):

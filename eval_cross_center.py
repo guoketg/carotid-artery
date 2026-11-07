@@ -64,13 +64,15 @@ def build_model(args):
     if args.arch == 'baseline':
         return ViT_seg(config_vit, img_size=args.img_size, num_classes=2,
                        edge_in=bool(args.edge_in), edge_op=args.edge_op,
+                       wavelet_basis=args.wavelet_basis,
                        ddbe_level=args.ddbe,
                        acam=bool(args.acam), hf_branch=bool(args.hf_branch),
                        hf_lambda=args.hf_lambda)
     if args.arch == 'unet':
         from networks.unet import UNet
         return UNet(in_channels=1, num_classes=2, edge_in=bool(args.edge_in),
-                    edge_op=args.edge_op, ddbe_level=args.ddbe,
+                    edge_op=args.edge_op, wavelet_basis=args.wavelet_basis,
+                    ddbe_level=args.ddbe,
                     acam=bool(args.acam), asr=bool(args.asr))
     if args.arch == 'wmren':
         from networks.unet_wmren import UNetWMREN
@@ -91,6 +93,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--edge_in', type=int, default=0)
     parser.add_argument('--edge_op', type=str, default='wavelet')
+    parser.add_argument('--wavelet_basis', type=str, default='haar',
+                        help='与训练时保持一致（haar/db2/db4/sym4/coif1/bior1.5）')
     parser.add_argument('--ddbe', type=int, default=0)
     parser.add_argument('--acam', type=int, default=0)
     parser.add_argument('--asr', type=int, default=0)

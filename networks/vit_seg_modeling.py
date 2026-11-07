@@ -22,6 +22,7 @@ from . import vit_seg_configs as configs
 from .vit_seg_modeling_resnet_skip import ResNetV2
 from .wavelet import build_hf_image, build_edge_map
 from .ddbe import DDBE, ACAM
+from .bdfr_v2 import DDBEv2, ACAMv2
 from .hf_branch import HFBranch, FAM, HF_DET_CHANNELS
 
 
@@ -395,6 +396,59 @@ class DecoderCup(nn.Module):
         return x
 
 
+class DecoderCupBDFR(nn.Module):
+    """BDFR-Net 忠实版解码器（Eq.1–10）。
+
+    每级：DDBE(解码特征) → 上采样 → ACAM(编码 skip, 解码特征) 加性融合 → conv 细化。
+    TransUNet 的 skip 在 28/56/112（比解码特征 14/28/56 浅一个八度），
+    因此 ACAM 只能落在上采样之后的融合点，这是骨干决定的唯一相位差。
+    """
+
+    def __init__(self, config, use_ddbe=True, use_acam=True):
+        super(DecoderCupBDFR, self).__init__()
+        self.config = config
+        self.n_skip = config.n_skip
+        self.use_ddbe = use_ddbe
+        self.use_acam = use_acam
+        head_channels = 512
+        self.conv_more = Conv2dReLU(config.hidden_size, head_channels, 3, padding=1, use_batchnorm=True)
+        decoder_channels = list(config.decoder_channels)
+        in_channels = [head_channels] + decoder_channels[:-1]
+        skip_channels = list(config.skip_channels)  # 拷贝，避免原地改 config
+        for i in range(4 - self.n_skip):
+            skip_channels[3 - i] = 0
+        self.fused = [use_acam and sk > 0 for sk in skip_channels]
+        self.ups = nn.ModuleList([nn.UpsamplingBilinear2d(scale_factor=2) for _ in in_channels])
+        self.conv1 = nn.ModuleList([
+            Conv2dReLU(ic if fz else ic + sk, oc, 3, padding=1, use_batchnorm=True)
+            for ic, oc, sk, fz in zip(in_channels, decoder_channels, skip_channels, self.fused)])
+        self.conv2 = nn.ModuleList([
+            Conv2dReLU(oc, oc, 3, padding=1, use_batchnorm=True) for oc in decoder_channels])
+        if use_ddbe:
+            self.ddbe = nn.ModuleList([DDBEv2(c) for c in in_channels])
+        if use_acam:
+            self.acam = nn.ModuleList([
+                ACAMv2(sk, ic) for sk, ic in zip(skip_channels[:self.n_skip], in_channels[:self.n_skip])])
+        self.fds = None  # BDFR 版不接 FDS
+
+    def forward(self, hidden_states, features=None):
+        b, n_patch, hidden = hidden_states.size()
+        h, w = int(np.sqrt(n_patch)), int(np.sqrt(n_patch))
+        x = hidden_states.permute(0, 2, 1).contiguous().view(b, hidden, h, w)
+        x = self.conv_more(x)
+        for i, (up, c1, c2) in enumerate(zip(self.ups, self.conv1, self.conv2)):
+            if self.use_ddbe:
+                x = self.ddbe[i](x)
+            x = up(x)
+            skip = features[i] if (features is not None and i < self.n_skip) else None
+            if self.fused[i]:
+                x = self.acam[i](skip, x)
+            elif skip is not None:
+                x = torch.cat([x, skip], dim=1)
+            x = c2(c1(x))
+        return x
+
+
 class FDSHeads(nn.Module):
     """Flux Deep Supervision（Syn-Net Eq.13）的三级辅助头。
 
@@ -414,8 +468,9 @@ class FDSHeads(nn.Module):
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 edge_in=False, edge_op="wavelet", ddbe_level=0, acam=False,
-                 hf_branch=False, hf_lambda=0.3):
+                 edge_in=False, edge_op="wavelet", wavelet_basis="haar", ddbe_level=0, acam=False,
+                 ddbe_hf_op="haar", hf_branch=False, hf_lambda=0.3,
+                 bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -424,9 +479,16 @@ class VisionTransformer(nn.Module):
         # edge_op：边缘图算子，wavelet（默认，λ=0，与旧行为逐位一致）/ sobel / laplacian 等
         self.edge_in = edge_in
         self.edge_op = edge_op
+        # wavelet_basis：小波基选择实验（只作用于 edge_op=wavelet/wavelet_lam）
+        self.wavelet_basis = wavelet_basis
         self.transformer = Transformer(config, img_size, vis,
                                        in_channels=4 if edge_in else 3)
-        self.decoder = DecoderCup(config)
+        # bdfr_v2：BDFR-Net Eq.(1)–(10) 忠实解码器（DDBE×4 + ACAM 替代 concat）
+        self.bdfr_v2 = bdfr_v2
+        if bdfr_v2:
+            self.decoder = DecoderCupBDFR(config, use_ddbe=bdfr_ddbe, use_acam=bdfr_acam)
+        else:
+            self.decoder = DecoderCup(config)
         self.segmentation_head = SegmentationHead(
             in_channels=config['decoder_channels'][-1],
             out_channels=config['n_classes'],
@@ -438,9 +500,11 @@ class VisionTransformer(nn.Module):
         # acam = 每个 decoder 级对 skip 特征做 ACAM 跨级语义对齐（ddbefull = ddbe4 + acam）。
         # 必须最后再建：否则随机数消耗顺序改变，同 seed 的基础权重与不挂的版本不再对齐。
         if ddbe_level == 4:
-            self.decoder.ddbe_all = nn.ModuleList([DDBE(c) for c in config.decoder_channels])
+            self.decoder.ddbe_all = nn.ModuleList(
+                [DDBE(c, hf_op=ddbe_hf_op) for c in config.decoder_channels])
         elif ddbe_level:
-            self.decoder.ddbe = DDBE(config.decoder_channels[ddbe_level - 1])
+            self.decoder.ddbe = DDBE(config.decoder_channels[ddbe_level - 1],
+                                     hf_op=ddbe_hf_op)
             self.decoder.ddbe_idx = ddbe_level - 1
         if acam:
             in_ch = [512] + list(config.decoder_channels[:-1])
@@ -477,7 +541,9 @@ class VisionTransformer(nn.Module):
         if x.size()[1] == 1:
             if self.edge_in:
                 # 第 4 通道：边缘图（默认 wavelet 高频重建，LL 置零），与原图同分辨率
-                x = torch.cat([x.repeat(1, 3, 1, 1), build_edge_map(x, self.edge_op)], dim=1)
+                x = torch.cat([x.repeat(1, 3, 1, 1),
+                               build_edge_map(x, self.edge_op,
+                                              basis=self.wavelet_basis)], dim=1)
             else:
                 x = x.repeat(1,3,1,1)
         x, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)

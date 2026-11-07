@@ -37,6 +37,7 @@ def build_model(args):
         from networks.unet import UNet
         return UNet(in_channels=1, num_classes=2,
                     edge_in=bool(args.edge_in), edge_op=args.edge_op,
+                    wavelet_basis=args.wavelet_basis,
                     ddbe_level=args.ddbe, acam=bool(args.acam),
                     asr=bool(args.asr))
     if args.arch == "wmren":
@@ -175,6 +176,9 @@ def main():
     p.add_argument("--edge_op", default="wavelet",
                    choices=["wavelet", "wavelet_lam", "energy", "sobel", "laplacian"],
                    help="输入级边缘图算子，与 train.py 同义（仅 unet 可换）")
+    p.add_argument("--wavelet_basis", default="haar",
+                   choices=["haar", "db2", "db4", "sym4", "coif1", "bior1.5"],
+                   help="小波基，与训练时保持一致（仅 edge_op=wavelet/wavelet_lam）")
     p.add_argument("--fusion", default="none", choices=["none", "se", "cross"])
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--arch", default="baseline",
