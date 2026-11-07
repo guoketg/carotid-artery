@@ -19,6 +19,9 @@ local/
 !docs/assets/**/*.png
 !docs/assets/**/*.pdf
 
+# 论文全文提取文本，版权内容不入库
+docs/papers_txt/
+
 # ---- 病人隐私相关：一律不得进仓库 ----
 # 原始影像（NIfTI）、病例划分清单、训练/评估产物都会带病人标识
 datasets/split/
