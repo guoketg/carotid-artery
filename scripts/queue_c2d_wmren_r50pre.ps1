@@ -1,21 +1,23 @@
-﻿# R50 宿主两臂：R50 全段（ImageNet21k 预训练，不截断）+ 两种接法（docs/experiments.md §1.14）。
+﻿# R50 宿主单臂：R50 全段（ImageNet21k 预训练，不截断）特征过 WRMM 再进解码器。
 #
-# 两臂都**全部**使用 R50：conv_root(7×7 stem) + block1/2/3（3/4/6 个残差单元），
-# 出 112²/64、56²/256、28²/512、14²/1024 四级特征，没有任何 stage 被截断。
-# 随机初始化对照（--no_pretrain）全部排除：文献里的 ResNet 一律加载预训练，
-# 从零训不是本任务的对照条件。
+# F1 的接线：
+#   R50 全段——conv_root(7×7 stem) + block1/2/3（3/4/6 个残差单元），不截断任何 stage，
+#   出 112²/64、56²/256、28²/512、14²/1024 四级特征；
+#   → 每级接一个 WRMM(stride=1) 做同级精炼（不出图、不改分辨率，只重写这一级特征）；
+#   → 精炼后的四级特征当作编码器输出，按 WMREN 的方式送进 unet_dec
+#     （浅三级作 skip 拼接，14² 作瓶颈），解码器完全不动。
+#   参数量 72.17 M。
 #
-# 臂表：
-#   F1  R50 全段四级特征 + 每级 WRMM stride=1 同级精炼 + unet_dec + 预训练
-#       → ..._abunetdec_encr50wrmm_pretrain_c2d
-#   E1  R50 全段四级特征直接进 unet_dec + 预训练（WRMM 不参与，别人的方案）
-#       → ..._abunetdec_encr50_pretrain_c2d       31.00 M
+# 对照：
+#   F1 vs K2（WRMM 编码器 + 同一 unet_dec，87.77 / 0.1923 / HD 0.979）
+#       = 把随机初始化的 WRMM 编码器换成「预训练 R50 + WRMM 精炼」值多少
+#   F1 vs A0 90.32 = 与项目主基线比；跨骨干家族，只作参照不判门槛。
 #
-# 读数：
-#   F1 − E1      = 「在 R50 提的特征上再加自己的 WRMM 编码器（精炼）」值多少
-#   F1 / E1 对 WMREN 参照（WRMM 编码器 + U-Net 解码器，去 REM = 87.77 / 0.1923 / HD 0.979）
-#                = 换成强骨干（R50 预训练）值多少
-#   注：`--wmren_enc r50deep`（R50 只嫁接深两级）按用户要求排除，不排期。
+# 已删除 / 不排期：
+#   - E1（R50 直连 unet_dec，31.00 M）：参数量只有 U-Net 的一半，不是公平的
+#     「ResNet + U-Net」对照，按用户要求删掉。
+#   - `--wmren_enc r50deep`（R50 只嫁接深两级）：同样排除。
+#   - 随机初始化对照（--no_pretrain）：文献里的 ResNet 一律加载预训练，不设从零训。
 #
 # 判定（§0）：|ΔDice| ≥ 0.5 或 HD 降 ≥ 0.1 mm 才算有效；单 seed 噪声带 ±0.3。
 #
@@ -24,7 +26,6 @@
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_wmren_r50pre.ps1
-#   ... -Only "E1"   只跑指定任务
 #   ... -DryRun      只打印命令
 param(
     [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
@@ -55,8 +56,7 @@ $common = @(
 
 # name, extra args, log tag
 $jobs = @(
-    @{ n = "F1"; tag = "wmren_encr50wrmm_pre"; a = @("--arch", "wmren", "--wmren_ablate", "unet_dec", "--wmren_enc", "r50wrmm") },
-    @{ n = "E1"; tag = "wmren_encr50_pre"; a = @("--arch", "wmren", "--wmren_ablate", "unet_dec", "--wmren_enc", "r50") }
+    @{ n = "F1"; tag = "wmren_encr50wrmm_pre"; a = @("--arch", "wmren", "--wmren_ablate", "unet_dec", "--wmren_enc", "r50wrmm") }
 )
 
 if ($Only) {

@@ -102,9 +102,31 @@ parser.add_argument('--bdfr_v2', type=int, default=0,
                     help='1 = 换成 BDFR-Net 忠实解码器（DDBE×4 + ACAM 替代 concat；仅 --arch baseline，'
                          '与 --ddbe/--acam 互斥）')
 parser.add_argument('--bdfr_ddbe', type=int, default=1,
-                    help='--bdfr_v2 1 时是否启用 DDBE（含 ECA）；0 = 完整去掉 DDBE 和 ECA，保留 ACAM')
+                    help='--bdfr_v2 1 时是否启用 DDBE 块；论文 Eq.1 里 ECA 是 DDBE 的第一步，'
+                         '两者绑定（0 = DDBE 与 ECA 一起去掉，只留 ACAM）')
 parser.add_argument('--bdfr_acam', type=int, default=1,
                     help='--bdfr_v2 1 时是否启用 ACAM；0 = ACAM 回退为 concat（其余不变）')
+parser.add_argument('--bdfr_wave_op', type=str, default='haar', choices=['haar', 'lap', 'pyr'],
+                    help='--bdfr_v2 1 时 DDBE 内 HF/LF 的分解基：haar（论文原版）/ lap（单尺度拉普拉斯）/ '
+                         'pyr（多尺度拉普拉斯金字塔）')
+parser.add_argument('--ffusion', type=int, default=0,
+                    help='1 = 解码器每个 skip 融合点换成 FreqFusion（NeurIPS 2024，'
+                         'ALPF+offset+AHPF，Eq.6–13；仅 --arch baseline，不与 --bdfr_v2 同开）')
+parser.add_argument('--edge_fusion', type=str, default='none',
+                    choices=['none', 'rel', 'relconst', 'mref', 'fem', 'abf', 'abftied'],
+                    help='解码器 skip 汇合点的边缘/频域融合：'
+                         'none / rel（R-GEF 单支拉普拉斯 + 逐像素可靠性，仅 baseline）/ '
+                         'relconst（r≡0.5，参数完全匹配的对照，仅 baseline）/ '
+                         'mref（MREF 多支：多尺度拉普拉斯 + Sobel + 斑点噪声图 + 双头门控，仅 baseline）/ '
+                         'fem（FDFUNet 的 FEM：MFDF 多尺度频域滤波 + ASCA 注意力，仅 baseline）/ '
+                         'abf（自研非对称频带融合：baseline = R50 版；unet = 弱骨干版）/ '
+                         'abftied（α_H = −α_L 的参数匹配对照）')
+parser.add_argument('--edge_gamma', type=float, default=0.0,
+                    help='R-GEF 注入强度 γ 初值。0 = 起点等价基线（实测 200ep 后 γ 仍≈0，模块未启用）；'
+                         '0.1 = 修正版，模块从头参与优化')
+parser.add_argument('--edge_depth', type=int, default=1,
+                    help='--edge_fusion mref 时每个 skip 汇合点上串联的 MREF 块数（推荐 4）；'
+                         '单块容量有限，级联 4 块 = 全模型 12 个融合块')
 parser.add_argument('--optim', type=str, default='sgd', choices=['sgd', 'adamw', 'adam'],
                     help='sgd = 项目历次口径（momentum 0.9 + poly）；adamw = 论文口径（恒定 lr，wd 1e-4）；'
                          'adam = FDFUNet 论文口径（Adam lr 1e-4 + cosine 退火到 1e-5，按 epoch）')
@@ -181,7 +203,7 @@ parser.add_argument('--wmren_no_gate', type=int, default=0,
                     help='1 = WRDM 去掉 Eq.(4)(5) 的 softmax 软加权（固定 0.5）；同样可与 unet_dec 叠加')
 parser.add_argument('--wmren_no_mlkm', type=int, default=0,
                     help='1 = WRMM 去掉 MLKM 多尺度大核单元（WRDM 输出直接 1×1 回通道）；同样可与 unet_dec 叠加')
-parser.add_argument('--wmren_enc', type=str, default='wrmm', choices=['wrmm', 'r50', 'r50deep', 'r50wrmm'],
+parser.add_argument('--wmren_enc', type=str, default='wrmm', choices=['wrmm', 'r50', 'r50deep', 'r50wrmm', 'r50seq'],
                     help="WMREN 的编码器：wrmm（默认，stem+4×WRMM，从零训）/ "
                          "r50（R50 conv_root+block1~3 整体替换编码器、WRMM 全不建，"
                          "用于问「换成 R50 编码器值多少」，不是「WMREN 的预训练版」）/ "
@@ -190,11 +212,29 @@ parser.add_argument('--wmren_enc', type=str, default='wrmm', choices=['wrmm', 'r
                          "浅两级 WRMM 与小波支全保留）/ "
                          "r50wrmm（R50 全段不截断，conv_root+block1~3 的 3/4/6 出四级特征，"
                          "再逐级接 WRMM 的 stride=1 同级精炼，形状不变；"
-                         "即「强骨干提特征 + 自己的编码器吃这些特征」）")
-parser.add_argument('--ddbe_hf_op', type=str, default='haar', choices=['haar', 'lap', 'pyr', 'none'],
+                         "即「强骨干提特征 + 自己的编码器吃这些特征」）/ "
+                         "r50seq（R50 与 WRMM 串行：WRMM1 的 112² 输出既作 skip 又喂 block1，"
+                         "WRMM2/3/4 的输出同理既作 skip 又喂下一级 block，"
+                         "WRMM 特征真正进入编码器主链）")
+parser.add_argument('--ddbe_hf_op', type=str, default='haar', choices=['haar', 'lap', 'pyr', 'none', 'plain'],
                     help='DDBE 高频支算子：haar（默认）/ lap（§1.12 拉普拉斯替换）/ '
                          'pyr（拉普拉斯金字塔，3 个真实尺度、保留符号）/ '
-                         'none（HF 支置零，作为「频域支整体值多少」对照）')
+                         'none（HF 支置零，作为「频域支整体值多少」对照）/ '
+                         'plain（ddbectl 去分解对照臂 2026-11-09：三支全吃同一普通特征，'
+                         '参数量与 haar/lap 逐位一致，归因「拼接改写 vs 频率内容」）')
+parser.add_argument('--r50_fdf', type=str, default='none', choices=['none', 'drdac', 'drdac_mfdf', 'full'],
+                    help='FDFUNet 模块渐进上 R50（2026-11-09 规划，验证 A.7 减法消融'
+                         '排除不掉的组合协同）：drdac = 编码器四级 + DRDAC（恒等起步）；'
+                         'drdac_mfdf = +编码/解码各四级 FEM（MFDF only）；'
+                         'full = FEM 开 ASCA（完整模块组）。全部外加不替换')
+parser.add_argument('--fgr', type=int, default=0,
+                    help='1 = 解码器四级挂 FGR（拉普拉斯频带 + FcaNet 式 DCT 谱门 + '
+                         '1×1 改写，fuse 零初始化恒等起步；「只有频带内容 + 轻门控」，'
+                         '与 ddbectl/plain 构成双向归因对照）')
+parser.add_argument('--fgr_mode', choices=['whole', 'band'], default='whole',
+                    help='--fgr 1 时的改写核档位：whole = 单枚 2C→C 核搅两带（原 FGR）；'
+                         'band = 高低频各一枚 C→C 零核并联（FBGR 分带档，R50 上解决'
+                         'FGR 与 DDBE 同点串联互覆的算子同型问题）')
 # ---- CCFR（ESWA-D-25-34301）两阶段训练 ----
 parser.add_argument('--ccfr_stage', type=str, default='both', choices=['both', '1', '2'],
                     help='both = 先训 EA-Net 再训 flow；1 = 只训 EA-Net；2 = 只训 flow（须给 --ccfr_stage1_ckpt）')
@@ -241,10 +281,36 @@ if not 0 <= args.ddbe <= 4:
     parser.error('--ddbe 取值 0~4')
 if args.acam and args.arch not in ('baseline', 'unet'):
     parser.error('--acam 只接了 baseline/unet 解码器（与 --ddbe 同挂载面）')
+if args.r50_fdf != 'none':
+    if args.arch != 'baseline':
+        parser.error('--r50_fdf 只接了 baseline（R50 编码器 + TransUNet 解码器）')
+    if args.ddbe or args.acam or args.bdfr_v2 or args.ffusion or args.edge_fusion != 'none':
+        parser.error('--r50_fdf 与 --ddbe/--acam/--bdfr_v2/--ffusion/--edge_fusion 互斥'
+                     '（A.7 组合协同单独成臂，不与已有模块纠缠）')
+if args.fgr:
+    if args.arch not in ('baseline', 'unet'):
+        parser.error('--fgr 只接了 baseline/unet（解码器四级输出改写）')
+    if args.arch == 'baseline' and (args.bdfr_v2 or args.ffusion):
+        parser.error('--fgr 与 --bdfr_v2/--ffusion 互斥（同为解码器改写面；'
+                     '--ddbe 允许组合 = FGR+DDBE 双模块臂，同点串联 ddbe→fgr）')
+if args.fgr_mode != 'whole' and not args.fgr:
+    parser.error('--fgr_mode 只在 --fgr 1 时有效（没有 FGR 就没有档位）')
 if args.bdfr_v2 and args.arch != 'baseline':
     parser.error('--bdfr_v2 只接了 TransUNet 解码器（--arch baseline）')
 if args.bdfr_v2 and (args.ddbe or args.acam):
     parser.error('--bdfr_v2 自带 DDBE×4 + ACAM，不能与 v1 的 --ddbe/--acam 同时开')
+if args.bdfr_wave_op != 'haar' and not args.bdfr_v2:
+    parser.error('--bdfr_wave_op 只作用于 --bdfr_v2 1 的 DDBEv2（v1 请用 --ddbe_hf_op）')
+if args.ffusion and args.arch != 'baseline':
+    parser.error('--ffusion 只接了 TransUNet 解码器（--arch baseline）')
+if args.ffusion and args.bdfr_v2:
+    parser.error('--ffusion 与 --bdfr_v2 都替换解码器融合点，不能同开')
+if args.edge_fusion != 'none' and args.arch not in ('baseline', 'unet'):
+    parser.error('--edge_fusion 只接了 baseline（TransUNet 解码器）与 unet 解码器')
+if args.arch == 'unet' and args.edge_fusion not in ('none', 'abf', 'abftied'):
+    parser.error('--arch unet 只接了自研 ABF（--edge_fusion abf / abftied）')
+if args.edge_fusion != 'none' and (args.bdfr_v2 or args.ffusion):
+    parser.error('--edge_fusion 与 --bdfr_v2/--ffusion 都改解码器融合点，不能同开')
 if args.asr and args.arch != 'unet':
     parser.error('--asr 只接了 unet 解码器（替换 up_conv，baseline/dual/split/xnet/gobletnet 未接）')
 if args.hf_branch and args.arch != 'baseline':
@@ -255,8 +321,8 @@ if not 0 <= args.vit_layers <= 12:
     parser.error('--vit_layers 取值 0~12（预训练只含 12 层权重，0 = 去掉全局 Transformer 段）')
 if args.no_pretrain and not (args.arch == 'baseline'
                              or (args.arch == 'wmren'
-                                 and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm'))):
-    parser.error('--no_pretrain 只支持 --arch baseline（A0 家族）与 --arch wmren 的 r50/r50deep/r50wrmm 编码器'
+                                 and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm', 'r50seq'))):
+    parser.error('--no_pretrain 只支持 --arch baseline（A0 家族）与 --arch wmren 的 r50/r50deep/r50wrmm/r50seq 编码器'
                  '（预训练臂的 scratch 对照）：unet/wmren(wrmm) 本来就是随机初始化，'
                  'dual/split 另有 --side_pretrained 控制侧路')
 if args.edge_op != 'wavelet' and not (args.arch in ('unet', 'baseline') and args.edge_in):
@@ -279,7 +345,7 @@ if args.wmren_wave_op != 'haar':
         parser.error('--wmren_wave_op 对 unet_enc 无效（四个 WRMM 已被替换）')
     if args.wmren_ablate == 'no_wave':
         parser.error('--wmren_wave_op 与 no_wave 互斥')
-if args.wmren_enc in ('r50', 'r50deep', 'r50wrmm'):
+if args.wmren_enc in ('r50', 'r50deep', 'r50wrmm', 'r50seq'):
     if args.arch != 'wmren':
         parser.error('--wmren_enc 只接了 --arch wmren')
     if args.wmren_ablate == 'unet_enc':
@@ -422,12 +488,28 @@ if __name__ == "__main__":
                 snapshot_path += '_nod'
             if not args.bdfr_acam:
                 snapshot_path += '_na'
+            if args.bdfr_wave_op != 'haar':
+                snapshot_path += '_bw' + args.bdfr_wave_op
+        if args.ffusion:
+            snapshot_path += '_ff'
+        if args.edge_fusion != 'none':
+            # R-GEF：rel 为正式模块，relconst 为参数匹配的常数门控对照
+            snapshot_path += '_eg' + args.edge_fusion
+            if args.edge_fusion == 'mref':
+                snapshot_path += str(int(args.edge_depth))
+            if args.edge_gamma != 0.0:
+                snapshot_path += '_gm' + str(int(round(args.edge_gamma * 100)))
         if args.asr:
             # v1（分组共享核 8 组）为 _asr；v2 逐通道核 + 软偏移，必须分目录
             snapshot_path += '_asr2'
         if args.hf_branch:
             # λ 量化到 0.1 粒度进快照名（λ=0.3 → _hfbr3）
             snapshot_path += '_hfbr' + str(int(round(args.hf_lambda * 10)))
+        if args.r50_fdf != 'none':
+            snapshot_path += '_r50fdf_' + {'drdac': 'dr', 'drdac_mfdf': 'mf', 'full': 'full'}[args.r50_fdf]
+        if args.fgr:
+            # whole 沿用历史段名 _fgr；band 是新算子档（FBGR），必须分目录
+            snapshot_path += '_fgr' if args.fgr_mode == 'whole' else '_fgrb'
         if args.domain_loss:
             # 损失口径不同必须分目录，否则与 0.5CE+0.5Dice 的权重混在一起
             snapshot_path += '_dl'
@@ -441,6 +523,10 @@ if __name__ == "__main__":
             snapshot_path += '_l' + args.loss.replace('_', '')
         if args.arch in ('unet', 'xnet', 'gobletnet', 'wmren', 'fdfunet'):
             snapshot_path += '_' + args.arch
+            if args.arch == 'unet' and args.edge_fusion in ('abf', 'abftied'):
+                snapshot_path += '_eg' + args.edge_fusion
+                if args.edge_gamma != 0.0:
+                    snapshot_path += '_gm' + str(int(round(args.edge_gamma * 100)))
             if args.arch == 'unet' and args.edge_in and args.edge_op == 'wavelet':
                 # unet 的边缘算子横扫：默认 wavelet 沿用历史目录名 _eowavelet（非默认算子已在上方加过）
                 snapshot_path += '_eo' + args.edge_op
@@ -470,6 +556,8 @@ if __name__ == "__main__":
                 snapshot_path += '_encr50deep'
             if args.arch == 'wmren' and args.wmren_enc == 'r50wrmm':
                 snapshot_path += '_encr50wrmm'
+            if args.arch == 'wmren' and args.wmren_enc == 'r50seq':
+                snapshot_path += '_encr50seq'
             if args.tag:
                 snapshot_path += '_' + args.tag
         if args.arch == 'dual':
@@ -572,7 +660,11 @@ if __name__ == "__main__":
                    edge_in=bool(args.edge_in), edge_op=args.edge_op,
                    wavelet_basis=args.wavelet_basis,
                    ddbe_level=args.ddbe, acam=bool(args.acam),
-                   asr=bool(args.asr), ddbe_hf_op=args.ddbe_hf_op).cuda()
+                   asr=bool(args.asr), ddbe_hf_op=args.ddbe_hf_op,
+                   fgr=bool(args.fgr), fgr_mode=args.fgr_mode)
+        if args.edge_fusion in ('abf', 'abftied'):
+            net.attach_edge_fusion(kind=args.edge_fusion, init_gamma=args.edge_gamma)
+        net = net.cuda()
     elif args.arch == 'weaveseg':
         # WeaveSeg（ICCV 2025）：U-Net 底座 + ASR + ICW，返回 {'out','sf','sb','su'}
         from networks.weaveseg import WeaveSeg
@@ -637,9 +729,20 @@ if __name__ == "__main__":
                       ddbe_hf_op=args.ddbe_hf_op,
                       hf_branch=bool(args.hf_branch), hf_lambda=args.hf_lambda,
                       bdfr_v2=bool(args.bdfr_v2), bdfr_ddbe=bool(args.bdfr_ddbe),
-                      bdfr_acam=bool(args.bdfr_acam)).cuda()
+                      bdfr_acam=bool(args.bdfr_acam),
+                      bdfr_wave_op=args.bdfr_wave_op,
+                      ffusion=bool(args.ffusion),
+                      edge_fusion=args.edge_fusion != 'none',
+                      edge_gate='const' if args.edge_fusion == 'relconst' else 'spatial',
+                      edge_kind=('mref' if args.edge_fusion == 'mref' else
+                                'fem' if args.edge_fusion == 'fem' else
+                                args.edge_fusion if args.edge_fusion in ('abf', 'abftied') else 'rel'),
+                      edge_depth=args.edge_depth,
+                      edge_gamma=args.edge_gamma,
+                      r50_fdf=args.r50_fdf, fgr=bool(args.fgr),
+                      fgr_mode=args.fgr_mode).cuda()
     if args.arch != 'ccfr' and not args.no_pretrain:
-        if args.arch == 'wmren' and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm'):
+        if args.arch == 'wmren' and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm', 'r50seq'):
             # wmren 的 load_from 是空操作（WRMM 无可迁移形状）；R50 编码器臂单独吃 R50 那部分权重
             net.load_r50(weights=np.load(config_vit.pretrained_path))
         else:

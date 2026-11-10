@@ -1,6 +1,6 @@
 # CLAUDE.md — 颈动脉斑块超声分割
 
-> 本文件只保留**必须遵守的硬约束**。设计细节、数据集说明、实验方案分别在 `docs/` 下，避免主文件膨胀。
+> 本文件只保留**必须遵守的规则与硬约束**。设计细节、数据集说明、实验方案分别在 `docs/` 下；**进度与状态一律写 `docs/status.md`，结果数字一律写 `docs/results.md`**，不写进本文件。
 
 ## 1. 项目
 
@@ -40,6 +40,18 @@
     - **据此的许可**：允许并鼓励针对噪声与低对比度设计——散斑统计建模、对数域/同态变换、低对比度下的形状与面积先验、声影区的不确定性建模——但同样必须先测后设计；评价以 ASSD / HD / DeltaArea 为主，不能只看 Dice。
     - **默认前提**：低频、大尺度的整体形状与面积是可靠信息，细节边界是不可靠信息。
 
+13. **结果表格输出规范（每次给指标表都必须遵守，不看当场提醒）**：
+    - **一表一骨干**：表头必须写死骨干与解码器（例：`ResNet-50（ImageNet21k 预训练，vit_layers=0）+ DecoderCup`）、数据集/划分口径、训练协议（epoch/batch/lr）与 seed。表头不得含糊成"某模型"。
+    - **基线必带**：每张表的第一行必须是该骨干+解码器组合自身的基线（不挂任何新模块），并给出完整四项 Dice / ASSD / HD / DeltaArea；不得省略基线行，不得借用别表的基线。
+    - **换骨干就换表**：编码器或解码器任一改变（如 R50+DecoderCup ↔ WRMM+unet_dec ↔ R50+WRMM+unet_dec），必须新开一张表；旧表的 Δ 不得跨表继承，跨表数字只能在正文里作参照，不得写进表的 Δ 列。
+    - **换论文就换表**：每个方法来源（论文名 + venue + 年份）单独一张表，表头注明来源与复现范围（完整复现 / 仅迁移核心模块）；不同论文的臂不得同表混排，本组自研模块单独成表。
+    - 表中 Δ 列必须写明参照对象与 seed（单 seed 要标"单 seed"）；缺失指标写"—"，不得删列；同一张表内指标口径必须一致。
+    - **多 seed 合并成一行**：同一臂的多个 seed 结果不得逐 seed 分行罗列，必须合并为一行，写成 `均值 ± sd`（Δ 写配对 Δ 的均值 ± sd），并在表头注明 seed 集合（例：`seed 1234/2024/3407`）。
+    - 指标口径按第 5 条。若某列实测异常（如基线 HD 出现离群值），全表统一改用替代量并在表下注明异常与替代口径（当前距离指标统一用 HD95），严禁同一张表里 HD 与 HD95 混称。
+
+14. **本文件只放规则，不放状态**：任何"当前在跑什么 / 已经得到什么结论 / 下一步等什么 / 最新数字 / 进度清单"都不得写入本文件，一律写入 [docs/status.md](docs/status.md)（状态）与 [docs/results.md](docs/results.md)（结果数字）。本文件只允许出现可执行的约束、判定规则、口径定义与文档索引。
+15. **多 seed 必须经用户同意才能跑**：默认一律单 seed（1234）。任何 3-seed（或更多）补跑、复验、均值±sd 汇总，都必须先说明理由与要占用的算力，**取得用户明确同意后**才可排入队列；不得自行决定多 seed。原因：多 seed 会长时间占卡，耽误其他实验。单 seed 结论不得在文档里被表述为"稳定"或"已验证"。
+
 ## 4. 文档索引
 
 | 文档 | 内容 |
@@ -51,18 +63,5 @@
 | [docs/literature.md](docs/literature.md) | 文献正式条目（venue / 表号 / 与本项目关系）+ 负面结果汇总 + 待读清单 |
 | [docs/paper-reading.md](docs/paper-reading.md) | 频域论文速查笔记；第五章为 2026-10-26 对本地 8 篇 PDF 的精读校正、结论冲突拆解、融合六档与推进顺序 |
 | [docs/experiments.md](docs/experiments.md) | 消融矩阵、评估协议、统计检验、运行命令 |
-| [docs/status.md](docs/status.md) | 环境与权重校验记录、进度清单、已知问题 |
-
-## 5. 当前状态
-
-- 环境、预训练权重（R50+ViT-B_16）、依赖、Windows `pjoin` 修复：已完成，见 `docs/status.md`。
-- 单通道原图基线与三通道早融合、三通道＋小波引导注意力的消融已完成；**三通道＋小波引导注意力相对单通道原图基线无增益**（差异在 seed 噪声带内），旧轻量侧支路线已否。
-- **双骨干交错四级融合**已实现并通过探针验证。融合分支此前因「输出投影零初始化 + γ 零初始化」双重零相乘永久冻结，2026-10-25 已修；最深 14² 接点「侧路无下游消费者」的结构性死支路也已改为串联双向（先更新侧路、主路再用 `qkv_b(B2)` 重取 K/V），探针 `max|Δ|=0`、`gamma_b` 第 1 步起有非零梯度。修复后跑完的首个活融合配置（`--fuse_op window`，前三个接点并行双向、最深接点当时仍是 A→B 单向）Dice 0.9051，**相对单通道基线 0.9092 无增益、四项指标全差**，但存在 `bs8` vs `bs4+ga2` 口径不一致与单 seed 两个混杂，详见 `docs/status.md` §4.5.6。
-- **2026-10-24 夜队列（只跑全量 SPARC 单子集）**：`scripts/night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `scripts/night_queue_dual2.ps1 -Skip *zhongnan`，实际顺序为四点全开·窗内/全局自适应融合 → 可变形大核 → AFF 式幅度调制 → 自适应融合＋跨尺度回流（队列中依次记作 `r1` / `r4` / `r5` / `r6`）。
-- **实测耗时**：全量 SPARC 0.70 s/iter（107 iter/epoch ≈ 75 s）→ **2.5 h/job**；瓶颈是 dataloader（`num_workers=1`），GPU 仅 63% util。旧文档“34.6 s/epoch、72 min”是错的。
-- **dev 快筛子集（已撤销）**：`lists_Carotid_dev` + `scripts/night_queue_dev.ps1` + `scripts/summarize_dev.py` 保留备用，当晚未使用，中间产物已删。
-- 训练超参变更：**batch 4 + `--grad_accum 2`**（等效 8）；batch 8 触发 WDDM 换页，单步 2.6×，禁用。
-- **2026-10-26 频域文献复盘**：本地 8 篇 PDF 精读完毕，XNet（ICCV2023）与 GobletNet（TMI2025）结论不矛盾——XNet 的 raw 基线是单编码器（增量混容量），GobletNet 参数量对齐后只剩「高频有用、低频有害」。据此确定：**变换种类不是主要矛盾，注入位置才是**；不再新增更重的融合算子，下一轮按 Step 0（打印 `γ` + HF 图改 IDWT 重建）→ Step 1（`bs4+ga2` 基线 3 seed）→ Step 2（stem 加一张 HF 通道，+27 参数）推进，详见 `docs/status.md` §4.6 与 `docs/technical-design.md`「频率注入位置」。
-- **2026-10-26 老师指示（改排期，代码未动）**：① 新数据集口径——根目录 `F:\code\datasets\Carotid2D`（`_S` 目录）＋官方划分 `datasets/split/`（SPARC：训练 350 张/约 101 例、测试 160 张/约 43 例；Zhongnan 448/187 张）。旧划分弃用，**全部历史数字只在旧口径下有效**；接入需小改代码（`train.py` 的 root_path 写死 + 划分文件转成 `<list_dir>/<Subset>/train.txt` 结构），明细见 `docs/dataset.md` §7，待批准。② 下一结构实验先做**边缘特征融合**，插队到「stem 加 HF 通道」与「特征级 DWT 解耦」之前，读法与最小设计见 `docs/technical-design.md`「频率注入位置」待决策第 4 条，实施待批准。
-- **2026-10-26 新口径落地（冒烟通过，基线重跑中）**：① Carotid2D 接入完成——root/list_dir 已切、划分四文件就位、快照带 `_c2d` 后缀，冒烟 n=160 与官方一致；② **指标物理单位化**——预测经 `original_grid_pair` 重采样回原分辨率网格后用 NIfTI 头 spacing 算 medpy 距离，**assd/hd 单位 mm、DeltaArea 单位 mm²**，历史数字均为像素口径不可直接比（口径断代见 `docs/dataset.md` §6、`docs/status.md` §4.6.6）；③ XNet 式低频主路已实现（`--main_input ll`，快照带 `_mainLL`），待基线跑完后与双骨干原图对照。新口径实验命令：`--batch_size 4 --grad_accum 2 --max_epochs 200 --eval_test_every 5`。
-- **2026-10-28 三队列收口（SPARC，官方划分，ep150 判定；旧口径，数字不与新口径直接比）**：① 双骨干 QKV 跨支注意力三 seed 判负——3-seed 均值 0.9012 vs 单骨干基线 0.9016，seed3407 低至 0.9012、掉出噪声带；② 融合算子五档横评齐：deform 0.9061 唯一三项全优但未过门槛，gate 与 auto 同噪声带，aff 垫底 0.9017；③ BDFR-Net 复现：单级挂载判负，四级全挂 0.9033、+ACAM 完整版 0.9053，方向为正但均未过门槛；④ 主路换 LL 低频图与原图无差异（0.9043 vs 0.9040）；⑤ 输入级边缘图单用无效、配双骨干 0.9072 为全场最佳点但未过门槛。详见 `docs/status.md` §3、`docs/study/fusion-operators-explained.md` 与 `deform-fusion-explained.md`。
+| [docs/status.md](docs/status.md) | 环境、权重校验、进度与当前状态（**状态只写这里，不写进本文件**）、已知风险 |
+| [docs/results.md](docs/results.md) | 结果纯台账（按骨干/论文分表，含基线与各消融的 Dice/ASSD/HD/DeltaArea） |

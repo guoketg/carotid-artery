@@ -151,11 +151,28 @@ class ResNetV2(nn.Module):
     def forward(self, x):
         features = []
         b, c, in_size, _ = x.size()
+        # --r50_fdf（2026-11-09 规划）：FDFUNet 模块渐进挂在 R50 四个 stage 输出
+        # （root 112²/64 → block1 55²/256 → block2 28²/512 → block3 14²/1024），
+        # 外加不替换、预训练权重不动；模块由 VisionTransformer 在基础权重建完后挂载
+        # （同 seed 基础权重与不挂的版本逐位对齐）。
+        # DRDAC 走残差（x + drdac(x)，fuse 零初始化 → 恒等起步）：TF32 下让 x 过
+        # pass-through conv（eye 初始化）会被激活舍入破坏逐位恒等，残差 + 零支路精确。
+        # FEM 论文口径 inline（非恒等，A2/A3 Δ≠0 属预期）。
+        drdac = getattr(self, 'fdf_drdac', None)
+        fem = getattr(self, 'fdf_fem', None)
         x = self.root(x)
+        if drdac is not None:
+            x = x + drdac[0](x)
+        if fem is not None:
+            x = fem[0](x)
         features.append(x)
         x = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)(x)
         for i in range(len(self.body)-1):
             x = self.body[i](x)
+            if drdac is not None:
+                x = x + drdac[i + 1](x)
+            if fem is not None:
+                x = fem[i + 1](x)
             right_size = int(in_size / 4 / (i+1))
             if x.size()[2] != right_size:
                 pad = right_size - x.size()[2]
@@ -166,4 +183,8 @@ class ResNetV2(nn.Module):
                 feat = x
             features.append(feat)
         x = self.body[-1](x)
+        if drdac is not None:
+            x = x + drdac[3](x)
+        if fem is not None:
+            x = fem[3](x)
         return x, features[::-1]

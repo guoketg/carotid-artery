@@ -332,7 +332,7 @@ class SegmentationHead(nn.Sequential):
 
 
 class DecoderCup(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, ffusion=False, edge_fusion=False, edge_gate="spatial"):
         super().__init__()
         self.config = config
         head_channels = 512
@@ -359,6 +359,21 @@ class DecoderCup(nn.Module):
             DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
         ]
         self.blocks = nn.ModuleList(blocks)
+        # FreqFusion（NeurIPS 2024）：替换 up + cat，挂在与 skip 同级的融合点
+        if ffusion:
+            from .freqfusion import FreqFusion
+            self.ffs = nn.ModuleList([
+                FreqFusion(c_high=ic, c_low=sk) if sk > 0 else None
+                for ic, sk in zip(in_channels, skip_channels)])
+        else:
+            self.ffs = None
+        # R-GEF（可靠性门控边缘融合）：挂在解码器每个有 skip 的融合点，
+        # 残差注入 skip' = skip + γ·(r ⊙ E)，γ 零初始化 → 起点与基线完全等价。
+        # 由 VisionTransformer 在全部基础权重初始化之后调用 attach_edge_fusion()，
+        # 保证同 seed 的基础权重与不挂的版本逐位对齐。
+        self.egf = None
+        self._in_channels = in_channels
+        self._skip_channels = skip_channels
         # DDBE / ACAM 由 VisionTransformer 在全部基础权重初始化之后挂上（保证同 seed RNG 对齐）
         self.ddbe = None
         self.ddbe_idx = -1
@@ -366,6 +381,45 @@ class DecoderCup(nn.Module):
         self.acams = None
         # FDS（Syn-Net Eq.13）：非空时 forward 额外返回三级辅助 logits
         self.fds = None
+        # FEM（--r50_fdf 解码器四级）/ FGR（--fgr）：同样由 VisionTransformer 最后挂载
+        self.fem_dec = None
+        self.fgr_all = None
+
+    def attach_edge_fusion(self, gate_mode="spatial", init_gamma=0.0, kind="rel", depth=1):
+        """在全部基础权重初始化之后挂边缘融合模块（保证同 seed 的基础权重逐位对齐）。
+
+        init_gamma：注入强度 γ 的初值。0 时起点与基线逐位等价，但实测 200ep 后
+        γ 仍停在 ±0.005（模块等于没打开），因此修正版用 0.1 让模块从头就参与优化。
+        kind：rel = R-GEF 单支拉普拉斯；mref = MREF 多支（多尺度拉普拉斯 + Sobel
+              + 斑点噪声图 + 双头门控）；fem = FDFUNet 的 FEM（MFDF + ASCA）。
+        depth：仅 mref 生效——每个 skip 汇合点上串联的 MREF 块数（4 = 级联 4 块）。
+        """
+        if kind == "fem":
+            from .edge_fusion import FEMFusion as _Mod
+            base = int(self.config.patches.grid[0])   # 14（224 输入 / patch 16）
+            self.egf = nn.ModuleList([
+                _Mod(sk, base * 2 ** (i + 1), base * 2 ** (i + 1), init_gamma=init_gamma)
+                if sk > 0 else None
+                for i, sk in enumerate(self._skip_channels)])
+            return
+        if kind in ("abf", "abftied"):
+            from .edge_fusion import AsymBandFusion as _Mod
+            self.egf = nn.ModuleList([
+                _Mod(sk, x_channels=ic, tied=(kind == "abftied"), init_gamma=init_gamma)
+                if sk > 0 else None
+                for ic, sk in zip(self._in_channels, self._skip_channels)])
+            return
+        if kind == "mref":
+            from .edge_fusion import CascadeEdgeFusion as _Mod
+            self.egf = nn.ModuleList([
+                _Mod(sk, x_channels=ic, depth=depth, init_gamma=init_gamma) if sk > 0 else None
+                for ic, sk in zip(self._in_channels, self._skip_channels)])
+            return
+        from .edge_fusion import ReliabilityGatedEdgeFusion
+        self.egf = nn.ModuleList([
+            ReliabilityGatedEdgeFusion(sk, x_channels=ic, gate_mode=gate_mode,
+                                       init_gamma=init_gamma) if sk > 0 else None
+            for ic, sk in zip(self._in_channels, self._skip_channels)])
 
     def forward(self, hidden_states, features=None):
         B, n_patch, hidden = hidden_states.size()  # reshape from (B, n_patch, hidden) to (B, h, w, hidden)
@@ -381,14 +435,26 @@ class DecoderCup(nn.Module):
                 skip = features[i] if (i < self.config.n_skip) else None
             else:
                 skip = None
+            if skip is not None and self.egf is not None and self.egf[i] is not None:
+                # R-GEF：边缘按逐像素可靠性残差注入 skip
+                skip = self.egf[i](skip, x)
             if skip is not None and self.acams is not None:
                 # ACAM：深层特征跨级对齐 skip（ddbefull；零初始化恒等起步）
                 skip = self.acams[i](skip, x)
-            x = decoder_block(x, skip=skip)
+            if skip is not None and self.ffs is not None and self.ffs[i] is not None:
+                # FreqFusion 自己完成上采样 + 融合，输出通道 = 原 up+cat 的通道
+                x = self.ffs[i](x, skip)
+                x = decoder_block.conv2(decoder_block.conv1(x))
+            else:
+                x = decoder_block(x, skip=skip)
             if self.ddbe is not None and i == self.ddbe_idx:
                 x = self.ddbe(x)
             if self.ddbe_all is not None:
                 x = self.ddbe_all[i](x)
+            if self.fem_dec is not None:
+                x = self.fem_dec[i](x)
+            if self.fgr_all is not None:
+                x = self.fgr_all[i](x)
             if aux is not None and i in (0, 1):
                 aux.append(x)      # 28² / 256（block0 后）、56² / 128（block1 后）
         if aux is not None:
@@ -404,12 +470,13 @@ class DecoderCupBDFR(nn.Module):
     因此 ACAM 只能落在上采样之后的融合点，这是骨干决定的唯一相位差。
     """
 
-    def __init__(self, config, use_ddbe=True, use_acam=True):
+    def __init__(self, config, use_ddbe=True, use_acam=True, wave_op='haar'):
         super(DecoderCupBDFR, self).__init__()
         self.config = config
         self.n_skip = config.n_skip
         self.use_ddbe = use_ddbe
         self.use_acam = use_acam
+        self.wave_op = wave_op
         head_channels = 512
         self.conv_more = Conv2dReLU(config.hidden_size, head_channels, 3, padding=1, use_batchnorm=True)
         decoder_channels = list(config.decoder_channels)
@@ -425,7 +492,7 @@ class DecoderCupBDFR(nn.Module):
         self.conv2 = nn.ModuleList([
             Conv2dReLU(oc, oc, 3, padding=1, use_batchnorm=True) for oc in decoder_channels])
         if use_ddbe:
-            self.ddbe = nn.ModuleList([DDBEv2(c) for c in in_channels])
+            self.ddbe = nn.ModuleList([DDBEv2(c, wave_op=wave_op) for c in in_channels])
         if use_acam:
             self.acam = nn.ModuleList([
                 ACAMv2(sk, ic) for sk, ic in zip(skip_channels[:self.n_skip], in_channels[:self.n_skip])])
@@ -470,7 +537,9 @@ class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
                  edge_in=False, edge_op="wavelet", wavelet_basis="haar", ddbe_level=0, acam=False,
                  ddbe_hf_op="haar", hf_branch=False, hf_lambda=0.3,
-                 bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True):
+                 bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
+                 ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
+                 edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole"):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -486,9 +555,10 @@ class VisionTransformer(nn.Module):
         # bdfr_v2：BDFR-Net Eq.(1)–(10) 忠实解码器（DDBE×4 + ACAM 替代 concat）
         self.bdfr_v2 = bdfr_v2
         if bdfr_v2:
-            self.decoder = DecoderCupBDFR(config, use_ddbe=bdfr_ddbe, use_acam=bdfr_acam)
+            self.decoder = DecoderCupBDFR(config, use_ddbe=bdfr_ddbe, use_acam=bdfr_acam,
+                                          wave_op=bdfr_wave_op)
         else:
-            self.decoder = DecoderCup(config)
+            self.decoder = DecoderCup(config, ffusion=ffusion)
         self.segmentation_head = SegmentationHead(
             in_channels=config['decoder_channels'][-1],
             out_channels=config['n_classes'],
@@ -535,6 +605,46 @@ class VisionTransformer(nn.Module):
                 nn.init.zeros_(inj.weight)
         else:
             self.hf_net = None
+        # --r50_fdf（2026-11-09 规划）：FDFUNet 三模块渐进挂 R50 编码器四级（A1/A2/A3）。
+        # 全部「外加不替换」：DRDAC 经残差钩子零初始化恒等起步（TF32 下 pass-through
+        # conv 不精确，必须走 x + branch），FEM 保持论文口径 inline 不包 γ。
+        # 挂载放在全部基础权重初始化之后（RNG 对齐纪律）。
+        if r50_fdf in ("drdac", "drdac_mfdf", "full"):
+            from .fdfunet import DRDAC
+            hm = self.transformer.embeddings.hybrid_model
+            hm.fdf_drdac = nn.ModuleList([DRDAC(c, c) for c in (64, 256, 512, 1024)])
+            with torch.no_grad():
+                for blk in hm.fdf_drdac:
+                    # 恒等起步 = fuse 全零 + ResNetV2.forward 的残差钩子（x + drdac(x)）。
+                    # 不能用 eye 让 x 过恒等 conv：TF32 下 cuDNN 会把输入激活舍入到
+                    # 10-bit 尾数（1.0×TF32(x) ≠ x），四级复累 → logits 差 O(1)；
+                    # 残差 + 零初始化（0×任何值 = 0）与 DDBE 同型，逐位精确等价不挂版本
+                    nn.init.zeros_(blk.fuse.weight)
+        if r50_fdf in ("drdac_mfdf", "full"):
+            from .fdfunet import FEM
+            hm = self.transformer.embeddings.hybrid_model
+            # 编码器四级：root 112²/64 → block1 55²/256（TransUNet 的 padding hack 发生在
+            # 挂载点之后——112² 经 3/2 maxpool 实际是 55²）→ block2 28²/512 → block3 14²/1024；
+            # 模块挂 pad 前（refined x 继续进下一级，inline 同 FDFUNet 主链），FEM 按实际分辨率注册
+            hm.fdf_fem = nn.ModuleList([
+                FEM(c, hh, ww, use_asca=(r50_fdf == "full"))
+                for c, hh, ww in ((64, 112, 112), (256, 55, 55), (512, 28, 28), (1024, 14, 14))])
+            # 解码器四级：28²/256 → 56²/128 → 112²/64 → 224²/16
+            self.decoder.fem_dec = nn.ModuleList([
+                FEM(c, s, s, use_asca=(r50_fdf == "full"))
+                for c, s in zip(config.decoder_channels, (28, 56, 112, 224))])
+        # --fgr（2026-11-09 规划）：FGR 频门改写挂解码器四级输出（拉普拉斯频带 +
+        # FcaNet 式 DCT 谱门 + 1×1 改写，fuse 零初始化恒等起步；与 ddbectl/plain 互补）
+        if fgr:
+            from .fgr import FGR
+            # fgr_mode：whole = 单核改写 [hf,lf]（原 FGR）；band = 双零核并联分带（FBGR）
+            self.decoder.fgr_all = nn.ModuleList([
+                FGR(c, s, s, mode=fgr_mode)
+                for c, s in zip(config.decoder_channels, (28, 56, 112, 224))])
+        if edge_fusion:
+            # 最后再挂 R-GEF：消耗 RNG 在所有基础权重之后，同 seed 与基线逐位对齐
+            self.decoder.attach_edge_fusion(edge_gate, init_gamma=edge_gamma, kind=edge_kind,
+                                            depth=edge_depth)
 
     def forward(self, x):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图

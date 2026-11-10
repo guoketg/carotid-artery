@@ -94,7 +94,7 @@ class DDBE(nn.Module):
 
     def __init__(self, channels, hf_op='haar'):
         super().__init__()
-        if hf_op not in ('haar', 'lap', 'pyr', 'none'):
+        if hf_op not in ('haar', 'lap', 'pyr', 'none', 'plain'):
             raise ValueError('unknown hf_op: %r' % (hf_op,))
         self.hf_op = hf_op
         C = channels
@@ -121,6 +121,8 @@ class DDBE(nn.Module):
 
     def forward(self, x):
         f = self.eca(x)
+        if self.hf_op == 'plain':
+            return self._forward_plain(x, f)
         if self.hf_op == 'lap':
             # 高频基换成同一口径的拉普拉斯分解；LF 仍吃 Haar LL（只换高频支）
             ll, details = laplacian_split_channels(f)
@@ -147,6 +149,22 @@ class DDBE(nn.Module):
         ctx = self.ctx_bn(self.ctx_conv(f))
         ctx = ctx * torch.sigmoid(self.ctx_gate(ctx))
         # 融合：初始 fuse=0 → 输出 = x（恒等起步）
+        return x + self.cbam(self.fuse(torch.cat([hf, lf, ctx], dim=1)))
+
+    def _forward_plain(self, x, f):
+        """ddbectl 对照臂（2026-11-09 规划）：三支全部吃同一普通特征，不做任何频域分解。
+
+        分解本身无参数，各支卷积原样保留 → 参数量与 haar/lap 版逐位一致；
+        HF 支输入 [f,f,f]（对位 haar 的 [lh,hl,hh] concat），LF 支直接吃 f（对位 LL）；
+        输入已是全分辨率，跳过转置卷积 / 双线性上采样（模块保留但闲置，不影响参数量）。
+        fuse 仍是唯一零初始化点 → 恒等起步，同 seed 与不挂 DDBE 的基线逐位等价。
+        归因问题：若本臂仍 ≈ +0.5，则 DDBE 的信号来自「拼接改写」而非频率内容
+        （results.md §7(3) 的机制问题）。
+        """
+        hf = self.hf_ca(self.hf_bn(self.hf_conv(self.hf_in(torch.cat([f, f, f], dim=1)))))
+        lf = self.lf_ca(self.lf_bn(self.lf_in(f)))
+        ctx = self.ctx_bn(self.ctx_conv(f))
+        ctx = ctx * torch.sigmoid(self.ctx_gate(ctx))
         return x + self.cbam(self.fuse(torch.cat([hf, lf, ctx], dim=1)))
 
 

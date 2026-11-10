@@ -107,19 +107,23 @@ FLOPs 比值 1.53 vs 论文 19.83/12.84 = 1.54。论文 GFLOPs 的绝对口径�
 - [x] |ΔDice| = 1.01% ≥ 噪声带 0.5%
 - [ ] 单 seed，跨 seed 复跑未排
 
-### 6.4 减法消融（2026-11-05 07:58 入队）
+### 6.4 减法消融（2026-11-05 入队，2026-11-10 回填）
 
 `--fdfunet_ablate {no_drdac,no_mfdf,no_asca}`，全部在完整版上只关一个模块，其余超参与 §6.3 逐字一致。
-队列 `scripts/queue_fdfunet_ablation.ps1`，3 job 串行；进度看 `logs/queue/queue_fdfunet_ablation_status.csv`。
+队列 `scripts/queue_fdfunet_ablation.ps1`，3 job 已跑完（exit 0×3，34.9 / 25.0 / 33.0 min）。
 
-| job | 变更 | 参数量 | 快照后缀 |
+| 模型 | Dice | ASSD | HD |
 |---|---|---|---|
-| `no_drdac` | DRDAC → 普通 3×3 conv 下采样 | 25.18 M | `_abnodrdac` |
-| `no_mfdf` | FEM 去掉 MFDF，只留 ASCA | 24.82 M | `_abnomfdf` |
-| `no_asca` | FEM 去掉 ASCA，只留 MFDF | 19.96 M | `_abnoasca` |
+| UNet\*（基线，§6.3） | 88.97 | 0.17592 | 0.95469 |
+| FDFUNet 完整（§6.3） | 89.98 | 0.16160 | 0.79095 |
+| − DRDAC | 89.85 | 0.15868 | 0.74834 |
+| − MFDF | 89.95 | 0.15572 | 0.73343 |
+| − ASCA | 89.81 | 0.15865 | 0.77446 |
 
-- [ ] 三档 ep200 的 Dice/ASSD/HD
-- [ ] 「完整 − 消融」的 Δ，按 |ΔDice| ≥ 0.5% 或 HD 降 ≥ 0.1 mm 判定
+- [x] 三档 ep200 的 Dice/ASSD/HD
+- [x] 「完整 − 消融」的 Δ：DRDAC **+0.13** / MFDF **+0.03** / ASCA **+0.17**（Dice，单位 %），全部远低于 0.5 门槛
+
+读法：完整版相对 UNet* +1.01 Dice 过线（判有效），但**没有任何单一模块能解释这个增益**——去掉任一模块 Dice 仍 ≥ 89.81（+0.84）；且三个消融版的 ASSD / HD 反而都比完整版更好（0.156–0.159 / 0.733–0.774 vs 0.162 / 0.791），即模块对边界质量是负贡献。+1.01 的增益主体是**整体结构**（5 级 UNet* + DRDAC 下采样块 + FEM 布局），不是频域模块本身。与 R50 渐进实验（results.md §5(13)–(15)：DRDAC +0.03 / +MFDF −0.37 / +ASCA −0.19 全判负）互相印证：**论文整体有效 ≠ 模块有效，频域模块单独拿出来在两种设定下都不是增益源**。
 
 ## 7. 运行命令
 

@@ -39,6 +39,22 @@ parser.add_argument('--deterministic', type=int,  default=1, help='whether use d
 parser.add_argument('--base_lr', type=float,  default=0.01, help='segmentation network learning rate')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--vit_patches_size', type=int, default=16, help='vit_patches_size, default is 16')
+parser.add_argument('--vit_layers', type=int, default=12,
+                    help='与训练时一致：0 = R50 单编码器协议')
+parser.add_argument('--bdfr_v2', type=int, default=0)
+parser.add_argument('--bdfr_ddbe', type=int, default=1,
+                    help='DDBE 块（含 ECA），与训练口径一致')
+parser.add_argument('--bdfr_acam', type=int, default=1)
+parser.add_argument('--bdfr_wave_op', type=str, default='haar',
+                    choices=['haar', 'lap', 'pyr'])
+parser.add_argument('--ffusion', type=int, default=0)
+parser.add_argument('--edge_fusion', type=str, default='none',
+                    choices=['none', 'rel', 'relconst', 'mref'],
+                    help='与训练时一致；relconst 走常数门控，mref 走多支边缘融合')
+parser.add_argument('--edge_gamma', type=float, default=0.0,
+                    help='与训练时一致：R-GEF 注入强度 γ 初值')
+parser.add_argument('--edge_depth', type=int, default=1,
+                    help='与训练时一致：mref 每个汇合点串联的块数')
 args = parser.parse_args()
 
 
@@ -113,9 +129,18 @@ if __name__ == "__main__":
     config_vit.n_classes = args.num_classes
     config_vit.n_skip = args.n_skip
     config_vit.patches.size = (args.vit_patches_size, args.vit_patches_size)
+    config_vit.transformer.num_layers = args.vit_layers
     if args.vit_name.find('R50') !=-1:
         config_vit.patches.grid = (int(args.img_size/args.vit_patches_size), int(args.img_size/args.vit_patches_size))
-    net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes).cuda()
+    net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes,
+                  bdfr_v2=bool(args.bdfr_v2), bdfr_ddbe=bool(args.bdfr_ddbe),
+                  bdfr_acam=bool(args.bdfr_acam), bdfr_wave_op=args.bdfr_wave_op,
+                  ffusion=bool(args.ffusion),
+                  edge_fusion=args.edge_fusion != 'none',
+                  edge_gate='const' if args.edge_fusion == 'relconst' else 'spatial',
+                  edge_kind='mref' if args.edge_fusion == 'mref' else 'rel',
+                  edge_depth=args.edge_depth,
+                  edge_gamma=args.edge_gamma).cuda()
 
     snapshot = os.path.join(snapshot_path, 'best_model.pth')
     if not os.path.exists(snapshot): snapshot = snapshot.replace('best_model', 'epoch_'+str(args.max_epochs-1))

@@ -5,7 +5,7 @@
 > 2026-10-23 ~ 10-27 的完整过程记录已归档到 [archive/status-history-2026-10.md](archive/status-history-2026-10.md)。
 > 术语解释见 [study/edge-fusion-explained.md](study/edge-fusion-explained.md)；融合算子逐个讲解见 [study/fusion-operators-explained.md](study/fusion-operators-explained.md)。
 
-最后更新：2026-10-30（判定口径统一为**终点 epoch 200**：`eval_batch_ep199.ps1` 16 job 全部重算完成，results.md 全表换 ep200 数字；新增 pitfalls.md 集中记录踩坑；GPU 当前空闲，无实验在跑）
+最后更新：2026-11-10 21:10（**在跑：queue_fgr_multiseed_zn 3 job**，约 23:10 收口；follow-up 链已挂两级：ZUB 补 Zhongnan unet 基线 → **queue_fbgr_full 三臂接力**（FBGR 分带档已实现、冒烟全绿，见 §2 与 [module-suite-design.md](module-suite-design.md)）；Syn-Net 经用户决策放弃，见 §4 item 2）。`queue_fgr_ddbe_combo` 3 job 15:39 全部收口 exit 0×3：R50 上 DDBE+FGR 组合 90.632 判负（同点双改写互覆）；弱骨干上 FGR +1.70 / 组合 +1.84 双门槛全过，**FGR 为头号候选**。上一批 `queue_r50fdf_fgr` 5 job 已于 00:57 收口，结果在 §5(12)–(16)）
 
 ---
 
@@ -22,12 +22,20 @@
 
 ---
 
-## 2. 队列状态（已全部跑完，GPU 空闲）
+## 2. 队列状态（在跑：queue_fgr_multiseed_zn，3 job 串行）
 
-**2026-10-30 04:32 最后一队收口**：文献复现三网络（U-Net/XNet/GobletNet）跑完 exit 0×3，至此全部训练与评测队列收口，无失败 job（唯一异常是融合算子 AFF 首跑在 ep5 因 GroupNorm 崩溃，修复后于批次 0+1 重跑成功）。评测产物（终点 epoch 200 口径）：各快照目录 `metrics_ep199.csv` + `logs/queue/eval199_*.log`（16 快照，2026-10-30 18:10 收口）。当前 GPU 空闲（无 train.py 进程）。
+**在跑 `queue_fgr_multiseed_zn.ps1`（2026-11-10 19:41 启动，预计约 3.5h）**：① UFs2024 = unet+fgr SPARC seed 2024；② UFs3407 = unet+fgr SPARC seed 3407；③ ZUF = unet+fgr Zhongnan seed 1234。目的：把 §7(4) 的 unet+fgr +1.70（单 seed）钉成多 seed 证据（与 s1234 合并为均值±标准差一行判定，门槛不变），并做 Zhongnan 方向性验证。状态 CSV：`logs/queue/queue_fgr_multiseed_zn_status.csv`。
+
+**接力链已挂两级（全自动，无需值守）**：① `queue_zn_unet_base.ps1`（PID 16328）等本队列 3 行状态落盘 + GPU 空闲后跑 Zhongnan unet 基线（seed 1234，快照 `..._224_Zhongnan_unet_c2d`），补 ZUF 的成对 Δ（状态：`queue_zn_unet_base_status.csv`）；② **`queue_fbgr_full.ps1`（2026-11-10 21:09 WMI 启动，PID 39212）**等 ZUB 状态落盘 + GPU 空闲后跑 FBGR 三臂（SPARC seed 1234 bs4 ga2 ep200，全走 `--fgr_mode band` 分带档）：FBGR-UNet（`..._SPARC_fgrb_unet_c2d`）、FBGR-R50（`..._vitL0_..._SPARC_fgrb_c2d`，对照 DDBE-lap 90.996 看互覆是否消除）、FULL-U = HFE+FBGR 同开（`..._SPARC_edge_fgrb_unet_eowavelet_c2d`，补消融阶梯最后一行）。第三臂原定 HFE-UNet，但同口径结果已存在（87.42 / +0.87，归档 A.4 C 组）经用户决策改跑 full 档。设计、诊断与判定规则见 [module-suite-design.md](module-suite-design.md)；冒烟 [scripts/smoke_fbgr_band.py](../scripts/smoke_fbgr_band.py) 全绿（恒等起步逐位 0、UNet 参数 +960、梯度链路、旗标接线）。状态 CSV：`logs/queue/queue_fbgr_full_status.csv`。
+
+**2026-11-10 00:57 `queue_r50fdf_fgr` 收口**：5 job 全部 exit 0（CTL 56.3min / A1 42.4min / A2 54.6min / A3 59.2min / FGR 44.1min），结果已回填 [results.md](results.md) §5(12)–(16)。要点：ddbeCTL +0.060 ≈ 噪声（DDBE 增益归因频率内容，机制问题落地）；A1/A2/A3 FDFUNet 渐进 +0.03/−0.37/−0.19 判负（MFDF 是负贡献主源）；FGR +0.305、ASSD/HD 同向改善，未过线但为多 seed 复核候选。HD 自本批起统一 medpy 口径。
+
+历史队列（全部收口，无失败 job；唯一异常是融合算子 AFF 首跑在 ep5 因 GroupNorm 崩溃，修复后于批次 0+1 重跑成功）：
 
 | 队列 | job 数 | 内容 | 状态 CSV |
 |---|---|---|---|
+| `queue_r50fdf_fgr.ps1`（A.7 组合协同 + FGR） | 5 | ddbectl 去分解对照、DRDAC/DRDAC+MFDF/完整 FDFUNet 渐进上 R50、FGR 频门改写 | `logs/queue/queue_r50fdf_fgr_status.csv` |
+| `queue_fgr_ddbe_combo.ps1`（FGR+DDBE 组合 + 弱骨干臂） | 3 | R50 解码器 DDBE×4+FGR 同点串联（90.632 判负）、UNet 仅 FGR（88.25，+1.70 双门槛全过）、UNet FGR+DDBE（88.39，复现线新高） | `logs/queue/queue_fgr_ddbe_combo_status.csv` |
 | `queue_c2d.ps1`（主队列） | 6 | 单骨干基线 seed2024/3407、双骨干跨支 QKV 注意力 seed2024/3407、输入级边缘图（基线+1 通道）、边缘图+双骨干 | `logs/queue/queue_c2d_status.csv` |
 | `queue_c2d_fuse.ps1`（融合算子横评） | 6 | AFF（崩溃 1 次）、gate 门控、deform 可变形大核、DDBE 单级挂载、基线 seed1234/3407 | `logs/queue/queue_c2d_fuse_status.csv` |
 | `queue_c2d_repro.ps1`（批次 0+1） | 4 | DDBE 四级全挂、DDBE×4+ACAM（BDFR 完整版）、AFF 重跑、主路吃 LL 低频图（XNet 便宜变体） | `logs/queue/queue_c2d_repro_status.csv` |
@@ -37,8 +45,10 @@
 **队列启动方式必须用 WMI**（否则训练会被终端回收，踩过坑）：
 
 ```powershell
-Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='powershell -ExecutionPolicy Bypass -NoProfile -File "...\queue_c2d_repro.ps1"'}
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& ''...\queue_xxx.ps1'' *>> ''...\launcher.log''"'}
 ```
+
+注意：WMI 不经 shell 解析，**`-File` 形式后不能带 `*>> log` 这类重定向参数**——重定向符与日志路径会被当成位置参数绑进脚本 `param`（2026-11-09 踩坑：脚本空转退出、日志路径被 Join-Path 建成目录）；要捕获队列脚本自身输出必须用上面的 `-Command "& 'script' *>> 'log'"` 包装形式。
 
 ---
 
@@ -85,7 +95,7 @@ ep200 指标（Dice / ASSD / HD、参数量、训练耗时）**完整表见 [res
 ## 4. 下一步等什么
 
 1. **批次 2 已实现未入队**（GobletNet 式：单主干 + 轻 HF 支 + FAM 逐层）：冒烟 5 项全过（恒等起步 max|Δlogits|=0、+1.206M 参数），入队命令 `--hf_branch 1 --hf_lambda 0.3`（快照 `*_SPARC_hfbr3_c2d`），批次 0+1 结论已落，可入队。实现细节见 [experiments.md](experiments.md) §1.9 执行记录②。
-2. **批次 3（Syn-Net）改方案待定**：老师要求先分别做局部支/全局支、再两个骨干一起看是否有真涨点——方案讨论中，`--fuse_op dct` 暂缓实现（见 experiments.md §1.9 批次 3）。批次 4（WMREN WRDM）视结论排期。
+2. **批次 3（Syn-Net）已放弃**（2026-11-10 用户决策）：原型臂 split+frc（FrCFusion，局部/全局分离双骨干）88.34，比 A0 低 2.2 点，负增益证实（experiments.md §2 待跑表）；`--fuse_op dct` 不再实现。改道：FGR 复核（在跑）→ 过线则设计 FGR-v2，不过线再议其他论文方法。批次 4（WMREN WRDM）视结论排期。
 3. 全部结论目前只在 SPARC 单子集成立；尚无变体达到幅度门槛（|ΔDice| ≥ 0.5% 或 HD 降 ≥ 0.1 mm）——edgedual / ddbefull / deform / edgedeform 四个方向为正的点，择优去 Zhongnan 复现。
 4. 病人图像仍在 git 历史里，彻底清除需 `git filter-repo` 重写历史（会改全部 commit hash，**待用户批准**）。
 
@@ -96,3 +106,44 @@ ep200 指标（Dice / ASSD / HD、参数量、训练耗时）**完整表见 [res
 - 病人隐私：工作区与 git 历史仍有病人图像/标识文件（已从当前索引移除，历史未清）。
 - 队列不自动续跑：机器重启或断电后需按 `logs/queue/queue_c2d_repro_status.csv` 手工 `-Skip` 重启。
 - 旧口径数字：10-25 之前是「旧划分 + 像素口径」；2026-10-30 起判定口径从 ep150/ep149 换为**终点 epoch 200**（A0 90.16%→90.32%），更早文档里的 ep149/ep150 数字全部作废，以 [results.md](results.md) 为准。
+
+---
+
+## 6. 状态归档（2026-11-07 自 CLAUDE.md 「当前状态」移入）
+
+> CLAUDE.md 只保留规则，以下进度记录迁到此节，按时间倒序追加。
+
+- 环境、预训练权重（R50+ViT-B_16）、依赖、Windows `pjoin` 修复：已完成。
+- 单通道原图基线与三通道早融合、三通道＋小波引导注意力的消融已完成；**三通道＋小波引导注意力相对单通道原图基线无增益**（差异在 seed 噪声带内），旧轻量侧支路线已否。
+- **双骨干交错四级融合**已实现并通过探针验证。融合分支此前因「输出投影零初始化 + γ 零初始化」双重零相乘永久冻结，2026-10-25 已修；最深 14² 接点「侧路无下游消费者」的结构性死支路也已改为串联双向（先更新侧路、主路再用 `qkv_b(B2)` 重取 K/V），探针 `max|Δ|=0`、`gamma_b` 第 1 步起有非零梯度。修复后跑完的首个活融合配置（`--fuse_op window`，前三个接点并行双向、最深接点当时仍是 A→B 单向）Dice 0.9051，**相对单通道基线 0.9092 无增益、四项指标全差**，但存在 `bs8` vs `bs4+ga2` 口径不一致与单 seed 两个混杂。
+- **2026-10-24 夜队列（只跑全量 SPARC 单子集）**：`scripts/night_queue_dual.ps1 -Skip r2_sparc,r3_sparc,r7_sparc,*zhongnan` → `scripts/night_queue_dual2.ps1 -Skip *zhongnan`，实际顺序为四点全开·窗内/全局自适应融合 → 可变形大核 → AFF 式幅度调制 → 自适应融合＋跨尺度回流。
+- **实测耗时**：全量 SPARC 0.70 s/iter（107 iter/epoch ≈ 75 s）→ **2.5 h/job**；瓶颈是 dataloader（`num_workers=1`），GPU 仅 63% util。旧文档“34.6 s/epoch、72 min”是错的。
+- **dev 快筛子集（已撤销）**：`lists_Carotid_dev` + `scripts/night_queue_dev.ps1` + `scripts/summarize_dev.py` 保留备用，中间产物已删。
+- 训练超参变更：**batch 4 + `--grad_accum 2`**（等效 8）；batch 8 触发 WDDM 换页，单步 2.6×，禁用。
+- **2026-10-26 频域文献复盘**：本地 8 篇 PDF 精读完毕，XNet（ICCV2023）与 GobletNet（TMI2025）结论不矛盾——XNet 的 raw 基线是单编码器（增量混容量），GobletNet 参数量对齐后只剩「高频有用、低频有害」。据此确定：**变换种类不是主要矛盾，注入位置才是**；不再新增更重的融合算子。详见 `technical-design.md`「频率注入位置」。
+- **2026-10-26 老师指示（改排期）**：① 新数据集口径——`Carotid2D`（`_S` 目录）＋官方划分（SPARC：训练 350 张/约 101 例、测试 160 张/约 43 例；Zhongnan 448/187 张），旧划分弃用，**全部历史数字只在旧口径下有效**；② 下一结构实验先做**边缘特征融合**，插队到「stem 加 HF 通道」与「特征级 DWT 解耦」之前。
+- **2026-10-26 新口径落地**：① Carotid2D 接入完成——root/list_dir 已切、划分四文件就位、快照带 `_c2d` 后缀，冒烟 n=160 与官方一致；② **指标物理单位化**——预测经 `original_grid_pair` 重采样回原分辨率网格后用 NIfTI 头 spacing 算 medpy 距离，**assd/hd 单位 mm、DeltaArea 单位 mm²**，历史数字均为像素口径不可直接比；③ XNet 式低频主路已实现（`--main_input ll`）。
+- **2026-10-28 三队列收口（SPARC，官方划分，ep150 判定；旧口径）**：① 双骨干 QKV 跨支注意力三 seed 判负——3-seed 均值 0.9012 vs 单骨干基线 0.9016；② 融合算子五档横评齐：deform 0.9061 唯一三项全优但未过门槛，gate 与 auto 同噪声带，aff 垫底 0.9017；③ BDFR-Net 复现：单级挂载判负，四级全挂 0.9033、+ACAM 完整版 0.9053，方向为正但均未过门槛；④ 主路换 LL 低频图与原图无差异（0.9043 vs 0.9040）；⑤ 输入级边缘图单用无效、配双骨干 0.9072 为全场最佳点但未过门槛。
+- **2026-11-07 R50 新协议（`vit_layers=0`，R50+DecoderCup）全部收口**：基线 A 90.4903 / ASSD 0.14473 / HD95 0.41634（seed 1234）。FreqFusion（NeurIPS 2024）90.5729（+0.083，不显著）；DDBE×4 去 ACAM 90.9251 / HD 0.6292（+0.435，ΔHD −0.077，未过线）；DDBE×4+ACAM 关+拉普拉斯 90.9960 / HD 0.6581（+0.506，ΔHD −0.048，单 seed 刚过 Dice 线）；自研 R-GEF 边缘融合 90.4039（−0.086，权重复查 `gamma` 终值 −0.0044/+0.0013/−0.0005，模块实际未启用）。
+- **2026-11-07 WRMM 线**：基线 K2（WRMM 随机编码器 + `unet_dec`）87.7742 / HD95 0.6060；去 MLKM −1.006（MLKM 值 +1.01）；去门控 +0.452（门控有害）；去小波支 +0.336。R50 全段 + WRMM 精炼 + `unet_dec` 89.7390 / HD95 0.5051（vs K2 +1.965，vs R50 基线 −0.751）。
+- **2026-11-07 在跑队列** `queue_c2d_r50_seedcheck.ps1`（5 job，串行）：R-GEF γ 初值 0→0.1 修正版；基线 A 的 seed 2024/3407；DDBE×4+ACAM+lap 的 seed 2024/3407（给 F3 的 +0.506 做 3-seed 确认）。状态 CSV：`logs/queue/queue_c2d_r50_seedcheck_status.csv`。
+- **2026-11-08 seedcheck 收口**（5 job 全 exit 0）：R-GEF γ₀=0.1 → 90.6230（+0.133，不显著）；基线 s2024 90.3567 / s3407 90.4244；DDBE+lap 复跑 s2024 90.9342 / s3407 91.0241（注意这两条是 **ACAM 开**，与 seed 1234 的 ACAM 关不同臂，已按定稿口径移出结果引用）。实测耗时：R-GEF 33 min、R50 基线 28 min、DDBE×4 48 min。
+- **2026-11-08 定稿口径**：ACAM 全关，不再进表；后续所有 DDBE 实验只跑 ACAM 关版本。多 seed 默认禁止（CLAUDE.md 第 15 条），需明确同意才排。
+- **2026-11-08 extend 队列收口**（`queue_c2d_wmren_r50_extend.ps1`，7 job 全 exit 0，10:59→21:48，合计 10.8 h）：R50U 56 min / RW_nm 95.2 / RW_ng 102.1 / RW_nw 83.2 / RW_lap 111.2 / K2_cmb 98 / RW_cmb 103.1。结果见 results.md §6 表 6-A/6-B/6-C——**WRMM 的四条结论在强骨干（预训练 R50）上全部归零**（最大 |Δ| 0.342，无一过 0.5 门槛）。
+- **2026-11-08 当前在跑**：`queue_c2d_r50seq_goblet0.ps1` 的 S1（`r50seq` 串行 WRMM 编码器，22:20 起）。relconst 已收口：90.4366 / HD95 0.3991，相对基线 −0.054、相对空间门控版 −0.186，30.1 min。其后为 GobletNet λ=0 → `queue_c2d_mref.ps1`（MREF depth=4）。三者均为前台 powershell 串行等待，互斥不会并行抢卡。
+- **耗时基准（实测）**：R50+DecoderCup 类 28~48 min/job；R-GEF 32~33 min；`r50wrmm`（72M）+`unet_dec` 83~111 min；GobletNet（133M）149 min。databloader 仍是瓶颈（`num_workers=1`）。
+- **2026-11-08 结果回填**：`docs/results.md` 新增 §5（R50 新协议：基线 3-seed、FreqFusion、DDBE×4 两档、R-GEF 两版）与 §6（K2 / r50 直连 / r50wrmm 三张骨干分开的 WRMM 留一表 + 组合臂）。
+- **2026-11-09 三 job 收口**：`queue_c2d_r50seq_goblet0.ps1` 的 S1/S2 与 `queue_c2d_mref.ps1` 全部 exit 0，GPU 空闲。
+  1. **r50seq（WRMM 串进 R50 主链，71.41M）89.6193 / 0.15645 / HD95 0.4449**（95.6 min）：相对 r50wrmm 并联 −0.120、相对 r50 直连 −0.012 → 串行同样零增益（results.md §6(3)）。
+  2. **GobletNet λ=0（87.1472 / 0.2092 / HD95 0.6919，144.9 min）**：相对原版 λ=0.3（86.277 / 0.2287）**+0.870**，说明原配置的 0.3·LL 回灌是负资产；HD 两项口径不同（旧快照无 hd95 列），不可直接比（results.md §4(4)）。
+  3. **MREF×4 级联（32.38M，12 块，γ₀=0.1）90.3750 / 0.14701 / HD95 0.43244**：ΔDice −0.115 → 容量放大 30 倍仍无增益，排除「模块容量不足」（results.md §5(8)）。
+- **待用户决策**：MREF 在强骨干上未过 0.5 门槛，是否按原计划搬到弱骨干（`unet_dec`，需给 `UNetFusion` 加可选 egf 参数并放开 `--edge_fusion` 仅 baseline 的限制）。
+- **2026-11-09 A.7 组合协同 + FGR 队列启动**（用户批准的设计，`queue_r50fdf_fgr.ps1` 5 job 串行，20:40 起）：
+  1. CTL `--ddbe 4 --ddbe_hf_op plain`：DDBE 去分解对照——三支全吃普通特征、参数量与 haar 版逐位一致，归因「拼接改写 vs 频率内容」（results.md §7(3) 机制问题）；
+  2. A1 `--r50_fdf drdac`：FDFUNet DRDAC 挂 R50 编码器四级——残差钩子 + fuse 零初始化恒等起步（**TF32 下不能让 x 过 eye 恒等 conv**：cuDNN 会把输入激活舍入到 10-bit 尾数，1.0×TF32(x)≠x，四级复累 → logits 差 O(1)；残差 + 零初始化 0×任何值=0 与 DDBE 同型、逐位精确，坑已记 pitfalls.md）；
+  3. A2 `--r50_fdf drdac_mfdf`：+ 编码器四级/解码器四级 FEM（MFDF only，论文口径 inline 不包 γ；编码器 block1 挂载点 55²/256——TransUNet 的 padding hack 在挂载点之后，FEM 按 (256,55,55) 注册；非恒等属预期）；
+  4. A3 `--r50_fdf full`：FEM 开 ASCA（FDFUNet 完整三模块组）；
+  5. FGR `--fgr 1`：自研频门改写（拉普拉斯频带 + FcaNet 式 DCT 谱门 + 1×1 改写，门只作用频带支保证 fuse 零初始化精确恒等起步），挂解码器四级。
+  统一 §5 R50 协议（200ep / SGD 0.01 / bs4+ga2 / seed 1234），判定 |ΔDice| ≥ 0.5 或 HD95 降 ≥ 0.1，对照 A0=90.4903 / ASSD 0.14473 / HD95 0.41634。快照：`*_SPARC_{ddbe4_ddhfplain,r50fdf_dr,r50fdf_mf,r50fdf_full,fgr}_c2d`。实现：train.py `--r50_fdf/--fgr` 与互斥校验、[networks/fgr.py](../networks/fgr.py)（新）、[networks/vit_seg_modeling.py](../networks/vit_seg_modeling.py) 挂载块、[networks/vit_seg_modeling_resnet_skip.py](../networks/vit_seg_modeling_resnet_skip.py) 钩子、冒烟 [scripts/smoke_r50_fdf.py](../scripts/smoke_r50_fdf.py)（全绿：恒等/参数量/预训练加载）。
+  **收口（2026-11-10 00:57，exit 0×5）**：CTL 90.5505（+0.060，plain ≈ 噪声 → DDBE 增益归因频率内容）；A1 90.5246（+0.034）；A2 90.1181（−0.372）；A3 90.2999（−0.190）——FDFUNet 渐进整体判负；FGR **90.7955 / 0.13912 / HD 0.69732**（+0.305，三项同向，未过线、列为多 seed 复核候选）。详见 results.md §5(12)–(16)。
+

@@ -478,9 +478,9 @@ class UNetWMREN(nn.Module):
             raise ValueError('unknown wave_op: %r' % (wave_op,))
         if ablate == 'unet_enc' and wave_op != 'haar':
             raise ValueError('wave_op only applies to WRMM, not to unet_enc')
-        if enc not in ('wrmm', 'r50', 'r50deep', 'r50wrmm'):
+        if enc not in ('wrmm', 'r50', 'r50deep', 'r50wrmm', 'r50seq'):
             raise ValueError('unknown enc: %r' % (enc,))
-        if enc in ('r50', 'r50wrmm') and ablate == 'unet_enc':
+        if enc in ('r50', 'r50wrmm', 'r50seq') and ablate == 'unet_enc':
             raise ValueError('enc=%s 的浅层是 R50，没有 WRMM 可换' % enc)
         if enc == 'r50' and (ablate in ('no_wave', 'no_gate', 'no_mlkm')
                              or no_wave or no_gate or no_mlkm):
@@ -531,6 +531,23 @@ class UNetWMREN(nn.Module):
             self.r50 = ResNetV2(block_units=(3, 4, 6), width_factor=1, in_channels=3)
             self.r50_proj = nn.Conv2d(l1c, l2c, kernel_size=1, bias=False)
             self.wrmm1 = WRMM(l2c, l2c, ablate=wr_ablate, wave_op=wave_op, stride=1)
+            self.wrmm2 = WRMM(l3c, l3c, ablate=wr_ablate, wave_op=wave_op, stride=1)
+            self.wrmm3 = WRMM(l4c, l4c, ablate=wr_ablate, wave_op=wave_op, stride=1)
+            self.wrmm4 = WRMM(l5c, l5c, hidden=l4c, ablate=wr_ablate,
+                              wave_op=wave_op, stride=1)
+        elif enc == 'r50seq':
+            # R50 + WRMM 串行（与 r50wrmm 的差别只在接线）：
+            #   r50wrmm：R50 四级并联，各级 WRMM 只精炼「本级 skip」，R50 的下一级
+            #            看到的仍是原始 R50 特征（WRMM 输出不进 R50）。
+            #   r50seq ：WRMM 插进 R50 的前向主链——WRMM1 的输出既做 112² skip，
+            #            又送进 block1；WRMM2 的输出送进 block2；依此类推。
+            # 通道对齐：R50 的 block1 入口是 64 通道，故 WRMM1 必须是 64→64（隐层 64），
+            # 112² 的 skip 再单独用 1×1 升到 128 供解码器使用；后三级 WRMM 与 R50
+            # 各级输出同形（256/512/1024），可直接串行。
+            self.stem = nn.Identity()
+            self.r50 = ResNetV2(block_units=(3, 4, 6), width_factor=1, in_channels=3)
+            self.r50_proj = nn.Conv2d(l1c, l2c, kernel_size=1, bias=False)
+            self.wrmm1 = WRMM(l1c, l1c, ablate=wr_ablate, wave_op=wave_op, stride=1)
             self.wrmm2 = WRMM(l3c, l3c, ablate=wr_ablate, wave_op=wave_op, stride=1)
             self.wrmm3 = WRMM(l4c, l4c, ablate=wr_ablate, wave_op=wave_op, stride=1)
             self.wrmm4 = WRMM(l5c, l5c, hidden=l4c, ablate=wr_ablate,
@@ -605,6 +622,24 @@ class UNetWMREN(nn.Module):
             x3 = self.wrmm2(feats[1])                      # 56²/256
             x4 = self.wrmm3(feats[0])                      # 28²/512
             x5 = self.wrmm4(x5)                            # 14²/1024
+        elif self.enc_name == 'r50seq':
+            # R50 主干逐级手动推进，WRMM 串在两级之间（WRMM 输出既是 skip 又是下一级输入）。
+            # 与 ResNetV2.forward 等价：maxpool 后 112²→55²，block1 是 stride1 仍 55²，
+            # 原实现用零填充补到 56²，这里用 F.pad 复现同一补齐。
+            xr = x if x.shape[1] == 3 else x.repeat(1, 3, 1, 1)
+            r = self.r50.root(xr)                          # 112²/64
+            w1 = self.wrmm1(r)                             # 112²/64
+            x2 = self.r50_proj(w1)                         # 112²/128（skip）
+            p = F.max_pool2d(r, kernel_size=3, stride=2, padding=0)   # 55²/64
+            y = self.r50.body[0](p)                        # block1 → 55²/256
+            pad = 56 - y.size(2)
+            if pad > 0:
+                y = F.pad(y, (0, pad, 0, pad))
+            x3 = self.wrmm2(y)                             # 56²/256（skip → block2）
+            y = self.r50.body[1](x3)                       # block2 → 28²/512
+            x4 = self.wrmm3(y)                             # 28²/512（skip → block3）
+            y = self.r50.body[2](x4)                       # block3 → 14²/1024
+            x5 = self.wrmm4(y)                             # 14²/1024（瓶颈）
         else:
             x1 = self.stem(x)                              # 224²/64（不参与 skip）
             x2 = self.wrmm1(x1)                            # 112²/128

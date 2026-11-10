@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from networks.asr import ASR
 from networks.ddbe import ACAM, DDBE
+from networks.fgr import FGR
 from networks.wavelet import build_edge_map
 
 
@@ -199,7 +200,7 @@ class UNet(nn.Module):
 
     def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
                  wavelet_basis="haar", ddbe_level=0, acam=False, asr=False,
-                 ddbe_hf_op="haar"):
+                 ddbe_hf_op="haar", fgr=False, fgr_mode="whole"):
         super(UNet, self).__init__()
         l1c, l2c, l3c, l4c, l5c = 64, 128, 256, 512, 1024
         # edge_in：stem 多吃一张边缘图（与 TransUNet edge_in 同一算子、同一 λ=0 口径）
@@ -232,16 +233,15 @@ class UNet(nn.Module):
         # BDFR-Net 式解码器改造（与 baseline 的 --ddbe/--acam 同语义）：
         # 解码器四级按 28²/512 → 56²/256 → 112²/128 → 224²/64 编号，
         # ddbe_level=1~3 只挂单级，4 = 四级全挂；acam 对每级 skip 做跨级对齐。
+        # DDBE/FGR 模块在下方 init_kaiming 之后创建（RNG 对齐纪律：pitfalls 3
+        # 「DDBE 挂载时机太早」——同 seed 基础权重与不挂载版本逐位一致）。
         dec_chs = (l4c, l3c, l2c, l1c)
         self.ddbe_modules = None
-        if ddbe_level:
-            if ddbe_level == 4:
-                self.ddbe_modules = nn.ModuleList([DDBE(c, hf_op=ddbe_hf_op) for c in dec_chs])
-            else:
-                modules = [nn.Identity() for _ in dec_chs]
-                modules[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1], hf_op=ddbe_hf_op)
-                self.ddbe_modules = nn.ModuleList(modules)
+        self.fgr_modules = None
         self.acams = nn.ModuleList([ACAM(c, c) for c in dec_chs]) if acam else None
+        # 解码器 skip 汇合点的融合模块（ABF）：由 train.py 在权重初始化之后挂，
+        # 保证同 seed 的基础权重与基线逐位对齐
+        self.egf = None
         # ASR（WeaveSeg ICCV 2025）：把解码器前三级的上采样算子原地替换成
         # 1×1+BN+ReLU 通道对齐 → ASR(低分辨率特征, 同通道 skip)，模块名不变。
         self.asr_levels = ()
@@ -254,12 +254,22 @@ class UNet(nn.Module):
                 c_in, c_out = dec_pairs[level]
                 setattr(self, up_names[level], asr_up(c_in, c_out))
         init_kaiming(self)
-        # init_kaiming 会覆盖 DDBE.fuse 的零初始化，这里恢复（保证同 seed 与基线等价起步）
-        if self.ddbe_modules is not None:
-            for module in self.ddbe_modules.modules():
-                if isinstance(module, DDBE):
-                    nn.init.zeros_(module.fuse.weight)
-                    nn.init.zeros_(module.fuse.bias)
+        # 挂载模块在全部基础权重初始化之后建（RNG 对齐纪律，与 baseline 侧 L572 同型）：
+        # DDBE 内部 conv 保留 PyTorch 默认初始化（与 R50 侧 DDBE 一致），fuse 本身
+        # 在 DDBE.__init__ 已零初始化且不再被 init_kaiming 覆盖，恒等起步自然成立。
+        # FGR 同理：fuse 零初始化、gate bias 2.0，挂载次序与 baseline（ddbe→fgr）一致。
+        if ddbe_level:
+            if ddbe_level == 4:
+                self.ddbe_modules = nn.ModuleList([DDBE(c, hf_op=ddbe_hf_op) for c in dec_chs])
+            else:
+                modules = [nn.Identity() for _ in dec_chs]
+                modules[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1], hf_op=ddbe_hf_op)
+                self.ddbe_modules = nn.ModuleList(modules)
+        if fgr:
+            # fgr_mode：whole = 单核改写 [hf,lf]（原 FGR）；band = 双零核并联分带（FBGR）
+            self.fgr_modules = nn.ModuleList(
+                [FGR(c, s, s, mode=fgr_mode)
+                 for c, s in zip(dec_chs, (28, 56, 112, 224))])
 
     def _up(self, level, feat, skip):
         """单级上采样：该级挂了 ASR 就用 ASR(feat, skip)，否则用原 up_conv"""
@@ -268,13 +278,30 @@ class UNet(nn.Module):
             return ups[level](feat, skip)
         return ups[level](feat)
 
+    def attach_edge_fusion(self, kind="abf", init_gamma=0.1):
+        """在四级 skip 汇合点挂 ABF（非对称频带融合）。
+
+        弱骨干版配置：speckle=True（斑点噪声衰减）+ large_kernel=True（depthwise 7×7
+        补感受野）。kind='abftied' 为参数完全匹配的对照（α_H = −α_L，退化单门控）。
+        """
+        from .edge_fusion import AsymBandFusion
+        chans = (512, 256, 128, 64)   # 28²/512、56²/256、112²/128、224²/64
+        self.egf = nn.ModuleList([
+            AsymBandFusion(c, speckle=True, large_kernel=True,
+                           tied=(kind == "abftied"), init_gamma=init_gamma)
+            for c in chans])
+
     def _decode(self, up, skip, fuse, level):
-        """单级解码：ACAM 对齐 skip → concat → DBB →（可选）DDBE。"""
+        """单级解码：ABF → ACAM 对齐 skip → concat → DBB → DDBE → FGR（与 baseline 同序）。"""
+        if self.egf is not None:
+            skip = self.egf[level](skip, up)
         if self.acams is not None:
             skip = self.acams[level](skip, up)
         out = fuse(torch.cat([up, skip], dim=1))
         if self.ddbe_modules is not None:
             out = self.ddbe_modules[level](out)
+        if self.fgr_modules is not None:
+            out = self.fgr_modules[level](out)
         return out
 
     def forward(self, x):

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .wavelet import haar_dwt_channels
+from .wavelet import haar_dwt_channels, laplacian_split_channels, laplacian_pyramid_channels
 
 
 def _bottleneck(channels, reduction):
@@ -77,10 +77,18 @@ class CBAMv2(nn.Module):
 
 
 class DDBEv2(nn.Module):
-    """Eq.(1)–(6)：ECA → {HF, LF, CTX} 三支 → cat → φ1 → CBAM，输出无残差"""
+    """DDBE 块 = ECA（Eq.1）+ 双域解耦与融合（Eq.2–6）。
 
-    def __init__(self, channels, reduction=16):
+    注意 ECA 不是独立组件：论文 Eq.1 先对特征做 ECA 通道重标定，再进入高低频分解，
+    因此本模块的开关必须整体开关，不能只去掉分解而保留 ECA。
+    """
+
+    def __init__(self, channels, reduction=16, wave_op='haar'):
         super(DDBEv2, self).__init__()
+        # wave_op：把论文的 Haar 分解换成别的基，只改 HF/LF 的取法，其余 Eq.(1)–(6) 不变
+        if wave_op not in ('haar', 'lap', 'pyr'):
+            raise ValueError('wave_op 只支持 haar/lap/pyr，收到 %r' % (wave_op,))
+        self.wave_op = wave_op
         self.eca = ECAv2(channels, reduction)
         # HF 支：cat(LH,HL,HH) 3C→C → B → δ → 3×3 → 转置卷积 → CE
         self.hf_proj = nn.Conv2d(3 * channels, channels, 1, bias=False)
@@ -103,7 +111,12 @@ class DDBEv2(nn.Module):
 
     def forward(self, x):
         f_eca = self.eca(x)
-        ll, details = haar_dwt_channels(f_eca)
+        if self.wave_op == 'lap':
+            ll, details = laplacian_split_channels(f_eca)
+        elif self.wave_op == 'pyr':
+            ll, details = laplacian_pyramid_channels(f_eca)
+        else:
+            ll, details = haar_dwt_channels(f_eca)
 
         hf = self.hf_proj(torch.cat(details, dim=1))
         hf = F.relu(self.hf_bn(hf), inplace=True)
