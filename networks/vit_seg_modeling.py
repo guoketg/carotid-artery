@@ -384,6 +384,10 @@ class DecoderCup(nn.Module):
         # FEM（--r50_fdf 解码器四级）/ FGR（--fgr）：同样由 VisionTransformer 最后挂载
         self.fem_dec = None
         self.fgr_all = None
+        # FreqDINO 移植（--fd_mfea / --fd_fgbr）：四级全挂（28²/256 → 56²/128 →
+        # 112²/64 → 224²/16），每级独立实例；同样最后挂载保证 RNG 对齐
+        self.fd_mfea = None
+        self.fd_fgbr = None
 
     def attach_edge_fusion(self, gate_mode="spatial", init_gamma=0.0, kind="rel", depth=1):
         """在全部基础权重初始化之后挂边缘融合模块（保证同 seed 的基础权重逐位对齐）。
@@ -455,6 +459,10 @@ class DecoderCup(nn.Module):
                 x = self.fem_dec[i](x)
             if self.fgr_all is not None:
                 x = self.fgr_all[i](x)
+            if self.fd_mfea is not None:
+                x = self.fd_mfea[i](x)
+            if self.fd_fgbr is not None:
+                x = self.fd_fgbr[i](x)
             if aux is not None and i in (0, 1):
                 aux.append(x)      # 28² / 256（block0 后）、56² / 128（block1 后）
         if aux is not None:
@@ -539,7 +547,8 @@ class VisionTransformer(nn.Module):
                  ddbe_hf_op="haar", hf_branch=False, hf_lambda=0.3,
                  bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
                  ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
-                 edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole"):
+                 edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole",
+                 fd_mfea=False, fd_fgbr=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -641,6 +650,15 @@ class VisionTransformer(nn.Module):
             self.decoder.fgr_all = nn.ModuleList([
                 FGR(c, s, s, mode=fgr_mode)
                 for c, s in zip(config.decoder_channels, (28, 56, 112, 224))])
+        if fd_mfea or fd_fgbr:
+            from .freqdino import MFEA, FGBR
+            # 四级全挂：每级一个独立实例，通道跟着解码器分级走
+            if fd_mfea:
+                self.decoder.fd_mfea = nn.ModuleList(
+                    [MFEA(c) for c in config['decoder_channels']])
+            if fd_fgbr:
+                self.decoder.fd_fgbr = nn.ModuleList(
+                    [FGBR(c) for c in config['decoder_channels']])
         if edge_fusion:
             # 最后再挂 R-GEF：消耗 RNG 在所有基础权重之后，同 seed 与基线逐位对齐
             self.decoder.attach_edge_fusion(edge_gate, init_gamma=edge_gamma, kind=edge_kind,

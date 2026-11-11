@@ -235,6 +235,14 @@ parser.add_argument('--fgr_mode', choices=['whole', 'band'], default='whole',
                     help='--fgr 1 时的改写核档位：whole = 单枚 2C→C 核搅两带（原 FGR）；'
                          'band = 高低频各一枚 C→C 零核并联（FBGR 分带档，R50 上解决'
                          'FGR 与 DDBE 同点串联互覆的算子同型问题）')
+# ---- FreqDINO（arXiv 2512.11335）移植批：MFEA / FGBR 四级全挂解码器输出 ----
+parser.add_argument('--fd_mfea', type=int, default=0,
+                    help='1 = 解码器四级（28²/256→224²/16）全挂 MFEA：两级 Haar 分解 + '
+                         '边界/结构通道注意力改写，λ=0.3、α=β=0.5，γ 零初始化恒等起步')
+parser.add_argument('--fd_fgbr', type=int, default=0,
+                    help='1 = 同四级全挂 FGBR：两级高频逐级降维出 8×min(64,C) 维边界原型，'
+                         'Q 来自空间特征、K/V 来自原型（8 头×min(128,C) 维，ω=0.2），'
+                         'W_O 零初始化恒等起步')
 # ---- CCFR（ESWA-D-25-34301）两阶段训练 ----
 parser.add_argument('--ccfr_stage', type=str, default='both', choices=['both', '1', '2'],
                     help='both = 先训 EA-Net 再训 flow；1 = 只训 EA-Net；2 = 只训 flow（须给 --ccfr_stage1_ckpt）')
@@ -295,6 +303,15 @@ if args.fgr:
                      '--ddbe 允许组合 = FGR+DDBE 双模块臂，同点串联 ddbe→fgr）')
 if args.fgr_mode != 'whole' and not args.fgr:
     parser.error('--fgr_mode 只在 --fgr 1 时有效（没有 FGR 就没有档位）')
+if args.fd_mfea or args.fd_fgbr:
+    # 只接 TransUNet 解码器（--arch baseline）；且与其它解码器改写/融合臂互斥，
+    # 保证移植批每个臂只变一个模块
+    if args.arch != 'baseline':
+        parser.error('--fd_mfea/--fd_fgbr 目前只接了 baseline（R50-TransUNet 解码器）')
+    if (args.fgr or args.ffusion or args.bdfr_v2 or args.edge_fusion != 'none'
+            or args.r50_fdf != 'none'):
+        parser.error('--fd_mfea/--fd_fgbr 与 --fgr/--ffusion/--bdfr_v2/--edge_fusion/'
+                     '--r50_fdf 互斥（单模块移植批只变一个变量）')
 if args.bdfr_v2 and args.arch != 'baseline':
     parser.error('--bdfr_v2 只接了 TransUNet 解码器（--arch baseline）')
 if args.bdfr_v2 and (args.ddbe or args.acam):
@@ -510,6 +527,10 @@ if __name__ == "__main__":
         if args.fgr:
             # whole 沿用历史段名 _fgr；band 是新算子档（FBGR），必须分目录
             snapshot_path += '_fgr' if args.fgr_mode == 'whole' else '_fgrb'
+        if args.fd_mfea:
+            snapshot_path += '_fdmfea'
+        if args.fd_fgbr:
+            snapshot_path += '_fdfgbr'
         if args.domain_loss:
             # 损失口径不同必须分目录，否则与 0.5CE+0.5Dice 的权重混在一起
             snapshot_path += '_dl'
@@ -740,7 +761,8 @@ if __name__ == "__main__":
                       edge_depth=args.edge_depth,
                       edge_gamma=args.edge_gamma,
                       r50_fdf=args.r50_fdf, fgr=bool(args.fgr),
-                      fgr_mode=args.fgr_mode).cuda()
+                      fgr_mode=args.fgr_mode,
+                      fd_mfea=bool(args.fd_mfea), fd_fgbr=bool(args.fd_fgbr)).cuda()
     if args.arch != 'ccfr' and not args.no_pretrain:
         if args.arch == 'wmren' and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm', 'r50seq'):
             # wmren 的 load_from 是空操作（WRMM 无可迁移形状）；R50 编码器臂单独吃 R50 那部分权重
