@@ -12,11 +12,9 @@ local/
 *.key
 *.dpapi
 
-# 图像/文档产物：除 docs/assets 下的文档插图外一律不进仓库
-# （避免有人把带病人标识的中间图随手丢进仓库；docs/assets 下的是已脱敏的论文插图）
+# 图像/文档产物一律不进仓库（PNG/PDF 都不上传 GitHub，仅保留在本地）
 *.pdf
 *.png
-!docs/assets/**/*.png
 !docs/assets/**/*.pdf
 
 # 论文全文提取文本，版权内容不入库
