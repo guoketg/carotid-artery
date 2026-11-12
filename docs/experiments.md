@@ -12,7 +12,7 @@
 | 输入 | 224×224；基线单通道灰度 repeat 3 通道；变体按需加通道（边缘图 / 方向子带） |
 | 训练 | `--batch_size 4 --grad_accum 2`（等效 bs8）；`--max_epochs 200`（poly 衰减总长绑死）；`--eval_test_every 5` |
 | 优化 | SGD，lr 0.01，momentum 0.9，wd 1e-4；loss = 0.5·CE + 0.5·Dice |
-| 预训练 | R50 + ViT-B_16（ImageNet21k）；ResNet 一律加载预训练，不设随机初始化对照 |
+| 预训练 | R50 + ViT-B_16（ImageNet21k）；默认全部加载预训练。`--no_pretrain 1` 只作归因对照（V-N1 基线 89.59；DDBE/FGR 的随机初始化归因批见 status.md §2） |
 | 读数 | 终点 ep200：`test_curve.csv` 末行，或 `epoch_199.pth` 重推理 |
 | 指标 | Dice / ASSD / HD / DeltaArea；ASSD、HD 单位 mm，只用 HD 不用 HD95 |
 | 判定 | 主看 ASSD / HD，两项方向一致才认边界改善；\|ΔDice\| ≥ 0.5% 或 HD 降 ≥ 0.1 mm 才算有效 |
