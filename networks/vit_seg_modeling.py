@@ -13,6 +13,7 @@ def pjoin(*args):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
@@ -331,6 +332,36 @@ class SegmentationHead(nn.Sequential):
         super().__init__(conv2d, upsampling)
 
 
+class FullResEvidenceHead(nn.Module):
+    """224² 全分辨率证据支路：把原图的多尺度局部统计量接到解码器最细一级。
+
+    解码器末级（224²/16ch）既无 skip、也不接触原图，最细图像证据只到 112²。
+    本模块在该级补 4 个原图派生通道（I / 5×5 均值 / 21×21 均值 / 9×9 局部标准差），
+    输出 logits 残差；末层零初始化 → 起点与基线逐位等价。
+    """
+
+    def __init__(self, dec_ch, num_classes=2, mid_ch=16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(dec_ch + 4, mid_ch, 3, padding=1, bias=False)
+        self.norm1 = nn.BatchNorm2d(mid_ch)
+        self.conv2 = nn.Conv2d(mid_ch, mid_ch, 3, padding=1, bias=False)
+        self.norm2 = nn.BatchNorm2d(mid_ch)
+        self.conv3 = nn.Conv2d(mid_ch, num_classes, 1)
+        nn.init.zeros_(self.conv3.weight)
+        nn.init.zeros_(self.conv3.bias)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x, img):
+        m5 = F.avg_pool2d(img, 5, 1, 2)
+        m21 = F.avg_pool2d(img, 21, 1, 10)
+        avg9 = F.avg_pool2d(img, 9, 1, 4)
+        var9 = F.avg_pool2d(img * img, 9, 1, 4) - avg9 * avg9
+        s9 = torch.sqrt(var9.clamp_min(1e-6))
+        h = self.act(self.norm1(self.conv1(torch.cat([x, img, m5, m21, s9], dim=1))))
+        h = self.act(self.norm2(self.conv2(h)))
+        return self.conv3(h)
+
+
 class DecoderCup(nn.Module):
     def __init__(self, config, ffusion=False, edge_fusion=False, edge_gate="spatial"):
         super().__init__()
@@ -548,7 +579,7 @@ class VisionTransformer(nn.Module):
                  bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
                  ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
                  edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole",
-                 fd_mfea=False, fd_fgbr=False):
+                 fd_mfea=False, fd_fgbr=False, head_hr=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -663,6 +694,11 @@ class VisionTransformer(nn.Module):
             # 最后再挂 R-GEF：消耗 RNG 在所有基础权重之后，同 seed 与基线逐位对齐
             self.decoder.attach_edge_fusion(edge_gate, init_gamma=edge_gamma, kind=edge_kind,
                                             depth=edge_depth)
+        self.hr_head = None
+        if head_hr:
+            # 最后创建：RNG 消耗在全部基础权重之后，同 seed 与基线逐位对齐
+            self.hr_head = FullResEvidenceHead(config['decoder_channels'][-1],
+                                               config['n_classes'])
 
     def forward(self, x):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
@@ -692,6 +728,9 @@ class VisionTransformer(nn.Module):
                         fa[0][0] + self.hf_inject[0](fa[0][1])]   # 64@112
         x = self.decoder(x, features)
         logits = self.segmentation_head(x)
+        if self.hr_head is not None:
+            # 224² 级补原图全分辨率证据（I/5×5 均值/21×21 均值/9×9 局部标准差）
+            logits = logits + self.hr_head(x, x_in[:, :1])
         return logits
 
     def load_from(self, weights):

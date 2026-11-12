@@ -248,6 +248,25 @@ def trainer_synapse(args, model, snapshot_path):
             l_ce = ce_loss(out, label[:].long())
             return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
                     + 0.5 * boundary(out, label)), l_ce
+    elif loss_name == 'farfp':
+        from utils import far_fp_loss
+        far_w = float(getattr(args, 'far_w', 0.1))
+        far_margin = int(getattr(args, 'far_margin', 10))
+
+        def seg_loss(out, label):
+            """损失改进 A：0.5CE+0.5Dice + far_w·远处假阳性项（单独归因 HD 尾部）。"""
+            l_ce = ce_loss(out, label[:].long())
+            return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
+                    + far_w * far_fp_loss(out, label, margin=far_margin)), l_ce
+    elif loss_name == 'bndsoft':
+        from utils import boundary_soft_ce
+        bnd_eps = float(getattr(args, 'bnd_eps', 0.25))
+        bnd_radius = int(getattr(args, 'bnd_radius', 1))
+
+        def seg_loss(out, label):
+            """损失改进 C：边界带软标签 CE + 硬 Dice（单变量降低歧义带监督强度）。"""
+            l_ce = boundary_soft_ce(out, label, eps=bnd_eps, radius=bnd_radius)
+            return 0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True), l_ce
     elif loss_name in ('weave5', 'weave4'):
         # weave4 = 同一套五项里的 L_uncert 权重置 0，用来单变量判断不确定项本身值不值
         aux_loss = WeaveSegFiveTermLoss(

@@ -128,6 +128,31 @@ def _signed_distance(gt):
     return phi / float(max(g.shape))
 
 
+def boundary_soft_ce(logits, label, eps=0.25, radius=1):
+    """边界带软标签 CE：GT 边界带 ±radius 像素内的目标向 0.5 软化。
+
+    前景像素目标由 (1,0) 变为 (1-eps, eps)，背景像素由 (0,1) 变为 (eps, 1-eps)，
+    eps ∈ [0, 0.5]；eps=0.5 时带内目标恒为 (0.5, 0.5)。
+
+    动机（docs/low-score-samples.md §5）：低分误差集中在贴 GT 的 1 px 边界带，
+    该带梯度仅为全图均值的 1.9 倍，属标注歧义区。继续用硬标签逼模型贴合等于
+    放大标签噪声，故降低带内监督强度，把容量让给可学的内部与远端区域。
+
+    eps=0 时严格退化为普通交叉熵（冒烟脚本用该恒等性做校验）。
+    """
+    fg = (label > 0).float().unsqueeze(1)
+    dil = F.max_pool2d(fg, kernel_size=3, stride=1, padding=1)
+    ero = 1.0 - F.max_pool2d(1.0 - fg, kernel_size=3, stride=1, padding=1)
+    band = (dil - ero).clamp(0.0, 1.0)
+    for _ in range(int(radius) - 1):
+        band = F.max_pool2d(band, kernel_size=3, stride=1, padding=1)
+    soft = fg * (1.0 - eps) + (1.0 - fg) * eps
+    p_fg = torch.where(band > 0, soft, fg)
+    target = torch.cat([1.0 - p_fg, p_fg], dim=1)
+    logp = F.log_softmax(logits, dim=1)
+    return -(target * logp).sum(dim=1).mean()
+
+
 class BoundaryLoss(nn.Module):
     """Boundary Loss（Kervadec et al., MIDL 2019）：用 GT 有符号距离图给预测概率加权。
 

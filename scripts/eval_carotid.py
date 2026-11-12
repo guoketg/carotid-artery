@@ -74,7 +74,8 @@ def build_model(args):
     return VisionTransformer(config, img_size=args.img_size, num_classes=2,
                              edge_in=bool(args.edge_in), ddbe_level=args.ddbe,
                              acam=bool(args.acam), hf_branch=bool(args.hf_branch),
-                             hf_lambda=args.hf_lambda)
+                             hf_lambda=args.hf_lambda,
+                             head_hr=bool(getattr(args, "head_hr", 0)))
 
 
 def eval_ckpt(args):
@@ -197,6 +198,8 @@ def main():
     p.add_argument("--asr", type=int, default=0, help="1 = unet 解码器前三级挂 ASR，与 train.py 同义（仅 unet）")
     p.add_argument("--hf_branch", type=int, default=0, help="1 = GobletNet 式 HF 支 + FAM，与 train.py 同义（仅 baseline）")
     p.add_argument("--hf_lambda", type=float, default=0.3, help="HF 图低频回灌权重 λ，与 train.py 同义")
+    p.add_argument("--head_hr", type=int, default=0,
+                   help="1 = 解码器 224² 级接原图全分辨率证据支路，与 train.py 同义（仅 baseline）")
     p.add_argument("--fds", type=int, default=0, help="1 = 模型带三级 FDS 辅助头（仅 dual/split）")
     p.add_argument("--vit_name", default="R50-ViT-B_16")
     p.add_argument("--vit_layers", type=int, default=12, help="ViT 层数，与 train.py 同义")
