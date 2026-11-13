@@ -11,7 +11,16 @@
 #                          （低可分辨带降低监督强度，而不是提高权重）
 #   两条都不叠加 --domain_loss，保证与基线的单变量差异可归因。
 #
-# 对照：UNet 基线 86.55（..._SPARC_unet_c2d，口径见 docs/results.md）
+# 补充（2026-11-12）：D2（UNet + 完整领域损失 87.01 / HD 0.99）的 HD 改进归因。
+#   D2 同时改了四项，单靠 LFA 只能证明"远假阳项单独有没有用"，不能回答"0.15 的
+#   HD 降幅里有多少来自它"。故加两个从 D2 出发的单变量臂：
+#     AB-noFar  --domain_loss 1 --dl_far_w 0     （D2 去掉远假阳项）
+#     DL-far03  --domain_loss 1 --dl_far_w 0.3   （剂量响应，看 HD 是否随权重单调）
+#   判读：noFar 的 HD 若回到 ~1.14 → 该项是 D2 HD 增益的主因；若仍是 ~1.0
+#   → 增益来自边界带加权 CE / 面积项，L_far 只值 ASSD 那一点点。
+#
+# 对照：UNet 基线 86.55（..._SPARC_unet_c2d，口径见 docs/results.md）；
+#        D2 完整领域损失 87.01 / ASSD 0.202 / HD 0.99（..._SPARC_dl_unet_c2d，ep200）
 # 判定（§0 统一协议，HD 用 medpy 口径）：|ΔDice| >= 0.5 且 HD 同向，终点 ep200，单 seed 1234。
 # 筛选过线的胜者再单独搬到 R50 复验，不在本队列内。
 #
@@ -71,7 +80,14 @@ $jobs = @(
        snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_lfarfp_unet_c2d" },
     @{ n = "LBC"; tag = "unet_lbndsoft"
        a = @("--arch", "unet", "--loss", "bndsoft")
-       snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_lbndsoft_unet_c2d" }
+       snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_lbndsoft_unet_c2d" },
+    # ---- D2 归因：从完整领域损失出发的单变量消融 ----
+    @{ n = "AB-noFar"; tag = "unet_dl_nofar"
+       a = @("--arch", "unet", "--domain_loss", "1", "--dl_far_w", "0")
+       snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_dlL3.0R2A0.05F0.0M10_unet_c2d" },
+    @{ n = "DL-far03"; tag = "unet_dl_far03"
+       a = @("--arch", "unet", "--domain_loss", "1", "--dl_far_w", "0.3")
+       snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_dlL3.0R2A0.05F0.3M10_unet_c2d" }
 )
 
 foreach ($job in $jobs) {

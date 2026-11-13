@@ -1,4 +1,4 @@
-# 论文模块套件设计：频带改写家族的位置分工（2026-11-10）
+﻿# 论文模块套件设计：频带改写家族的位置分工（2026-11-10）
 
 配套代码：[networks/fgr.py](../networks/fgr.py)、[networks/wavelet.py](../networks/wavelet.py)（`laplacian_split_channels`）、
 挂载点 [networks/unet.py](../networks/unet.py#L260-L269)（unet）与 [networks/vit_seg_modeling.py](../networks/vit_seg_modeling.py#L636-L640)（R50 解码器）；
@@ -151,3 +151,41 @@ UNet 底座消融阶梯（每行都是已排期或已有数字）：
 - 不能说：FBGR 一定能吃到 DDBE 的分带收益（FBGR-U / FBGR-R50 在队）；
   HFE 与 FBGR 是否互补叠加（FULL-U 在队）。
 - 本设计不改判定协议、不加门、不新增空间轴算子，全部构件都有已跑通的代码路径。
+
+## 9. FGR 挂载位置研究 + 编码器融合 EFF（2026-11-13）
+
+**问题**：FGR 历史上固定在解码器四级输出，位置从未做同变量对照。三个候选面的语义不同：
+
+| 位置 | 改写的对象 | 是否影响编码主链 | 对照目的 |
+|---|---|---|---|
+| `dec`（历史） | 解码器每级 cat+DBB 之后的输出 | 否 | 已有 88.2484 / 0.19369 / HD 0.96818 |
+| `enc` | 编码器每级输出 x1..x4（改写后继续下采样，同时作 skip） | 是 | 频带内容进入编码主链值多少 |
+| `skip` | 只改写送进解码器的 skip 副本（主干用原特征） | 否 | 只改 skip 内容是否就够 |
+
+三臂参数增量都是 +2,788,160（Σ(8C²+3C)，C=64/128/256/512），不是容量对比；冒烟
+`scripts/smoke_fgr_pos_eff.py` 四臂 IDENTITY。
+
+**编码器融合 EFF（Encoder Frequency Fusion）**：把 FGR 的通道轴频率门控搬到编码器，并让
+频带支来自两个尺度（自顶向下级联，FPN 式）：
+
+```text
+ctx = Up(Conv1x1(deep))                       deep = 更深一级（y_{i+1}）
+y   = x_i + Fuse1x1( w ⊙ [hf(x_i), lf(ctx)] )
+w   = σ(Linear(DCT描述子([x_i, ctx])))         gate: 2C→2C
+```
+
+- 与 FGR 的唯一差异是频带内容来源：hf 取本级局部细节，lf 取深层上下文 ctx 的 Haar LL；
+  门仍是通道轴、逐位置改写，不含空间轴注意力（守则 4）。
+- 恒等起步：fuse 全零（唯一零点）+ gate bias 2.0；级联下 y_i ≡ x_i，整条阶梯不改变网络。
+- 参数量：proj C·C_deep + gate 4C²+2C + fuse 2C²+C = 8C²+3C，通道逐级翻倍时与解码器 FGR
+  的增量逐位相同（+2,788,160），论文里可直接与 FGR 对位。
+- 梯度链路（冒烟实测）：第 0 步 fuse 有梯度，1 步后 gate 非零，proj 经 lf 内容支路从一开始
+  就有梯度——不是「双重零冻死」。
+
+**队列** `queue_fgr_pos_eff.ps1`（2026-11-13 WMI 启动，3 job，SPARC s1234 bs4 ga2 ep200）：
+FGREnc（`_fgre`）、FGRSkip（`_fgrs`）、EFF（`_eff`），对照 unet+fgr 88.2484。
+判定不变：|ΔDice| ≥ 0.5 或 HD 降 ≥ 0.1 mm。
+
+- enc/skip > dec → 增益来自编码器侧频带内容，位置应前移；
+- 都低于 dec → 解码器输出点是最优接点（深层语义饱和前补细节）；
+- EFF > 同参数量的 dec FGR → 跨尺度内容（深层低频）比同尺度双频带更值。

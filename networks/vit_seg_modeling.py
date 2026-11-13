@@ -579,7 +579,7 @@ class VisionTransformer(nn.Module):
                  bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
                  ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
                  edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole",
-                 fd_mfea=False, fd_fgbr=False, head_hr=False):
+                 fd_mfea=False, fd_fgbr=False, head_hr=False, edge_branch=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -699,6 +699,17 @@ class VisionTransformer(nn.Module):
             # 最后创建：RNG 消耗在全部基础权重之后，同 seed 与基线逐位对齐
             self.hr_head = FullResEvidenceHead(config['decoder_channels'][-1],
                                                config['n_classes'])
+        # 边缘监督分支（共享编码器 + 独立的对称边缘解码器：第二个 DecoderCup +
+        # 2 类分割头）+ 最后创建，保证同 seed 的基础权重与不挂载版本逐位对齐。
+        self.edge_dec = None
+        self.edge_head = None
+        if edge_branch:
+            edge_cfg = copy.deepcopy(config)
+            edge_cfg['n_classes'] = 2
+            self.edge_dec = DecoderCup(edge_cfg)
+            self.edge_head = SegmentationHead(
+                in_channels=edge_cfg['decoder_channels'][-1],
+                out_channels=2, kernel_size=3)
 
     def forward(self, x):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
@@ -726,11 +737,17 @@ class VisionTransformer(nn.Module):
             features = [fa[2][0] + self.hf_inject[2](fa[2][1]),   # 512@28
                         fa[1][0] + self.hf_inject[1](fa[1][1]),   # 256@56
                         fa[0][0] + self.hf_inject[0](fa[0][1])]   # 64@112
+        x_enc = x  # 编码器输出 (B, n_patch, hidden)，供边缘分支复用
         x = self.decoder(x, features)
         logits = self.segmentation_head(x)
         if self.hr_head is not None:
             # 224² 级补原图全分辨率证据（I/5×5 均值/21×21 均值/9×9 局部标准差）
             logits = logits + self.hr_head(x, x_in[:, :1])
+        if self.edge_dec is not None:
+            # 边缘分支与主分割共享同一份编码特征（瓶颈 + R50 三级 skip），
+            # 但走独立的第二个解码器，输出 2 类边缘 logits（背景 / 边缘带）
+            edge = self.edge_head(self.edge_dec(x_enc, features))
+            return {"out": logits, "edge": edge}
         return logits
 
     def load_from(self, weights):

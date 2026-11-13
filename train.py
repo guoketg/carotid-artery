@@ -179,7 +179,7 @@ parser.add_argument('--fds', type=int, default=0,
 parser.add_argument('--loss', type=str, default='ce_dice',
                     choices=['ce_dice', 'ce_dice46', 'ce_dice_unc', 'weave5', 'weave4',
                              'bce_wiou', 'bce_iou_dice', 'focal', 'tversky', 'boundary',
-                             'farfp', 'bndsoft'],
+                             'farfp', 'bndsoft', 'cvartail', 'sw'],
                     help='ce_dice = 0.5CE+0.5Dice（§0 口径）；ce_dice46 = 论文 Eq.(14) 的 0.4CE+0.6Dice；'
                          'ce_dice_unc = Kendall 同方差不确定性加权 CE+Dice（初值等价 0.5/0.5，额外对照）；'
                          'weave5 = WeaveSeg Eq.(12) 五项损失 1.0Mask+0.5L_fg+0.5L_bg+0.3L_tri+1.0L_uncert；'
@@ -190,6 +190,19 @@ parser.add_argument('--loss', type=str, default='ce_dice',
                          'boundary = 0.5CE+0.5Dice+0.5Boundary（损失基线，均为 §0 其余口径不变）；'
                          'farfp = 0.5CE+0.5Dice+far_w·远处假阳性（对准 HD 尾部）；'
                          'bndsoft = 边界带软标签 CE + 硬 Dice（降低低可分辨带的监督强度）')
+parser.add_argument('--sw_mode', type=str, default='', choices=['', 'echo', 'cnr', 'both'],
+                    help='配合 --loss sw：样本级损失权重的来源。'
+                         'echo = 低回声 1.2 / 高回声 0.8（train 上 rel_echo 一维 k-means 二分）；'
+                         'cnr = 边界低对比度 1.2 / 高对比度 0.8（train 三分位）；'
+                         'both = 两者相乘后 clip 到 [0.6, 1.8]')
+parser.add_argument('--sw_file', type=str, default='',
+                    help='样本权重表路径；默认 logs/analysis/sample_weights_<subset>_<sw_mode>.csv')
+parser.add_argument('--tl_w', type=float, default=0.1,
+                    help='cvartail 的尾部项权重；与 0.5CE+0.5Dice 同量级')
+parser.add_argument('--tl_q', type=float, default=0.1,
+                    help='cvartail 的 CVaR 分位比例（0.1 = 最差 10%% 像素；1.0 退化为均值型）')
+parser.add_argument('--tl_area_w', type=float, default=0.05,
+                    help='cvartail 的面积一致性项权重（对齐预测与标签的前景面积，抑制 DeltaArea 漂移）')
 parser.add_argument('--fdfunet_variant', type=str, default='full', choices=['full', 'unetstar'],
                     help='full = 完整 FDFUNet（DRDAC + MFDF + ASCA）；unetstar = 论文同构基线 UNet*')
 parser.add_argument('--fdfunet_ablate', type=str, default='',
@@ -240,13 +253,22 @@ parser.add_argument('--r50_fdf', type=str, default='none', choices=['none', 'drd
                          'drdac_mfdf = +编码/解码各四级 FEM（MFDF only）；'
                          'full = FEM 开 ASCA（完整模块组）。全部外加不替换')
 parser.add_argument('--fgr', type=int, default=0,
-                    help='1 = 解码器四级挂 FGR（拉普拉斯频带 + FcaNet 式 DCT 谱门 + '
-                         '1×1 改写，fuse 零初始化恒等起步；「只有频带内容 + 轻门控」，'
-                         '与 ddbectl/plain 构成双向归因对照）')
+                    help='1 = 挂 FGR（拉普拉斯频带 + FcaNet 式 DCT 谱门 + 1×1 改写，'
+                         'fuse 零初始化恒等起步；位置由 --fgr_pos 决定，默认解码器四级；'
+                         '「只有频带内容 + 轻门控」，与 ddbectl/plain 构成双向归因对照）')
 parser.add_argument('--fgr_mode', choices=['whole', 'band'], default='whole',
                     help='--fgr 1 时的改写核档位：whole = 单枚 2C→C 核搅两带（原 FGR）；'
                          'band = 高低频各一枚 C→C 零核并联（FBGR 分带档，R50 上解决'
                          'FGR 与 DDBE 同点串联互覆的算子同型问题）')
+parser.add_argument('--fgr_pos', choices=['dec', 'enc', 'skip'], default='dec',
+                    help='--fgr 1 时的挂载位置（2026-11-13 位置研究）：dec = 解码器'
+                         '四级输出（历史位置）；enc = 编码器主干四级输出（改写后继续'
+                         '下采样并作 skip）；skip = 只改写送进解码器的 skip 副本。'
+                         'enc/skip 目前只接 --arch unet')
+parser.add_argument('--eff', type=int, default=0,
+                    help='1 = 编码器跨尺度频率融合 EFF（自顶向下级联：hf(x_i) + '
+                         'lf(深层上下文)，通道轴频率门控改写，fuse 零初始化恒等起步；'
+                         '只接 --arch unet，与 --fgr/--ddbe 等单变量互斥）')
 # ---- FreqDINO（arXiv 2512.11335）移植批：MFEA / FGBR 四级全挂解码器输出 ----
 parser.add_argument('--fd_mfea', type=int, default=0,
                     help='1 = 解码器四级（28²/256→224²/16）全挂 MFEA：两级 Haar 分解 + '
@@ -259,6 +281,13 @@ parser.add_argument('--fd_fgbr', type=int, default=0,
 parser.add_argument('--head_hr', type=int, default=0,
                     help='1 = 解码器 224² 级接原图全分辨率证据支路（I / 5×5 均值 / 21×21 均值 / '
                          '9×9 局部标准差 4 通道 → 两层 3×3 → logits 残差，末层零初始化恒等起步）')
+parser.add_argument('--edge_branch', type=int, default=0,
+                    help='1 = 边缘监督分支：编码器共享、解码器两个（主分割 + 对称边缘解码器）。'
+                         '边缘标签由原 GT 掩膜经 --edge_kernel 形态学梯度（dilate−erode）得到，'
+                         '边缘项与主分割同形式同权重（同一 seg_loss，--edge_branch_w 默认 1.0）；'
+                         '主分割输出/损失/评估口径不变。只接 unet 与 baseline')
+parser.add_argument('--edge_branch_w', type=float, default=1.0,
+                    help='边缘分支监督权重，默认 1.0 = 与主分割完全同权（--edge_w 仍是 CCFR Stage1 的 0.4 口径）')
 # ---- CCFR（ESWA-D-25-34301）两阶段训练 ----
 parser.add_argument('--ccfr_stage', type=str, default='both', choices=['both', '1', '2'],
                     help='both = 先训 EA-Net 再训 flow；1 = 只训 EA-Net；2 = 只训 flow（须给 --ccfr_stage1_ckpt）')
@@ -313,12 +342,24 @@ if args.r50_fdf != 'none':
                      '（A.7 组合协同单独成臂，不与已有模块纠缠）')
 if args.fgr:
     if args.arch not in ('baseline', 'unet'):
-        parser.error('--fgr 只接了 baseline/unet（解码器四级输出改写）')
+        parser.error('--fgr 只接了 baseline/unet（解码器四级输出改写；unet 可用 --fgr_pos）')
     if args.arch == 'baseline' and (args.bdfr_v2 or args.ffusion):
         parser.error('--fgr 与 --bdfr_v2/--ffusion 互斥（同为解码器改写面；'
                      '--ddbe 允许组合 = FGR+DDBE 双模块臂，同点串联 ddbe→fgr）')
 if args.fgr_mode != 'whole' and not args.fgr:
     parser.error('--fgr_mode 只在 --fgr 1 时有效（没有 FGR 就没有档位）')
+if args.fgr_pos != 'dec':
+    if not args.fgr:
+        parser.error('--fgr_pos 只在 --fgr 1 时有效（没有 FGR 就没有位置）')
+    if args.arch != 'unet':
+        parser.error('--fgr_pos enc/skip 目前只接了 unet（baseline 仍是解码器位置）')
+if args.eff:
+    if args.arch != 'unet':
+        parser.error('--eff 只接了 unet（编码器跨尺度融合）')
+    if (args.fgr or args.ddbe or args.acam or args.asr or args.bdfr_v2
+            or args.ffusion or args.edge_fusion != 'none'):
+        parser.error('--eff 与 --fgr/--ddbe/--acam/--asr/--bdfr_v2/--ffusion/'
+                     '--edge_fusion 互斥（位置/融合研究单变量臂）')
 if args.fd_mfea or args.fd_fgbr:
     # 只接 TransUNet 解码器（--arch baseline）；且与其它解码器改写/融合臂互斥，
     # 保证移植批每个臂只变一个模块
@@ -339,6 +380,11 @@ if args.head_hr:
             or args.r50_fdf != 'none' or args.fd_mfea or args.fd_fgbr):
         parser.error('--head_hr 与 --fgr/--ffusion/--bdfr_v2/--edge_fusion/--r50_fdf/'
                      '--fd_mfea/--fd_fgbr 互斥（单模块臂只变一个变量）')
+if args.edge_branch:
+    if args.arch not in ('unet', 'baseline'):
+        parser.error('--edge_branch 只接了 unet 与 baseline（R50-TransUNet）')
+    if args.edge_branch_w <= 0:
+        parser.error('--edge_branch 需要 --edge_branch_w > 0（否则边缘分支不收监督）')
 if args.bdfr_wave_op != 'haar' and not args.bdfr_v2:
     parser.error('--bdfr_wave_op 只作用于 --bdfr_v2 1 的 DDBEv2（v1 请用 --ddbe_hf_op）')
 if args.ffusion and args.arch != 'baseline':
@@ -376,13 +422,20 @@ if args.fds and args.arch not in ('dual', 'split'):
     parser.error('--fds 只接了 dual/split 的解码器（baseline/unet 的解码器未挂三级辅助头）')
 if args.loss == 'bce_wiou' and args.arch not in ('baseline', 'dual', 'split'):
     parser.error('--loss bce_wiou 只接了 baseline/dual/split（unet 等复现网络未接）')
-if args.loss in ('farfp', 'bndsoft') and args.domain_loss:
+if args.loss in ('farfp', 'bndsoft', 'cvartail') and args.domain_loss:
     parser.error('--loss farfp/bndsoft 与 --domain_loss 互斥（否则 domain 分支会静默覆盖）')
 if args.loss == 'bndsoft':
     if not 0.0 <= args.bnd_eps <= 0.5:
         parser.error('--bnd_eps 必须在 [0, 0.5]（eps>0.5 会把前景软化成背景）')
     if args.bnd_radius < 1:
         parser.error('--bnd_radius 必须 >= 1')
+if args.loss == 'sw':
+    if not args.sw_mode:
+        parser.error('--loss sw 需要 --sw_mode echo/cnr/both')
+    if args.dataset != 'Carotid':
+        parser.error('--loss sw 只接了 Carotid（权重表按颈动脉切片生成）')
+elif args.sw_mode:
+    parser.error('--sw_mode 只在 --loss sw 时生效')
 if args.wmren_ablate and args.arch != 'wmren':
     parser.error('--wmren_ablate 只接了 --arch wmren')
 if args.wmren_wave_op != 'haar':
@@ -556,7 +609,16 @@ if __name__ == "__main__":
             snapshot_path += '_r50fdf_' + {'drdac': 'dr', 'drdac_mfdf': 'mf', 'full': 'full'}[args.r50_fdf]
         if args.fgr:
             # whole 沿用历史段名 _fgr；band 是新算子档（FBGR），必须分目录
-            snapshot_path += '_fgr' if args.fgr_mode == 'whole' else '_fgrb'
+            if args.fgr_mode == 'band':
+                snapshot_path += '_fgrb'
+            elif args.fgr_pos == 'enc':
+                snapshot_path += '_fgre'
+            elif args.fgr_pos == 'skip':
+                snapshot_path += '_fgrs'
+            else:
+                snapshot_path += '_fgr'
+        if args.eff:
+            snapshot_path += '_eff'
         if args.fd_mfea:
             snapshot_path += '_fdmfea'
         if args.fd_fgbr:
@@ -577,6 +639,10 @@ if __name__ == "__main__":
                 snapshot_path += '_F%sM%d' % (args.far_w, args.far_margin)
             if args.loss == 'bndsoft' and (args.bnd_eps != 0.25 or args.bnd_radius != 1):
                 snapshot_path += '_E%sR%d' % (args.bnd_eps, args.bnd_radius)
+            if args.loss == 'cvartail':
+                snapshot_path += '_W%sQ%sA%s' % (args.tl_w, args.tl_q, args.tl_area_w)
+            if args.loss == 'sw':
+                snapshot_path += '_sw' + args.sw_mode
         if args.arch in ('unet', 'xnet', 'gobletnet', 'wmren', 'fdfunet'):
             snapshot_path += '_' + args.arch
             if args.arch == 'unet' and args.edge_fusion in ('abf', 'abftied'):
@@ -682,6 +748,12 @@ if __name__ == "__main__":
         if args.head_hr:
             # 224 全分辨率证据支路单独分目录，不能与基线快照混用
             snapshot_path += '_hr'
+        if args.edge_branch:
+            # 边缘监督支路（共享编码器 + 双解码器）单独分目录
+            snapshot_path += '_eb'
+            if args.edge_branch_w != 1.0 or args.edge_kernel != 3:
+                # 非默认监督权重/边缘核必须进目录名，否则多档位互相覆盖
+                snapshot_path += '_w%sK%d' % (args.edge_branch_w, args.edge_kernel)
 
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
@@ -720,7 +792,9 @@ if __name__ == "__main__":
                    wavelet_basis=args.wavelet_basis,
                    ddbe_level=args.ddbe, acam=bool(args.acam),
                    asr=bool(args.asr), ddbe_hf_op=args.ddbe_hf_op,
-                   fgr=bool(args.fgr), fgr_mode=args.fgr_mode)
+                   fgr=bool(args.fgr), fgr_mode=args.fgr_mode,
+                   fgr_pos=args.fgr_pos, eff=bool(args.eff),
+                   edge_branch=bool(args.edge_branch))
         if args.edge_fusion in ('abf', 'abftied'):
             net.attach_edge_fusion(kind=args.edge_fusion, init_gamma=args.edge_gamma)
         net = net.cuda()
@@ -801,7 +875,8 @@ if __name__ == "__main__":
                       r50_fdf=args.r50_fdf, fgr=bool(args.fgr),
                       fgr_mode=args.fgr_mode,
                       fd_mfea=bool(args.fd_mfea), fd_fgbr=bool(args.fd_fgbr),
-                      head_hr=bool(args.head_hr)).cuda()
+                      head_hr=bool(args.head_hr),
+                      edge_branch=bool(args.edge_branch)).cuda()
     if args.arch != 'ccfr' and not args.no_pretrain:
         if args.arch == 'wmren' and args.wmren_enc in ('r50', 'r50deep', 'r50wrmm', 'r50seq'):
             # wmren 的 load_from 是空操作（WRMM 无可迁移形状）；R50 编码器臂单独吃 R50 那部分权重

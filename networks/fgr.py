@@ -54,6 +54,54 @@ def _dct_bases(channels, height, width, n_freq=16):
     return bases
 
 
+class EFF(nn.Module):
+    """EFF：Encoder Frequency Fusion（编码器跨尺度频率融合，2026-11-13 设计）。
+
+    动机：FGR 目前只挂在解码器输出；编码器侧此前只有注入式（MFDF/FEM 在 R50 上判负）
+    与同尺度改写两条路，缺一个「把深层低频上下文与浅层高频细节真正合起来」的编码器
+    级融合。EFF 把 FGR 的通道轴频率门控搬到编码器，并让频带支来自两个尺度：
+
+        y = x + Fuse1x1( w ⊙ [hf(x), lf(ctx)] )
+        ctx = Up(Conv1x1(deep))          # deep = 更深一级编码特征（级联）
+        w   = σ(Linear(DCT描述子([x, ctx])))
+
+    与 FGR 的差异只有频带内容来源：hf 仍来自本级 x（局部细节），lf 改为深层上下文
+    ctx 的低频 LL（语义上下文）。门只看 [x, ctx] 的谱描述子，仍是通道轴逐位置改写。
+
+    级联顺序（FPN 式自顶向下）：y4 = EFF4(x4, x5) → y3 = EFF3(x3, y4) → y2 → y1；
+    y1..y4 作为解码器 skip。恒等起步：fuse 零初始化 → 初始 y_i ≡ x_i 逐位相等，
+    整条阶梯不改变网络；gate bias 2.0（同 FGR，唯一零点仍是 fuse）。
+    参数量：proj C·C_deep + gate 4C²+2C + fuse 2C²+C = 8C²+3C（编码通道逐级翻倍时
+    与解码器 FGR 的增量逐位相同，UNet 四级 +2,788,160）。
+    """
+
+    def __init__(self, channels, height, width, deep_channels, n_freq=16):
+        super().__init__()
+        C = channels
+        self.proj = nn.Conv2d(deep_channels, C, 1, bias=False)
+        self.gate = nn.Linear(2 * C, 2 * C)
+        self.fuse = nn.Conv2d(2 * C, C, 1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, 2.0)
+        nn.init.zeros_(self.fuse.weight)
+        nn.init.zeros_(self.fuse.bias)
+        self.register_buffer(
+            'dct_base', _dct_bases(2 * C, height, width, n_freq), persistent=False)
+
+    def forward(self, x, deep):
+        ctx = F.interpolate(self.proj(deep), size=x.shape[-2:],
+                            mode="bilinear", align_corners=False)
+        _, details = laplacian_split_channels(x)
+        hf = F.interpolate(details[0].abs() + details[1].abs() + details[2].abs(),
+                           size=x.shape[-2:], mode="bilinear", align_corners=False)
+        ll_ctx, _ = laplacian_split_channels(ctx)
+        lf = F.interpolate(ll_ctx, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        gate_in = torch.cat([x, ctx], dim=1)
+        z = (gate_in * self.dct_base.unsqueeze(0)).sum(dim=(2, 3))     # (B,2C) DCT 谱描述子
+        w = torch.sigmoid(self.gate(z)).unsqueeze(-1).unsqueeze(-1)    # (B,2C,1,1)
+        return x + self.fuse(w * torch.cat([hf, lf], dim=1))
+
+
 class FGR(nn.Module):
     """输入输出同形 (B,C,H,W)，H/W 需为偶数（laplacian_split 要求，28/56/112/224 均满足）。"""
 

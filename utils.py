@@ -128,6 +128,41 @@ def _signed_distance(gt):
     return phi / float(max(g.shape))
 
 
+def cvar_distance_tail_loss(logits, label, q=0.1, d0=10.0, cap=3.0):
+    """距离尾部损失（CVaR-DSL）：只优化最差 q% 的「距离加权不一致」。
+
+    e(x) = |p(x) − gt(x)| · clamp(D(x)/d0, max=cap)
+      D = 到 GT 边界的距离（像素，|有符号距离图|）
+    再对每张切片取 e 最大的 q% 的均值（CVaR），最后按 batch 平均。
+
+    动机：HD 是 max 型泛函，而 CE / Dice / 边界加权 / 面积 / 远假阳全是 mean 型聚合，
+    对尾部不敏感（阶段 0 离线验证：均值代理与 HD 的 rho=0.69~0.75，
+    top10% 代理 rho=0.86~0.90，控制均值后仍有 0.77 的偏相关）。
+    q=1 时逼近单侧 HD，q=100 时退化为均值型距离项。
+    """
+    import numpy as np
+
+    prob = torch.softmax(logits, dim=1)[:, 1]
+    gt = (label > 0).float()
+    gtn = gt.detach().cpu().numpy().astype(bool)
+    dist = []
+    for g in gtn:
+        if not g.any():
+            dist.append(np.zeros_like(g, dtype=np.float32))
+            continue
+        phi = _signed_distance(g) * float(max(g.shape))  # 还原成像素距离
+        dist.append(np.abs(phi).astype(np.float32))
+    d = torch.from_numpy(np.stack(dist)).to(prob.device).float()
+
+    e = torch.abs(prob - gt) * (d / d0).clamp(max=cap)
+    b, h, w = e.shape
+    k = max(1, int(round(h * w * float(q))))
+    vals = torch.topk(e.reshape(b, -1), k, dim=1).values
+    valid = (gt.reshape(b, -1).sum(dim=1) > 0).float()
+    per = vals.mean(dim=1) * valid
+    return per.sum() / valid.sum().clamp(min=1.0)
+
+
 def boundary_soft_ce(logits, label, eps=0.25, radius=1):
     """边界带软标签 CE：GT 边界带 ±radius 像素内的目标向 0.5 软化。
 
@@ -167,6 +202,43 @@ class BoundaryLoss(nn.Module):
         gt = (label > 0).detach().cpu().numpy()
         phi = torch.from_numpy(np.stack([_signed_distance(g) for g in gt]))
         return (prob * phi.to(prob.device).float()).mean()
+
+
+class SampleWeightedCEDice(nn.Module):
+    """样本级加权 0.5·CE + 0.5·Dice（按切片给权重，不是按像素）。
+
+    与基线 [DiceLoss] 的唯一差别是聚合方式：基线在整 batch 上做全局求和，
+    样本权重无法作用；这里先算每个样本的 CE / Dice，再按 w 加权平均。
+    w 在 batch 内除以自身均值（保持平均权重 1），避免全难样本的 batch
+    把有效学习率放大；w 全为 1 时与 0.5·CE + 0.5·DiceLoss(n_classes) 数值一致。
+    """
+
+    def __init__(self, n_classes=2):
+        super(SampleWeightedCEDice, self).__init__()
+        self.n_classes = n_classes
+
+    def forward(self, logits, label, weight=None):
+        label = label.long()
+        if label.dim() == 4:
+            label = label[:, 0]
+        ce = F.cross_entropy(logits, label, reduction='none').mean(dim=(1, 2))
+
+        prob = torch.softmax(logits, dim=1)
+        tgt = torch.stack([(label == i).float() for i in range(self.n_classes)], dim=1)
+        inter = (prob * tgt).sum(dim=(2, 3))
+        # 分母口径必须与 DiceLoss 一致：soft 概率平方和 + 目标平方和（不是概率和）
+        denom = (prob * prob).sum(dim=(2, 3)) + (tgt * tgt).sum(dim=(2, 3))
+        dice = 1.0 - (2.0 * inter + 1e-5) / (denom + 1e-5)      # (B, C)
+        dice = dice.mean(dim=1)                                  # 与 DiceLoss 一致：两类取平均
+
+        if weight is None:
+            w = torch.ones_like(ce)
+        else:
+            w = weight.to(ce.device).float().reshape(-1)
+        w = w / w.mean().clamp_min(1e-6)
+        loss_ce = (w * ce).sum() / w.sum()
+        loss_dice = (w * dice).sum() / w.sum()
+        return 0.5 * loss_ce + 0.5 * loss_dice, loss_ce
 
 
 class DiceLoss(nn.Module):

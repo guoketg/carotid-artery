@@ -1,3 +1,4 @@
+import csv
 import os
 import random
 
@@ -34,6 +35,12 @@ def label_path_of(image_path):
     return image_path.replace(".nii.gz", "_label.nii.gz")
 
 
+def load_weight_table(csv_path):
+    """读取样本权重表（列：rel,w），键与列表文件中的相对路径一致。"""
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        return {r["rel"].replace("\\", "/"): float(r["w"]) for r in csv.DictReader(f)}
+
+
 def normalize_image(volume):
     """1%~99% 分位截断后按自身均值方差标准化"""
     lo, hi = np.percentile(volume, 1), np.percentile(volume, 99)
@@ -59,7 +66,7 @@ class CarotidDataset(Dataset):
     """颈动脉斑块 2D 超声切片数据集，返回单通道图像与二值标签"""
 
     def __init__(self, root, list_file, split="train", img_size=224, augment=True, use_wavelet=False,
-                 gamma_aug=False):
+                 gamma_aug=False, weight_file=None):
         self.root = root
         self.split = split
         self.img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
@@ -70,6 +77,8 @@ class CarotidDataset(Dataset):
         self.samples = read_list(list_file)
         if not self.samples:
             raise RuntimeError(f"列表为空: {list_file}")
+        # 逐切片损失权重表（可选）：缺失切片回退到 1.0，保证与无权重口径可对照
+        self.weights = load_weight_table(weight_file) if weight_file else {}
 
     def __len__(self):
         return len(self.samples)
@@ -116,6 +125,7 @@ class CarotidDataset(Dataset):
             "image": image,
             "label": torch.from_numpy(label).long(),
             "case": rel,
+            "weight": torch.tensor(self.weights.get(rel, 1.0), dtype=torch.float32),
         }
 
 

@@ -39,7 +39,8 @@ def build_model(args):
                     edge_in=bool(args.edge_in), edge_op=args.edge_op,
                     wavelet_basis=args.wavelet_basis,
                     ddbe_level=args.ddbe, acam=bool(args.acam),
-                    asr=bool(args.asr))
+                    asr=bool(args.asr),
+                    edge_branch=bool(getattr(args, "edge_branch", 0)))
     if args.arch == "wmren":
         from networks.unet_wmren import UNetWMREN
         return UNetWMREN(in_channels=1, num_classes=2)
@@ -75,7 +76,8 @@ def build_model(args):
                              edge_in=bool(args.edge_in), ddbe_level=args.ddbe,
                              acam=bool(args.acam), hf_branch=bool(args.hf_branch),
                              hf_lambda=args.hf_lambda,
-                             head_hr=bool(getattr(args, "head_hr", 0)))
+                             head_hr=bool(getattr(args, "head_hr", 0)),
+                             edge_branch=bool(getattr(args, "edge_branch", 0)))
 
 
 def eval_ckpt(args):
@@ -200,6 +202,8 @@ def main():
     p.add_argument("--hf_lambda", type=float, default=0.3, help="HF 图低频回灌权重 λ，与 train.py 同义")
     p.add_argument("--head_hr", type=int, default=0,
                    help="1 = 解码器 224² 级接原图全分辨率证据支路，与 train.py 同义（仅 baseline）")
+    p.add_argument("--edge_branch", type=int, default=0,
+                   help="1 = 边缘监督分支（共享编码器 + 双解码器），与 train.py 同义（unet/baseline）")
     p.add_argument("--fds", type=int, default=0, help="1 = 模型带三级 FDS 辅助头（仅 dual/split）")
     p.add_argument("--vit_name", default="R50-ViT-B_16")
     p.add_argument("--vit_layers", type=int, default=12, help="ViT 层数，与 train.py 同义")

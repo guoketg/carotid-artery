@@ -33,6 +33,73 @@ def _primary_out(outputs):
     return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
 
+def _edge_target(label, k=3):
+    """由原 GT 掩膜经边缘算子得到边缘标签（与 CCFR Stage1 同口径，可复现）：
+
+      1) 掩膜二值化（> 0.5，数据集返回的是 resize 后的 long 标签）；
+      2) k×k 形态学梯度 dilate − erode，k=3 → 1 像素内环 + 1 像素外环的边缘带；
+      3) clamp 到 [0,1] 作为边缘目标（224² 网格，与边缘解码器输出同网格）；
+         训练时按主分割同形式 CE+Dice 用 (.long())，评测时按概率图用 (0/1)。
+    """
+    m = (label.float().unsqueeze(1) > 0.5).float()
+    dil = F.max_pool2d(m, k, 1, k // 2)
+    ero = -F.max_pool2d(-m, k, 1, k // 2)
+    return (dil - ero).clamp(0.0, 1.0)
+
+
+def _edge_scores(prob, gt_edge, tol=2):
+    """边缘预测打分（224² 网格）：prob 为 sigmoid 概率，gt_edge 为 0/1 边缘带。
+
+    严格口径给 edge Dice / precision / recall；另加 ±tol 像素容差口径——
+    1 px 边缘线的严格重合对副解码器过苛，容差口径回答「线是不是落在正确位置附近」。
+    同时记录 pred_edge_frac / gt_edge_frac，用来暴露「全 0 / 全 1」的退化解
+    （BCE 均值对稀疏目标很容易被常数图糊弄过去，Dice 与占比一起看）。
+    """
+    p = (prob > 0.5).float()
+    g = (gt_edge > 0.5).float()
+    tp = (p * g).sum()
+    gd = F.max_pool2d(g[None, None], 2 * tol + 1, 1, tol)[0, 0]
+    pd = F.max_pool2d(p[None, None], 2 * tol + 1, 1, tol)[0, 0]
+    return dict(
+        edge_dice=(2 * tp / (p.sum() + g.sum() + 1e-6)).item(),
+        edge_prec=(tp / (p.sum() + 1e-6)).item(),
+        edge_rec=(tp / (g.sum() + 1e-6)).item(),
+        edge_prec_t2=((p * gd).sum() / (p.sum() + 1e-6)).item(),
+        edge_rec_t2=((pd * g).sum() / (g.sum() + 1e-6)).item(),
+        pred_edge_frac=p.mean().item(), gt_edge_frac=g.mean().item())
+
+
+def _save_edge_panels(path, rows):
+    """四列拼图肉眼核验边缘分支：原图+GT 轮廓 / GT 边缘带 / 预测边缘概率 / 预测边缘叠加。
+
+    rows: [(case, img, gt, gt_edge, prob, main_dice, edge_dice), ...]
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    n = len(rows)
+    fig, axes = plt.subplots(n, 4, figsize=(11.5, 2.6 * n), squeeze=False)
+    for i, (case, img, gt, gt_e, prob, main_dice, edge_dice) in enumerate(rows):
+        ax = axes[i, 0]
+        ax.imshow(img, cmap='gray')
+        ax.contour(gt, [0.5], colors='lime', linewidths=0.8)
+        ax.set_title('%s  mainDice=%.3f  edgeDice=%.3f' % (case, main_dice, edge_dice),
+                     fontsize=8)
+        axes[i, 1].imshow(gt_e, cmap='gray', vmin=0, vmax=1)
+        axes[i, 1].set_title('GT edge (morph 3x3)', fontsize=8)
+        axes[i, 2].imshow(prob, cmap='magma', vmin=0, vmax=1)
+        axes[i, 2].set_title('pred edge prob', fontsize=8)
+        ax = axes[i, 3]
+        ax.imshow(img, cmap='gray')
+        ax.imshow(np.ma.masked_where(prob < 0.5, prob), cmap='autumn', alpha=0.75)
+        ax.set_title('pred edge > 0.5', fontsize=8)
+        for ax in axes[i]:
+            ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(path, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+
+
 class WeaveSegFiveTermLoss(nn.Module):
     """WeaveSeg（ICCV 2025）Eq.(12) 的五项损失，权重取论文的经验值 1.0/0.5/0.5/0.3/1.0：
 
@@ -172,10 +239,20 @@ def trainer_synapse(args, model, snapshot_path):
     if args.dataset == 'Carotid':
         from datasets.dataset_carotid import CarotidDataset
         split_dir = os.path.join(args.list_dir, args.subset)
+        sw_mode = getattr(args, 'sw_mode', '')
+        weight_file = None
+        if sw_mode:
+            weight_file = (getattr(args, 'sw_file', '') or
+                           os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'analysis',
+                                        'sample_weights_%s_%s.csv' % (args.subset, sw_mode)))
+            if not os.path.isfile(weight_file):
+                raise FileNotFoundError('样本权重表不存在: %s（先跑 scripts/build_sample_weights.py）'
+                                        % weight_file)
         db_train = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "train.txt"),
                                   split="train", img_size=args.img_size,
                                   use_wavelet=bool(args.use_wavelet),
-                                  gamma_aug=bool(getattr(args, 'gamma_aug', 0)))
+                                  gamma_aug=bool(getattr(args, 'gamma_aug', 0)),
+                                  weight_file=weight_file)
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
                                   use_wavelet=bool(args.use_wavelet))
@@ -258,6 +335,18 @@ def trainer_synapse(args, model, snapshot_path):
             l_ce = ce_loss(out, label[:].long())
             return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
                     + far_w * far_fp_loss(out, label, margin=far_margin)), l_ce
+    elif loss_name == 'cvartail':
+        from utils import cvar_distance_tail_loss, area_consistency_loss
+        tl_w = float(getattr(args, 'tl_w', 0.1))
+        tl_q = float(getattr(args, 'tl_q', 0.1))
+        tl_area_w = float(getattr(args, 'tl_area_w', 0.05))
+
+        def seg_loss(out, label):
+            """距离尾部 + 面积一致性：0.5CE+0.5Dice + 面积项 + CVaR_q(距离加权不一致)。"""
+            l_ce = ce_loss(out, label[:].long())
+            return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
+                    + tl_area_w * area_consistency_loss(out, label)
+                    + tl_w * cvar_distance_tail_loss(out, label, q=tl_q)), l_ce
     elif loss_name == 'bndsoft':
         from utils import boundary_soft_ce
         bnd_eps = float(getattr(args, 'bnd_eps', 0.25))
@@ -299,6 +388,15 @@ def trainer_synapse(args, model, snapshot_path):
         def seg_loss(out, label):
             """Kendall 同方差不确定性加权 CE+Dice（初始等价 0.5/0.5）。"""
             return aux_loss(out, label)
+    elif loss_name == 'sw':
+        from utils import SampleWeightedCEDice
+        sw_loss = SampleWeightedCEDice(num_classes)
+        # 权重按 batch 传入：seg_loss 的签名被十几个分支共用，用可变容器避免全量改签名
+        sw_state = {'w': None}
+
+        def seg_loss(out, label):
+            """样本级加权 0.5CE+0.5Dice；w 全 1 时与 §0 基线数值一致。"""
+            return sw_loss(out, label, sw_state['w'])
     else:
         def seg_loss(out, label):
             l_ce = ce_loss(out, label[:].long())
@@ -333,14 +431,20 @@ def trainer_synapse(args, model, snapshot_path):
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+            if loss_name == 'sw':
+                sw_state['w'] = sampled_batch['weight'].cuda()
             outputs = model(image_batch)
             aux = None
             maps = None
+            edge_logits = None
+            l_edge = None
             if isinstance(outputs, dict):
                 # FDS：主输出 + 三级辅助 logits（各自上采样到 GT 分辨率后再算损失）
                 # weaveseg：额外带 sf/sb/su 三个上下文 logits，供 Eq.(12) 的后三项
+                # edge_branch：额外带 edge（边缘解码器 logits）
                 aux = outputs.get('aux')
                 maps = {k: outputs[k] for k in ('sf', 'sb', 'su') if k in outputs} or None
+                edge_logits = outputs.get('edge')
                 outputs = outputs['out']
             if isinstance(outputs, (tuple, list)):
                 # XNet 双输出（低频/高频支）：每支各算一次分割损失，再对支数取平均
@@ -365,6 +469,16 @@ def trainer_synapse(args, model, snapshot_path):
                                                    align_corners=False)
                     l_aux, _ = seg_loss(aux_logits, label_batch)
                     loss = loss + w_aux * l_aux
+            if edge_logits is not None:
+                # 边缘分支：与原 GT 经边缘算子得到的边缘标签做**与主分割同形式、同权重**
+                # 的监督（同一 seg_loss，默认 0.5CE+0.5Dice），权重 --edge_branch_w 默认 1.0；
+                # 主分割输出与主损失不变。
+                edge_t = _edge_target(label_batch,
+                                      int(getattr(args, 'edge_kernel', 3))).long()
+                if edge_t.shape[1] == 1:
+                    edge_t = edge_t[:, 0]
+                l_edge, _ = seg_loss(edge_logits, edge_t)
+                loss = loss + float(getattr(args, 'edge_branch_w', 1.0)) * l_edge
             (loss / grad_accum).backward()
 
             # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次
@@ -386,8 +500,12 @@ def trainer_synapse(args, model, snapshot_path):
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
+            if l_edge is not None:
+                writer.add_scalar('info/loss_edge', l_edge, iter_num)
 
-            logging.info('iteration %d : loss : %f, loss_ce: %f' % (iter_num, loss.item(), loss_ce.item()))
+            logging.info('iteration %d : loss : %f, loss_ce: %f%s' % (
+                iter_num, loss.item(), loss_ce.item(),
+                '' if l_edge is None else ', loss_edge: %f' % l_edge.item()))
 
             if iter_num % 20 == 0:
                 image = image_batch[1, 0:1, :, :]
@@ -461,14 +579,34 @@ def trainer_synapse(args, model, snapshot_path):
         testloader = _DL(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
         model.eval()
         records = []
+        edge_records = []
+        edge_detail = []
         with torch.no_grad():
             for batch in testloader:
-                logits = _primary_out(model(batch['image'].cuda()))
+                outputs = model(batch['image'].cuda())
+                logits = _primary_out(outputs)
                 pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
                 pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch['case'][0])
                 record = compute_case_metrics(pred_o, gt_o, spacing=spacing)
                 record['case'] = batch['case'][0]
                 records.append(record)
+                # 边缘分支：同一批样本顺带算边缘指标并留图，确认副解码器真的学到了边缘
+                if isinstance(outputs, dict) and 'edge' in outputs:
+                    # 2 类边缘 logits → 第 1 类概率作为边缘概率
+                    prob = torch.softmax(outputs['edge'], dim=1)[0, 1].cpu()
+                    gt_e = _edge_target(batch['label'],
+                                        int(getattr(args, 'edge_kernel', 3)))[0, 0]
+                    es = _edge_scores(prob, gt_e)
+                    # 对照：把主分割预测过同一边缘算子能得到多少 edge Dice。
+                    # 边缘头明显高于它才算真学到，≈ 则只是把主掩膜重新描了一遍边。
+                    es["edge_dice_main"] = _edge_scores(
+                        _edge_target(torch.from_numpy(pred)[None],
+                                     int(getattr(args, 'edge_kernel', 3)))[0, 0],
+                        gt_e)["edge_dice"]
+                    edge_records.append(dict(case=batch['case'][0], dice=record['dice'], **es))
+                    edge_detail.append((batch['case'][0], batch['image'][0, 0].cpu().numpy(),
+                                        batch['label'][0].cpu().numpy(), gt_e.numpy(),
+                                        prob.numpy(), record['dice'], es['edge_dice']))
         summary = summarize(records)
         with open(os.path.join(snapshot_path, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
             writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd", "delta_area"])
@@ -482,4 +620,38 @@ def trainer_synapse(args, model, snapshot_path):
                          summary["hd95"]["mean"], summary["hd95"]["std"],
                          summary["delta_area"]["mean"], summary["delta_area"]["std"],
                          summary["abs_delta_area"]["mean"]))
+        if edge_records:
+            def _mean(key):
+                return float(np.mean([r[key] for r in edge_records]))
+            with open(os.path.join(snapshot_path, "edge_metrics.csv"), "w", newline="",
+                      encoding="utf-8") as f:
+                cols = ["case", "dice", "edge_dice", "edge_prec", "edge_rec",
+                        "edge_prec_t2", "edge_rec_t2", "pred_edge_frac", "gt_edge_frac",
+                        "edge_dice_main"]
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                w.writerows(edge_records)
+            n_ok = sum(1 for r in edge_records if r["edge_dice"] > 0.3)
+            logging.info(
+                "edge summary (%d cases): edgeDice=%.3f | prec=%.3f rec=%.3f | "
+                "prec@2px=%.3f rec@2px=%.3f | pred_frac=%.4f gt_frac=%.4f | "
+                "edgeDice(main-derived)=%.3f | edgeDice>0.3: %d/%d"
+                % (len(edge_records), _mean("edge_dice"), _mean("edge_prec"),
+                   _mean("edge_rec"), _mean("edge_prec_t2"), _mean("edge_rec_t2"),
+                   _mean("pred_edge_frac"), _mean("gt_edge_frac"),
+                   _mean("edge_dice_main"), n_ok, len(edge_records)))
+            if _mean("pred_edge_frac") < 0.001:
+                logging.warning("边缘头输出几乎全 0：副解码器没有学到边缘（检查 --edge_w / 学习率）")
+            elif _mean("pred_edge_frac") > 0.5:
+                logging.warning("边缘头输出几乎全 1：副解码器退化为常数图")
+            # 最差 3 例 + 最好 3 例，一张图看清边缘是否贴合
+            order = sorted(range(len(edge_detail)), key=lambda i: edge_detail[i][6])
+            picks = order[:3] + order[-3:] if len(order) > 6 else order
+            vis_dir = os.path.join(snapshot_path, "edge_vis")
+            os.makedirs(vis_dir, exist_ok=True)
+            rows = [edge_detail[i] for i in picks]
+            _save_edge_panels(os.path.join(vis_dir, "edge_branch_cases.png"), rows)
+            for i, d in zip(picks, rows):
+                _save_edge_panels(os.path.join(vis_dir, "%s.png" % d[0]), [d])
+            logging.info("edge visualization saved to %s" % vis_dir)
     return "Training Finished!"

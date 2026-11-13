@@ -38,10 +38,12 @@
 | 损失基线 | A0 × Focal / Tversky / Boundary / wIoU，`queue_c2d_loss_baselines.ps1` Phase 1 就绪，未启动 |
 | 领域损失消融 | 去边界带 / 去面积项 / 去远假阳项，同队列 Phase 2 就绪，未启动 |
 | 领域损失补 seed | 主配置 seed 2024 / 3407，同队列 Phase 3 就绪，未启动 |
+| 远假阳项归因（UNet） | 对照 D2（87.01 / 0.202 / 0.99）与基线（86.55 / 0.225 / 1.14）：AB-noFar（`--dl_far_w 0`）判"0.15 的 HD 降幅是否来自该项"，DL-far03（`--dl_far_w 0.3`）看剂量；连同 LFA 已入 `queue_c2d_loss_unet.ps1`，启动器在 `queue_c2d_loss_unet_status.csv` |
 | HFBranch + FAM | 代码已实现、冒烟通过，未入队 |
 | 跨中心反向 | 待补 Zhongnan → SPARC（需先训 Zhongnan 权重）与 dual / split 分支 |
 | split + frc | 88.34（A0 −2.2 点），HD 未重算，未收口 |
 | 输入分辨率 320 vs 224 | 未做，且不作为论文卖点；若补须所有对比方法同口径 |
+| 边缘监督分支 | 共享编码器 + 两个对等解码器（主分割 + 边缘解码器）；边缘 GT = 原标签 3×3 形态学梯度（dilate−erode），边缘项与主分割同一 `seg_loss`、同权重 1.0。UNet（+22.6M）与 R50 预训练（+7.4M）各一臂，SPARC seed 1234 bs4 ga2 ep200；已挂 `queue_c2d_edge_branch.ps1`，状态见 status.md §2。用户先验 TransUNet 骨干 +1.0 Dice；存在解码器容量混杂 |
 
 ## 3. 仍在用的结论（每条一行，明细见归档）
 
