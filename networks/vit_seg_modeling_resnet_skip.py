@@ -160,11 +160,17 @@ class ResNetV2(nn.Module):
         # FEM 论文口径 inline（非恒等，A2/A3 Δ≠0 属预期）。
         drdac = getattr(self, 'fdf_drdac', None)
         fem = getattr(self, 'fdf_fem', None)
+        # --fgr --fgr_pos enc（2026-11-14）：FGR 挂编码器四级主链（inline 改写，
+        # 改写后的特征继续下采样并作为 skip；fuse 零初始化 → 恒等起步）。
+        # 位置同 FEM：block1 的 padding hack 之前（module 看 55² 真实特征）。
+        fgr = getattr(self, 'fgr_enc', None)
         x = self.root(x)
         if drdac is not None:
             x = x + drdac[0](x)
         if fem is not None:
             x = fem[0](x)
+        if fgr is not None:
+            x = fgr[0](x)
         features.append(x)
         x = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)(x)
         for i in range(len(self.body)-1):
@@ -173,6 +179,8 @@ class ResNetV2(nn.Module):
                 x = x + drdac[i + 1](x)
             if fem is not None:
                 x = fem[i + 1](x)
+            if fgr is not None:
+                x = fgr[i + 1](x)
             right_size = int(in_size / 4 / (i+1))
             if x.size()[2] != right_size:
                 pad = right_size - x.size()[2]
@@ -187,4 +195,6 @@ class ResNetV2(nn.Module):
             x = x + drdac[3](x)
         if fem is not None:
             x = fem[3](x)
+        if fgr is not None:
+            x = fgr[3](x)
         return x, features[::-1]

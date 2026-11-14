@@ -25,6 +25,7 @@ from .wavelet import build_hf_image, build_edge_map
 from .ddbe import DDBE, ACAM
 from .bdfr_v2 import DDBEv2, ACAMv2
 from .hf_branch import HFBranch, FAM, HF_DET_CHANNELS
+from .sdf import SDFHead
 
 
 logger = logging.getLogger(__name__)
@@ -579,7 +580,9 @@ class VisionTransformer(nn.Module):
                  bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
                  ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
                  edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole",
-                 fd_mfea=False, fd_fgbr=False, head_hr=False, edge_branch=False):
+                 fgr_pos="dec",
+                 fd_mfea=False, fd_fgbr=False, head_hr=False, edge_branch=False,
+                 edge_fuse="none", sdf="none", sdf_tau=12.0):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -675,12 +678,23 @@ class VisionTransformer(nn.Module):
                 for c, s in zip(config.decoder_channels, (28, 56, 112, 224))])
         # --fgr（2026-11-09 规划）：FGR 频门改写挂解码器四级输出（拉普拉斯频带 +
         # FcaNet 式 DCT 谱门 + 1×1 改写，fuse 零初始化恒等起步；与 ddbectl/plain 互补）
-        if fgr:
+        # fgr_pos（2026-11-14）：dec = 解码器四级输出（默认）；enc = R50 编码器四级
+        # 主链（inline 改写后继续下采样，参数量 8C²+3C/级，四级 +11.05M）。
+        if fgr and fgr_pos == 'dec':
             from .fgr import FGR
             # fgr_mode：whole = 单核改写 [hf,lf]（原 FGR）；band = 双零核并联分带（FBGR）
             self.decoder.fgr_all = nn.ModuleList([
                 FGR(c, s, s, mode=fgr_mode)
                 for c, s in zip(config.decoder_channels, (28, 56, 112, 224))])
+        if fgr and fgr_pos == 'enc':
+            from .fgr import FGR
+            # 编码器四级实际形状（同 fdf_fem 注释）：root 112²/64 → block1 55²/256
+            # （padding hack 在挂载点之后）→ block2 28²/512 → block3 14²/1024。
+            # 模块挂在 hybrid_model 上，forward 里 inline 改写（见 ResNetV2.forward）。
+            hm = self.transformer.embeddings.hybrid_model
+            hm.fgr_enc = nn.ModuleList([
+                FGR(c, hh, ww, mode=fgr_mode)
+                for c, hh, ww in ((64, 112, 112), (256, 55, 55), (512, 28, 28), (1024, 14, 14))])
         if fd_mfea or fd_fgbr:
             from .freqdino import MFEA, FGBR
             # 四级全挂：每级一个独立实例，通道跟着解码器分级走
@@ -710,6 +724,19 @@ class VisionTransformer(nn.Module):
             self.edge_head = SegmentationHead(
                 in_channels=edge_cfg['decoder_channels'][-1],
                 out_channels=2, kernel_size=3)
+        # edge_fuse：把边缘概率以零初始化标量 γ 残差加到主解码器输出特征上。
+        # γ=0 时与不注入逐位一致，是否采用边缘证据交给训练自己决定。
+        self.edge_fuse_scale = (nn.Parameter(torch.zeros(1))
+                                if edge_fuse == "add" and edge_branch else None)
+        # 连续界面表示：SDF 头挂在主解码器输出（224²）上。最后创建，保证同 seed 下
+        # 基础权重与不挂载版本逐位对齐。
+        #   sdf='out'：分割输出改成距离场，掩膜由零水平集给出（logits = ±sharp·sdf）
+        #   sdf='aux'：保留分类头作输出，距离场只作辅助监督
+        self.sdf_mode = sdf
+        self.sdf_head = None
+        self.sdf_sharp = 0.5  # logit = sharp·sdf，界面位于 sdf=0，概率斜坡宽约 ±2/ sharp px
+        if sdf != "none":
+            self.sdf_head = SDFHead(config['decoder_channels'][-1], tau=float(sdf_tau))
 
     def forward(self, x):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
@@ -738,16 +765,36 @@ class VisionTransformer(nn.Module):
                         fa[1][0] + self.hf_inject[1](fa[1][1]),   # 256@56
                         fa[0][0] + self.hf_inject[0](fa[0][1])]   # 64@112
         x_enc = x  # 编码器输出 (B, n_patch, hidden)，供边缘分支复用
-        x = self.decoder(x, features)
-        logits = self.segmentation_head(x)
-        if self.hr_head is not None:
-            # 224² 级补原图全分辨率证据（I/5×5 均值/21×21 均值/9×9 局部标准差）
-            logits = logits + self.hr_head(x, x_in[:, :1])
+        edge = None
         if self.edge_dec is not None:
             # 边缘分支与主分割共享同一份编码特征（瓶颈 + R50 三级 skip），
             # 但走独立的第二个解码器，输出 2 类边缘 logits（背景 / 边缘带）
             edge = self.edge_head(self.edge_dec(x_enc, features))
-            return {"out": logits, "edge": edge}
+        x = self.decoder(x, features)
+        if self.edge_fuse_scale is not None:
+            # 边缘概率（第 1 类）按标量 γ 残差注入主路解码特征；γ=0 起步
+            e = torch.softmax(edge, dim=1)[:, 1:2]
+            e = F.interpolate(e, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + self.edge_fuse_scale * e
+        logits = self.segmentation_head(x)
+        if self.hr_head is not None:
+            # 224² 级补原图全分辨率证据（I/5×5 均值/21×21 均值/9×9 局部标准差）
+            logits = logits + self.hr_head(x, x_in[:, :1])
+        sdf = None
+        if self.sdf_head is not None:
+            sdf = self.sdf_head(x)
+            if self.sdf_mode == 'out':
+                # 输出即距离场：两类 logit 只承载 sdf，掩膜 = sdf > 0（零水平集），
+                # 事件位置是连续的，不存在 argmax 的整像素量化。
+                logits = torch.cat([-self.sdf_sharp * sdf,
+                                    self.sdf_sharp * sdf], dim=1)
+        if edge is not None or sdf is not None:
+            out = {"out": logits}
+            if edge is not None:
+                out["edge"] = edge
+            if sdf is not None:
+                out["sdf"] = sdf
+            return out
         return logits
 
     def load_from(self, weights):

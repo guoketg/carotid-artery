@@ -24,9 +24,13 @@
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\queue_fgr_pos_eff.ps1 -DryRun
 #   powershell -ExecutionPolicy Bypass -File scripts\queue_fgr_pos_eff.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\queue_fgr_pos_eff.ps1 -Only FGREnc
+#     （2026-11-13 补跑用：FGREnc 首跑因跑批中途改 datasets/dataset_carotid.py 崩在
+#       ep5 评测的 worker 重导入，与模块无关；-Only 只跑指定 job 名，其余跳过）
 param(
     [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
     [string]$Root = "E:\mkl\code\python_code\carotid-artery",
+    [string]$Only = "",
     [switch]$DryRun
 )
 
@@ -70,6 +74,15 @@ $jobs = @(
        a = @("--eff", "1")
        snap = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224_SPARC_eff_unet_c2d" }
 )
+
+if ($Only) {
+    $jobs = @($jobs | Where-Object { $_.n -eq $Only })
+    if ($jobs.Count -eq 0) {
+        Write-Host "[fgr pos/eff] no job matched -Only '$Only' (names: FGREnc / FGRSkip / EFF)"
+        exit 2
+    }
+    Write-Host "[fgr pos/eff] -Only $Only : $($jobs.Count) job"
+}
 
 foreach ($job in $jobs) {
     # 等 GPU 空出来再开跑，绝不与其它训练抢卡

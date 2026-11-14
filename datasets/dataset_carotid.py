@@ -62,11 +62,23 @@ def resize_pair(image, label, size):
     return image.astype(np.float32), (label > 0.5).astype(np.float32)
 
 
+def sobel_edges(label):
+    """原始尺寸二值标签过 Sobel：梯度 > 0 置 1，其余 0（旧实验口径）。
+
+    注意与 trainer._edge_target 的区别：这里**不 resize**，边缘在原始小 crop
+    （如 42×63）上算出来，再随图像一起 nearest 放大到 224，边缘带宽度会被
+    放大同样的倍数（≈5 倍），前景占比从 ~2% 变成 ~12%。
+    """
+    gx = ndimage.sobel(label, axis=0, mode="nearest")
+    gy = ndimage.sobel(label, axis=1, mode="nearest")
+    return (np.hypot(gx, gy) > 0).astype(np.float32)
+
+
 class CarotidDataset(Dataset):
     """颈动脉斑块 2D 超声切片数据集，返回单通道图像与二值标签"""
 
     def __init__(self, root, list_file, split="train", img_size=224, augment=True, use_wavelet=False,
-                 gamma_aug=False, weight_file=None):
+                 gamma_aug=False, weight_file=None, edge_mode=""):
         self.root = root
         self.split = split
         self.img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
@@ -74,6 +86,9 @@ class CarotidDataset(Dataset):
         self.use_wavelet = use_wavelet
         # BDFR-Net 论文的 augmentation 含 gamma 扰动；默认关，保持既有实验口径不变
         self.gamma_aug = gamma_aug
+        # 边缘监督分支的目标来源：'' = 不返回边缘（沿用 trainer 内的 224 形态学梯度）；
+        # 'sobel_orig' = 原始尺寸二值标签过 Sobel（>0→1）后再随图像放大到 224
+        self.edge_mode = edge_mode
         self.samples = read_list(list_file)
         if not self.samples:
             raise RuntimeError(f"列表为空: {list_file}")
@@ -114,19 +129,30 @@ class CarotidDataset(Dataset):
         label = (label > 0.5).astype(np.float32)
         if self.augment:
             image, label = self._augment(image, label)
+        edge = sobel_edges(label) if self.edge_mode == "sobel_orig" else None
         image = normalize_image(image)
-        image, label = resize_pair(image, label, self.img_size)
+        if edge is None:
+            image, label = resize_pair(image, label, self.img_size)
+        else:
+            # 与 resize_pair 同一组 factors，边缘用 order=0 nearest 一起放大
+            factors = (self.img_size[0] / image.shape[0], self.img_size[1] / image.shape[1])
+            image, label = resize_pair(image, label, self.img_size)
+            edge = ndimage.zoom(edge, factors, order=0, mode="nearest")
+            edge = (edge > 0.5).astype(np.float32)
         image = torch.from_numpy(image).unsqueeze(0).float()
         if self.use_wavelet:
             from networks.wavelet import build_three_channel
             image = build_three_channel(image.unsqueeze(0))[0]
 
-        return {
+        batch = {
             "image": image,
             "label": torch.from_numpy(label).long(),
             "case": rel,
             "weight": torch.tensor(self.weights.get(rel, 1.0), dtype=torch.float32),
         }
+        if edge is not None:
+            batch["edge"] = torch.from_numpy(edge).long()
+        return batch
 
 
 def build_splits(seed=1234, test_ratio=0.2):

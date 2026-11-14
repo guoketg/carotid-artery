@@ -80,9 +80,9 @@ def build_model(args):
                              edge_branch=bool(getattr(args, "edge_branch", 0)))
 
 
-def eval_ckpt(args):
+def load_net(args, ckpt):
     net = build_model(args).cuda()
-    state = torch.load(args.ckpt, map_location="cuda")
+    state = torch.load(ckpt, map_location="cuda")
     # 历史 checkpoint 的 BidirFrC 只有 gamma_a（单向）；新代码加了零初始化的 gamma_b，
     # 缺这个键时保持 0 == 旧行为逐元素等价，其余任何缺失/多余键仍报错
     missing, unexpected = net.load_state_dict(state, strict=False)
@@ -90,6 +90,55 @@ def eval_ckpt(args):
     if bad or unexpected:
         raise RuntimeError(f"state_dict 不匹配: missing={bad} unexpected={list(unexpected)}")
     net.eval()
+    return net
+
+
+def _primary_out(logits):
+    """与 trainer._primary_out 同口径：FDS 取 dict['out']，XNet 取元组首项。"""
+    if isinstance(logits, dict):
+        logits = logits["out"]
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+    return logits
+
+
+def _dump_overlay(root_path, case, pred_o, gt_o, rec, out_dir):
+    """导出原网格叠加图：灰=原图，绿=GT 轮廓，红=预测轮廓，黄=两者重合。"""
+    import nibabel as nib
+    from PIL import Image
+    from scipy import ndimage as ndi
+
+    img = nib.load(os.path.join(root_path, case)).get_fdata(dtype=np.float32)
+    if img.ndim == 3:
+        img = img[..., img.shape[-1] // 2]
+    lo, hi = np.percentile(img, [1, 99])
+    g = np.clip((img - lo) / max(float(hi - lo), 1e-6), 0, 1)
+    rgb = np.stack([g, g, g], axis=-1)
+
+    def edge(m):
+        return m & ~ndi.binary_erosion(m, np.ones((3, 3), bool), border_value=1)
+
+    pe, ge = edge(pred_o), edge(gt_o)
+    rgb[..., 0][ge], rgb[..., 2][ge] = 0, 0   # GT 轮廓：绿
+    rgb[..., 1][pe], rgb[..., 2][pe] = 0, 0   # 预测轮廓：红
+    rgb[..., 0][ge & pe], rgb[..., 1][ge & pe] = 1, 1
+
+    name = case.replace("/", "__").replace(".nii.gz", "")
+    out = os.path.join(out_dir, f"{name}_hd{rec['hd']:.2f}.png")
+    Image.fromarray((rgb * 255).astype(np.uint8)).resize(
+        (rgb.shape[1] * 6, rgb.shape[0] * 6), Image.NEAREST).save(out)
+
+
+def eval_ckpt(args):
+    ckpts = [c.strip() for c in args.ens_ckpts.split(",") if c.strip()] \
+        if args.ens_ckpts else [args.ckpt]
+    nets = [load_net(args, c) for c in ckpts]
+
+    dump_set = set()
+    if args.dump_cases:
+        os.makedirs(args.dump_dir, exist_ok=True)
+        with open(args.dump_cases, "r", encoding="utf-8-sig") as f:
+            dump_set = {row["case"].strip().replace("\\", "/") for row in csv.DictReader(f)}
 
     split_dir = os.path.join(args.list_dir, args.subset)
     ds = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
@@ -100,18 +149,18 @@ def eval_ckpt(args):
     records = []
     with torch.no_grad():
         for i, batch in enumerate(dl):
-            logits = net(batch["image"].cuda())
-            if isinstance(logits, dict):
-                # FDS 网络：只取主输出
-                logits = logits["out"]
-            if isinstance(logits, (tuple, list)):
-                # XNet 双输出：评估统一取低频主支（与 trainer._primary_out 同口径）
-                logits = logits[0]
-            pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
+            probs = None
+            for net in nets:
+                p = torch.softmax(_primary_out(net(batch["image"].cuda())), dim=1)
+                probs = p if probs is None else probs + p
+            probs = probs / len(nets)
+            pred = torch.argmax(probs, dim=1).cpu().numpy()[0]
             pred_o, gt_o, spacing = original_grid_pair(pred, args.root_path, batch["case"][0])
             rec = compute_case_metrics(pred_o, gt_o, spacing=spacing)
             rec["case"] = batch["case"][0]
             records.append(rec)
+            if dump_set and rec["case"] in dump_set:
+                _dump_overlay(args.root_path, rec["case"], pred_o, gt_o, rec, args.dump_dir)
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd", "delta_area"])
@@ -119,7 +168,7 @@ def eval_ckpt(args):
         w.writerows(records)
 
     s = summarize(records)
-    print(f"[eval] {args.out}")
+    print(f"[eval] {args.out}  (n_models={len(nets)})")
     print(f"[eval] n={s['n_cases']} dice={s['dice']['mean'] * 100:.2f}%±{s['dice']['std'] * 100:.2f}% "
           f"assd={s['assd']['mean']:.3f}±{s['assd']['std']:.3f} "
           f"hd={s['hd']['mean']:.2f}±{s['hd']['std']:.2f} "
@@ -215,8 +264,12 @@ def main():
     p.add_argument("--model_root", default=r"E:\mkl\code\python_code\model\TU_Carotid224")
     p.add_argument("--prefix", default="TU_pretrain_R50-ViT-B_16_skip3_epo120_bs8_224_")
     p.add_argument("--ckpt", default="")
+    p.add_argument("--ens_ckpts", default="",
+                   help="逗号分隔的多个 checkpoint：逐模型 softmax 概率平均后再 argmax（多 seed 集成）")
     p.add_argument("--out", default="")
     p.add_argument("--baseline_csv", default="")
+    p.add_argument("--dump_cases", default="", help="CSV（首列 case）：只导出这些病例的叠加图")
+    p.add_argument("--dump_dir", default="", help="叠加图输出目录，需与 --dump_cases 同用")
     args = p.parse_args()
 
     tag = args.subset + ("_w3" if args.use_wavelet else "")
@@ -227,7 +280,12 @@ def main():
         args.ckpt = os.path.join(exp_dir, "epoch_119.pth")
     if not args.out:
         args.out = os.path.join(exp_dir, "metrics.csv")
-    if not os.path.isfile(args.ckpt):
+    if args.ens_ckpts:
+        missing = [c.strip() for c in args.ens_ckpts.split(",")
+                   if c.strip() and not os.path.isfile(c.strip())]
+        if missing:
+            raise FileNotFoundError("; ".join(missing))
+    elif not os.path.isfile(args.ckpt):
         raise FileNotFoundError(args.ckpt)
 
     eval_ckpt(args)

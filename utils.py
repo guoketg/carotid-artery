@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -161,6 +163,73 @@ def cvar_distance_tail_loss(logits, label, q=0.1, d0=10.0, cap=3.0):
     valid = (gt.reshape(b, -1).sum(dim=1) > 0).float()
     per = vals.mean(dim=1) * valid
     return per.sum() / valid.sum().clamp(min=1.0)
+
+
+def positive_distance_map_2d(x, iters=2):
+    """可微正距离剖面 d+（区域 HD 损失 #82，2D 版）。
+
+    对应官方实现（lisaGUZZI/HD-Loss）的 SoftErosion3D + PositiveDistanceMap：
+        d+(p) = -erode(1-p, I)
+    每次「腐蚀」在 3x3 邻域对 1-p 连乘（含中心 9 项，对应 3D 的 26/27 连通），
+    乘性形式处处可导；外边界补 1（图像外视为背景，不在边界处收缩）。
+    单次腐蚀记 im_k = erosion^k(1-x)，返回 Σ_{k=0}^{I-1} im_k，
+    二值输入下等于到前景的棋盘距离，并在 I 处截断。
+
+    参数 x 可为 bool 或概率（B,1,H,W），返回同形状 float。
+    """
+    im = 1.0 - x.float()
+    total = torch.zeros_like(im)
+    for _ in range(int(iters)):
+        total = total + im
+        p = F.pad(im, (1, 1, 1, 1), mode='constant', value=1.0)
+        win = p.unfold(2, 3, 1).unfold(3, 3, 1)          # (B,C,H,W,3,3)
+        im = win.prod(dim=-1).prod(dim=-1)
+    return total
+
+
+def regional_hd_loss(logits, label, term='sym', iters=6, alpha=150.0, eps=1e-6):
+    """区域 Hausdorff 距离损失（#82，Guzzi et al., MLMI 2025）的 2D 实现。
+
+    fp = <d+(G)>_{y}  ：预测前景里、离 GT 前景多远（extra 侧）
+    fn = <d+(y)>_{G}  ：GT 前景里、离预测前景多远（miss 侧）
+    两者都按自身质量归一（论文 norm=0），消除面积偏置。
+
+    term:
+      sym = 0.5*(fp+fn)                  论文主用的 LAHsymLoss
+      ah  = max(fp, fn)                  论文 LAHLoss（逐样本精确最大值）
+      h   = max(smax(fp), smax(fn))      论文 LHLoss，smax 为 alpha 的 LogSumExp
+    空前景样本按有效样本数归一后置 0，避免 bs 内个别空切片污染与 NaN。
+    """
+    prob = torch.softmax(logits, dim=1)[:, 1:2]
+    gt = (label > 0).float()
+    if gt.dim() == 3:
+        gt = gt.unsqueeze(1)
+    with torch.no_grad():
+        dm_gt = positive_distance_map_2d(gt, iters)
+    dm_hat = positive_distance_map_2d(prob, iters)
+
+    axes = (1, 2, 3)
+    fp = (dm_gt * prob).sum(dim=axes) / (prob.sum(dim=axes) + eps)
+    fn = (dm_hat * gt).sum(dim=axes) / (gt.sum(dim=axes) + eps)
+    if term == 'sym':
+        per = 0.5 * (fp + fn)
+    elif term == 'ah':
+        per = torch.maximum(fp, fn)
+    elif term == 'h':
+        # 官方 logsum: alpha * log(sum(exp(x/alpha)))，按空间求和后取两侧较大者。
+        # 减去 alpha*log(N)：直接使用时该式含常数项 alpha*log(N)（224² 约 1624），
+        # 会把 0.5CE+0.5Dice（约 0.6）完全淹没，无法等权相加；减去常数后是标准
+        # soft-max（≈ 剖面内最大距离，上界为 iters），与 sym/ah 同量级、可加。
+        n_pix = float(dm_gt[0].numel())
+        offset = alpha * math.log(n_pix)
+        fp_l = alpha * torch.log(torch.sum(torch.exp((dm_gt * prob) / alpha), dim=axes) + eps) - offset
+        fn_l = alpha * torch.log(torch.sum(torch.exp((dm_hat * gt) / alpha), dim=axes) + eps) - offset
+        per = torch.maximum(fp_l, fn_l)
+    else:
+        raise ValueError('rhd term 必须是 sym / ah / h，收到 %r' % (term,))
+
+    valid = (gt.sum(dim=axes) > 0).float()
+    return (per * valid).sum() / valid.sum().clamp(min=1.0)
 
 
 def boundary_soft_ce(logits, label, eps=0.25, radius=1):

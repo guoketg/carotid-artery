@@ -47,6 +47,21 @@ def _edge_target(label, k=3):
     return (dil - ero).clamp(0.0, 1.0)
 
 
+def _sdf_target(label, tau=12.0):
+    """由 GT 掩膜逐样本算带符号距离场（像素单位，内部为正），裁剪到 ±tau。
+
+    只依赖"GT 是二值掩膜"这一件事：没有面积/形状/尺度等群体统计量，换数据集不用改参数。
+    224² 的欧氏距离变换每样本约 1 ms，CPU 上算（batch 4 可忽略）。
+    """
+    from scipy import ndimage as ndi
+    m = (label.detach().cpu().numpy() > 0)
+    out = np.empty(m.shape, dtype=np.float32)
+    for i in range(m.shape[0]):
+        d = ndi.distance_transform_edt(m[i]) - ndi.distance_transform_edt(~m[i])
+        out[i] = np.clip(d, -tau, tau)
+    return torch.from_numpy(out)
+
+
 def _edge_scores(prob, gt_edge, tol=2):
     """边缘预测打分（224² 网格）：prob 为 sigmoid 概率，gt_edge 为 0/1 边缘带。
 
@@ -239,6 +254,8 @@ def trainer_synapse(args, model, snapshot_path):
     if args.dataset == 'Carotid':
         from datasets.dataset_carotid import CarotidDataset
         split_dir = os.path.join(args.list_dir, args.subset)
+        # 边缘目标来源：只有开边缘分支时数据集才额外返回 "edge"（sobel_orig = 原尺寸 Sobel）
+        edge_mode = (getattr(args, 'edge_mode', '') or '') if getattr(args, 'edge_branch', 0) else ''
         sw_mode = getattr(args, 'sw_mode', '')
         weight_file = None
         if sw_mode:
@@ -252,10 +269,11 @@ def trainer_synapse(args, model, snapshot_path):
                                   split="train", img_size=args.img_size,
                                   use_wavelet=bool(args.use_wavelet),
                                   gamma_aug=bool(getattr(args, 'gamma_aug', 0)),
-                                  weight_file=weight_file)
+                                  weight_file=weight_file,
+                                  edge_mode=edge_mode)
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
-                                  use_wavelet=bool(args.use_wavelet))
+                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode)
         testloader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
         curve_path = os.path.join(snapshot_path, 'test_curve.csv')
         curve_rows = []
@@ -319,12 +337,13 @@ def trainer_synapse(args, model, snapshot_path):
     elif loss_name == 'boundary':
         from utils import BoundaryLoss
         boundary = BoundaryLoss()
+        bl_w = float(getattr(args, 'bl_w', 5.0))
 
         def seg_loss(out, label):
-            """损失基线：0.5·CE + 0.5·Dice + 0.5·Boundary（Kervadec 距离图加权）。"""
+            """0.5·CE + 0.5·Dice + bl_w·Boundary（Kervadec 距离图加权，权重按初始量级标定）。"""
             l_ce = ce_loss(out, label[:].long())
             return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
-                    + 0.5 * boundary(out, label)), l_ce
+                    + bl_w * boundary(out, label)), l_ce
     elif loss_name == 'farfp':
         from utils import far_fp_loss
         far_w = float(getattr(args, 'far_w', 0.1))
@@ -347,6 +366,23 @@ def trainer_synapse(args, model, snapshot_path):
             return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
                     + tl_area_w * area_consistency_loss(out, label)
                     + tl_w * cvar_distance_tail_loss(out, label, q=tl_q)), l_ce
+    elif loss_name == 'rhd':
+        # #82 区域 Hausdorff 距离损失（官方实现 lisaGUZZI/HD-Loss 的 LAHsymLoss 2D 版）
+        from utils import regional_hd_loss
+        rhd_term = getattr(args, 'rhd_term', 'sym')
+        rhd_w = float(getattr(args, 'rhd_w', 0.5))
+        rhd_iters = int(getattr(args, 'rhd_iters', 6))
+        rhd_alpha = float(getattr(args, 'rhd_alpha', 150.0))
+
+        def seg_loss(out, label):
+            """0.5CE+0.5Dice + rhd_w·区域 HD 项（两侧距离剖面按各自质量归一）。"""
+            l_ce = ce_loss(out, label[:].long())
+            l_dice = dice_loss(out, label, softmax=True)
+            l_rhd = regional_hd_loss(out, label, term=rhd_term, iters=rhd_iters,
+                                     alpha=rhd_alpha)
+            seg_loss.parts = (l_ce.detach(), l_dice.detach(), l_rhd.detach())
+            return (0.5 * l_ce + 0.5 * l_dice + rhd_w * l_rhd), l_ce
+        seg_loss.parts = None
     elif loss_name == 'bndsoft':
         from utils import boundary_soft_ce
         bnd_eps = float(getattr(args, 'bnd_eps', 0.25))
@@ -437,7 +473,9 @@ def trainer_synapse(args, model, snapshot_path):
             aux = None
             maps = None
             edge_logits = None
+            sdf_map = None
             l_edge = None
+            l_sdf = None
             if isinstance(outputs, dict):
                 # FDS：主输出 + 三级辅助 logits（各自上采样到 GT 分辨率后再算损失）
                 # weaveseg：额外带 sf/sb/su 三个上下文 logits，供 Eq.(12) 的后三项
@@ -445,6 +483,7 @@ def trainer_synapse(args, model, snapshot_path):
                 aux = outputs.get('aux')
                 maps = {k: outputs[k] for k in ('sf', 'sb', 'su') if k in outputs} or None
                 edge_logits = outputs.get('edge')
+                sdf_map = outputs.get('sdf')
                 outputs = outputs['out']
             if isinstance(outputs, (tuple, list)):
                 # XNet 双输出（低频/高频支）：每支各算一次分割损失，再对支数取平均
@@ -473,12 +512,31 @@ def trainer_synapse(args, model, snapshot_path):
                 # 边缘分支：与原 GT 经边缘算子得到的边缘标签做**与主分割同形式、同权重**
                 # 的监督（同一 seg_loss，默认 0.5CE+0.5Dice），权重 --edge_branch_w 默认 1.0；
                 # 主分割输出与主损失不变。
-                edge_t = _edge_target(label_batch,
-                                      int(getattr(args, 'edge_kernel', 3))).long()
-                if edge_t.shape[1] == 1:
+                if 'edge' in sampled_batch:
+                    # --edge_mode sobel_orig：边缘目标由数据集在原始尺寸上算好（已同尺寸放大）
+                    edge_t = sampled_batch['edge'].cuda()
+                else:
+                    edge_t = _edge_target(label_batch,
+                                          int(getattr(args, 'edge_kernel', 3))).long()
+                if edge_t.dim() == 4 and edge_t.shape[1] == 1:
                     edge_t = edge_t[:, 0]
                 l_edge, _ = seg_loss(edge_logits, edge_t)
                 loss = loss + float(getattr(args, 'edge_branch_w', 1.0)) * l_edge
+            if sdf_map is not None:
+                # 连续界面表示：只在 |d| < tau 的窄带内监督距离场（tanh 饱和之外无梯度），
+                # 外加 eikonal 项让场保持"梯度模长为 1"的距离场性质。
+                # 目标逐样本由 GT 距离变换生成，与数据集统计无关。
+                tau = float(getattr(args, 'sdf_tau', 12.0))
+                sdf_t = _sdf_target(label_batch, tau).unsqueeze(1).cuda()
+                if sdf_map.shape[-2:] != sdf_t.shape[-2:]:
+                    sdf_map = F.interpolate(sdf_map, size=sdf_t.shape[-2:],
+                                            mode='bilinear', align_corners=False)
+                band = (sdf_t.abs() < tau).float()
+                cnt = band.sum().clamp(min=1.0)
+                l_sdf = ((sdf_map - sdf_t).abs() * band).sum() / cnt / tau
+                gy, gx = torch.gradient(sdf_map, dim=(2, 3))
+                eik = (((gy ** 2 + gx ** 2).sqrt() - 1.0) ** 2 * band).sum() / cnt
+                loss = loss + float(getattr(args, 'sdf_w', 1.0)) * (l_sdf + 0.02 * eik)
             (loss / grad_accum).backward()
 
             # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次
@@ -502,10 +560,19 @@ def trainer_synapse(args, model, snapshot_path):
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
             if l_edge is not None:
                 writer.add_scalar('info/loss_edge', l_edge, iter_num)
+            if l_sdf is not None:
+                writer.add_scalar('info/loss_sdf', l_sdf, iter_num)
+            rhd_parts = getattr(seg_loss, 'parts', None)
+            if loss_name == 'rhd' and rhd_parts is not None:
+                writer.add_scalar('info/loss_rhd', rhd_parts[2], iter_num)
 
-            logging.info('iteration %d : loss : %f, loss_ce: %f%s' % (
+            logging.info('iteration %d : loss : %f, loss_ce: %f%s%s%s' % (
                 iter_num, loss.item(), loss_ce.item(),
-                '' if l_edge is None else ', loss_edge: %f' % l_edge.item()))
+                '' if l_edge is None else ', loss_edge: %f' % l_edge.item(),
+                '' if l_sdf is None else ', loss_sdf: %f' % l_sdf.item(),
+                '' if (loss_name != 'rhd' or rhd_parts is None) else
+                ', rhd_ce %.4f, rhd_dice %.4f, rhd_term %.4f'
+                % tuple(t.item() for t in rhd_parts)))
 
             if iter_num % 20 == 0:
                 image = image_batch[1, 0:1, :, :]
@@ -575,7 +642,7 @@ def trainer_synapse(args, model, snapshot_path):
         from metrics_carotid import compute_case_metrics, original_grid_pair, summarize
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
-                                  use_wavelet=bool(args.use_wavelet))
+                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode)
         testloader = _DL(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
         model.eval()
         records = []
@@ -594,7 +661,7 @@ def trainer_synapse(args, model, snapshot_path):
                 if isinstance(outputs, dict) and 'edge' in outputs:
                     # 2 类边缘 logits → 第 1 类概率作为边缘概率
                     prob = torch.softmax(outputs['edge'], dim=1)[0, 1].cpu()
-                    gt_e = _edge_target(batch['label'],
+                    gt_e = batch['edge'][0].float() if 'edge' in batch else _edge_target(batch['label'],
                                         int(getattr(args, 'edge_kernel', 3)))[0, 0]
                     es = _edge_scores(prob, gt_e)
                     # 对照：把主分割预测过同一边缘算子能得到多少 edge Dice。
@@ -652,6 +719,7 @@ def trainer_synapse(args, model, snapshot_path):
             rows = [edge_detail[i] for i in picks]
             _save_edge_panels(os.path.join(vis_dir, "edge_branch_cases.png"), rows)
             for i, d in zip(picks, rows):
-                _save_edge_panels(os.path.join(vis_dir, "%s.png" % d[0]), [d])
+                case_name = str(d[0]).replace("/", "_").replace("\\", "_")
+                _save_edge_panels(os.path.join(vis_dir, "%s.png" % case_name), [d])
             logging.info("edge visualization saved to %s" % vis_dir)
     return "Training Finished!"

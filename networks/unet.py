@@ -25,6 +25,7 @@ num_classes 类 logits。作为 XNet/GobletNet 的容量对齐基线：两篇论
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from networks.asr import ASR
 from networks.ddbe import ACAM, DDBE
@@ -230,7 +231,8 @@ class UNet(nn.Module):
     def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
                  wavelet_basis="haar", ddbe_level=0, acam=False, asr=False,
                  ddbe_hf_op="haar", fgr=False, fgr_mode="whole", fgr_pos="dec",
-                 eff=False, edge_branch=False):
+                 eff=False, eff_mode="whole", eff_lfdiff=False, edge_branch=False,
+                 edge_fuse="none"):
         super(UNet, self).__init__()
         l1c, l2c, l3c, l4c, l5c = 64, 128, 256, 512, 1024
         # edge_in：stem 多吃一张边缘图（与 TransUNet edge_in 同一算子、同一 λ=0 口径）
@@ -310,8 +312,9 @@ class UNet(nn.Module):
                 [FGR(c, s, s, mode=fgr_mode) for c, s in zip(chs, sizes)])
         if eff:
             # EFF：编码器跨尺度频率融合阶梯（自顶向下级联，见 fgr.py EFF）
+            # eff_mode='band' / eff_lfdiff：EFF-v2 的两条独立改动（默认关 = 首版）
             self.eff_modules = nn.ModuleList([
-                EFF(c, s, s, dc)
+                EFF(c, s, s, dc, mode=eff_mode, lf_diff=eff_lfdiff)
                 for c, dc, s in zip((l1c, l2c, l3c, l4c),
                                     (l2c, l3c, l4c, l5c), (224, 112, 56, 28))])
         # 边缘监督分支（共享编码器 + 独立的对称边缘解码器）：最后创建，
@@ -320,6 +323,10 @@ class UNet(nn.Module):
         if edge_branch:
             self.edge_dec = UNetDecoder(num_classes)
             init_kaiming(self.edge_dec)  # 与主解码器同初始化口径
+        # edge_fuse：把边缘概率以零初始化标量 γ 残差加到主解码器最浅层（224²）。
+        # γ=0 时与不注入逐位一致，是否采用边缘证据交给训练自己决定。
+        self.edge_fuse_scale = (nn.Parameter(torch.zeros(1))
+                                if edge_fuse == "add" and edge_branch else None)
 
     def _up(self, level, feat, skip):
         """单级上采样：该级挂了 ASR 就用 ASR(feat, skip)，否则用原 up_conv"""
@@ -388,14 +395,20 @@ class UNet(nn.Module):
         if self.fgr_pos == "skip" and self.fgr_modules is not None:
             # 只改写送进解码器的 skip 副本，编码器主干仍用原特征
             skips = tuple(m(s) for m, s in zip(self.fgr_modules, skips))
+        if self.edge_dec is not None:
+            # 边缘分支只吃共享编码器的瓶颈与原始 skip（浅→深）
+            edge = self.edge_dec(x5, (x1, x2, x3, x4))
         d4 = self._decode(self._up(0, x5, skips[3]), skips[3], self.d4_1, 0)
         d3 = self._decode(self._up(1, d4, skips[2]), skips[2], self.d3_1, 1)
         d2 = self._decode(self._up(2, d3, skips[1]), skips[1], self.d2_1, 2)
         d1 = self._decode(self._up(3, d2, skips[0]), skips[0], self.d1_1, 3)
+        if self.edge_fuse_scale is not None:
+            # 边缘概率（第 1 类）按标量 γ 残差注入主路最浅层；γ=0 起步
+            e = torch.softmax(edge, dim=1)[:, 1:2]
+            e = F.interpolate(e, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+            d1 = d1 + self.edge_fuse_scale * e
         out = self.d1_2(d1)
         if self.edge_dec is not None:
-            # 边缘分支只吃共享编码器的瓶颈与原始 skip（浅→深），不回流主分割
-            edge = self.edge_dec(x5, (x1, x2, x3, x4))
             return {"out": out, "edge": edge}
         return out
 
