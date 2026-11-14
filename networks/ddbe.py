@@ -90,7 +90,14 @@ class CBAM(nn.Module):
 
 
 class DDBE(nn.Module):
-    """双域解耦三分支：输入输出同形 (B,C,H,W)，H/W 为偶数。"""
+    """双域解耦三分支：输入输出同形 (B,C,H,W)，H/W 为偶数。
+
+    band_gate（可选，跨位置耦合用）：来自编码器同级 FGR 的逐通道谱门 (B,2C,1,1)，
+    前 C 列乘 HF 支、后 C 列乘 LF 支，CTX 支不受影响。这是**零参数**的调制接口——
+    接口本身不新建任何张量参数，三支卷积与融合权重完全不变，所以「同点串联」与
+    「跨位置耦合」两臂的参数量逐位一致，可直接成对比较。band_gate=None（默认）时
+    前向与本改动之前逐位相同，历史快照不受影响。
+    """
 
     def __init__(self, channels, hf_op='haar'):
         super().__init__()
@@ -119,10 +126,18 @@ class DDBE(nn.Module):
         nn.init.zeros_(self.fuse.weight)
         nn.init.zeros_(self.fuse.bias)
 
-    def forward(self, x):
+    @staticmethod
+    def _band_gate(hf, lf, band_gate):
+        """把外部门控乘到频带支上（门为 None 时原样返回，零参数）"""
+        if band_gate is None:
+            return hf, lf
+        w_hf, w_lf = band_gate.chunk(2, dim=1)
+        return hf * w_hf, lf * w_lf
+
+    def forward(self, x, band_gate=None):
         f = self.eca(x)
         if self.hf_op == 'plain':
-            return self._forward_plain(x, f)
+            return self._forward_plain(x, f, band_gate)
         if self.hf_op == 'lap':
             # 高频基换成同一口径的拉普拉斯分解；LF 仍吃 Haar LL（只换高频支）
             ll, details = laplacian_split_channels(f)
@@ -145,13 +160,15 @@ class DDBE(nn.Module):
         lf = self.lf_bn(self.lf_in(ll))
         lf = F.interpolate(lf, scale_factor=2, mode="bilinear", align_corners=False)
         lf = self.lf_ca(lf)
+        # 跨位置耦合（可选）：编码器同级 FGR 的谱门调制 HF/LF 两支（零参数）
+        hf, lf = self._band_gate(hf, lf, band_gate)
         # CTX：大核上下文 + 自门控
         ctx = self.ctx_bn(self.ctx_conv(f))
         ctx = ctx * torch.sigmoid(self.ctx_gate(ctx))
         # 融合：初始 fuse=0 → 输出 = x（恒等起步）
         return x + self.cbam(self.fuse(torch.cat([hf, lf, ctx], dim=1)))
 
-    def _forward_plain(self, x, f):
+    def _forward_plain(self, x, f, band_gate=None):
         """ddbectl 对照臂（2026-11-09 规划）：三支全部吃同一普通特征，不做任何频域分解。
 
         分解本身无参数，各支卷积原样保留 → 参数量与 haar/lap 版逐位一致；
@@ -163,6 +180,7 @@ class DDBE(nn.Module):
         """
         hf = self.hf_ca(self.hf_bn(self.hf_conv(self.hf_in(torch.cat([f, f, f], dim=1)))))
         lf = self.lf_ca(self.lf_bn(self.lf_in(f)))
+        hf, lf = self._band_gate(hf, lf, band_gate)
         ctx = self.ctx_bn(self.ctx_conv(f))
         ctx = ctx * torch.sigmoid(self.ctx_gate(ctx))
         return x + self.cbam(self.fuse(torch.cat([hf, lf, ctx], dim=1)))

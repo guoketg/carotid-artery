@@ -286,6 +286,12 @@ parser.add_argument('--fgr_pos', choices=['dec', 'enc', 'skip'], default='dec',
                          '四级输出（历史位置）；enc = 编码器主干四级输出（改写后继续'
                          '下采样并作 skip）；skip = 只改写送进解码器的 skip 副本。'
                          'enc/skip 目前只接 --arch unet')
+parser.add_argument('--fgr_ddbe_couple', type=int, default=0,
+                    help='1 = 编码器 FGR 与解码器 DDBE 跨位置耦合：把编码器四级 FGR 的'
+                         '逐通道谱门按分辨率投递到解码器同级 DDBE 的 HF/LF 两支'
+                         '（零参数接口，参数量与「编码器 FGR + 解码器 DDBE 各挂其位」'
+                         '的组合臂逐位一致）。需要 --arch unet + --ddbe 4 + '
+                         '--fgr 1 --fgr_pos enc 同时给')
 parser.add_argument('--eff', type=int, default=0,
                     help='1 = 编码器跨尺度频率融合 EFF（自顶向下级联：hf(x_i) + '
                          'lf(深层上下文)，通道轴频率门控改写，fuse 零初始化恒等起步；'
@@ -396,6 +402,14 @@ if args.fgr_pos != 'dec':
         parser.error('--fgr_pos 只在 --fgr 1 时有效（没有 FGR 就没有位置）')
     if args.arch == 'baseline' and args.fgr_pos == 'skip':
         parser.error('--fgr_pos skip 只接了 unet（baseline 的 skip 在编码器内，用 enc）')
+if args.fgr_ddbe_couple:
+    # 跨位置耦合只有一个合法组合：编码器 FGR 供门、解码器 DDBE 四级吃门
+    if args.arch != 'unet':
+        parser.error('--fgr_ddbe_couple 只接了 --arch unet（编码器与解码器通道逐级配对）')
+    if not (args.fgr and args.fgr_pos == 'enc'):
+        parser.error('--fgr_ddbe_couple 需要 --fgr 1 --fgr_pos enc（门来自编码器 FGR）')
+    if args.ddbe != 4:
+        parser.error('--fgr_ddbe_couple 需要 --ddbe 4（解码器四级 DDBE 全挂）')
 if args.eff:
     if args.arch != 'unet':
         parser.error('--eff 只接了 unet（编码器跨尺度融合）')
@@ -669,6 +683,9 @@ if __name__ == "__main__":
                 snapshot_path += '_fgrs'
             else:
                 snapshot_path += '_fgr'
+        if args.fgr_ddbe_couple:
+            # 耦合臂与「各挂其位」组合臂参数量相同但接口不同，必须分目录
+            snapshot_path += '_cpl'
         if args.eff:
             # EFF-v2 的两条改动必须分目录（band 多 +960 参数，lf 差分换内容）
             snapshot_path += '_eff'
@@ -865,7 +882,8 @@ if __name__ == "__main__":
                    ddbe_level=args.ddbe, acam=bool(args.acam),
                    asr=bool(args.asr), ddbe_hf_op=args.ddbe_hf_op,
                    fgr=bool(args.fgr), fgr_mode=args.fgr_mode,
-                   fgr_pos=args.fgr_pos, eff=bool(args.eff),
+                   fgr_pos=args.fgr_pos,
+                   couple=bool(args.fgr_ddbe_couple), eff=bool(args.eff),
                    eff_mode=args.eff_mode, eff_lfdiff=bool(args.eff_lfdiff),
                    edge_branch=bool(args.edge_branch),
                    edge_fuse=args.edge_fuse)

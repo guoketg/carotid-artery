@@ -231,9 +231,18 @@ class UNet(nn.Module):
     def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
                  wavelet_basis="haar", ddbe_level=0, acam=False, asr=False,
                  ddbe_hf_op="haar", fgr=False, fgr_mode="whole", fgr_pos="dec",
+                 couple=False,
                  eff=False, eff_mode="whole", eff_lfdiff=False, edge_branch=False,
                  edge_fuse="none"):
         super(UNet, self).__init__()
+        # couple：跨位置耦合——编码器四级 FGR 的逐通道谱门按分辨率投递到解码器
+        # 同级 DDBE 的 HF/LF 两支（零参数接口，见 networks/ddbe.py 的 band_gate）。
+        # 只在「编码器 FGR + 解码器 DDBE 四级」这一组合下有意义：UNet 各级编码器与
+        # 解码器通道数一一配对（64/128/256/512），门可以直接复用、不必再学一个投影。
+        if couple and not (fgr and fgr_pos == "enc" and ddbe_level == 4):
+            raise ValueError('couple=True 需要 fgr=True + fgr_pos="enc" + ddbe_level=4'
+                             '（编码器 FGR 门 → 解码器同级 DDBE 频带支）')
+        self.fgr_ddbe_couple = bool(couple)
         l1c, l2c, l3c, l4c, l5c = 64, 128, 256, 512, 1024
         # edge_in：stem 多吃一张边缘图（与 TransUNet edge_in 同一算子、同一 λ=0 口径）
         self.edge_in = edge_in
@@ -348,10 +357,23 @@ class UNet(nn.Module):
                            tied=(kind == "abftied"), init_gamma=init_gamma)
             for c in chans])
 
-    def _decode(self, up, skip, fuse, level):
+    def _enc_fgr(self, idx, x):
+        """编码器主链上的 FGR 改写（idx 顺序 0=224²/64 … 3=28²/512）。
+
+        耦合臂（couple=True）顺带导出该级谱门 w (B,2C,1,1) 供解码器同级 DDBE 使用，
+        非耦合臂返回 (x, None)，与改动之前逐位一致。
+        """
+        if self.fgr_modules is None or self.fgr_pos != "enc":
+            return x, None
+        if self.fgr_ddbe_couple:
+            return self.fgr_modules[idx](x, return_gate=True)
+        return self.fgr_modules[idx](x), None
+
+    def _decode(self, up, skip, fuse, level, band_gate=None):
         """单级解码：ABF → ACAM 对齐 skip → concat → DBB → DDBE → FGR（与 baseline 同序）。
 
         FGR 只在 fgr_pos='dec' 时挂在这里；enc/skip 位置在 forward 里各自应用。
+        band_gate 非空时（couple 臂）作为编码器同级 FGR 的谱门送进该级 DDBE。
         """
         if self.egf is not None:
             skip = self.egf[level](skip, up)
@@ -359,7 +381,8 @@ class UNet(nn.Module):
             skip = self.acams[level](skip, up)
         out = fuse(torch.cat([up, skip], dim=1))
         if self.ddbe_modules is not None:
-            out = self.ddbe_modules[level](out)
+            out = (self.ddbe_modules[level](out, band_gate=band_gate)
+                   if band_gate is not None else self.ddbe_modules[level](out))
         if self.fgr_modules is not None and self.fgr_pos == "dec":
             out = self.fgr_modules[level](out)
         return out
@@ -371,17 +394,13 @@ class UNet(nn.Module):
             x = torch.cat([x, build_edge_map(x, self.edge_op,
                                              basis=self.wavelet_basis)], dim=1)
         x1 = self.l1_1(x)                    # 224²/64
-        if self.fgr_pos == "enc" and self.fgr_modules is not None:
-            x1 = self.fgr_modules[0](x1)
+        x1, g1 = self._enc_fgr(0, x1)
         x2 = self.l2_1(self.l1_2(x1))        # 112²/128
-        if self.fgr_pos == "enc" and self.fgr_modules is not None:
-            x2 = self.fgr_modules[1](x2)
+        x2, g2 = self._enc_fgr(1, x2)
         x3 = self.l3_1(self.l2_2(x2))        # 56²/256
-        if self.fgr_pos == "enc" and self.fgr_modules is not None:
-            x3 = self.fgr_modules[2](x3)
+        x3, g3 = self._enc_fgr(2, x3)
         x4 = self.l4_1(self.l3_2(x3))        # 28²/512
-        if self.fgr_pos == "enc" and self.fgr_modules is not None:
-            x4 = self.fgr_modules[3](x4)
+        x4, g4 = self._enc_fgr(3, x4)
         x5 = self.l5_1(self.l4_2(x4))        # 14²/1024
         if self.eff_modules is not None:
             # EFF 自顶向下级联：y4←(x4,x5)、y3←(x3,y4)、y2←(x2,y3)、y1←(x1,y2)
@@ -398,10 +417,13 @@ class UNet(nn.Module):
         if self.edge_dec is not None:
             # 边缘分支只吃共享编码器的瓶颈与原始 skip（浅→深）
             edge = self.edge_dec(x5, (x1, x2, x3, x4))
-        d4 = self._decode(self._up(0, x5, skips[3]), skips[3], self.d4_1, 0)
-        d3 = self._decode(self._up(1, d4, skips[2]), skips[2], self.d3_1, 1)
-        d2 = self._decode(self._up(2, d3, skips[1]), skips[1], self.d2_1, 2)
-        d1 = self._decode(self._up(3, d2, skips[0]), skips[0], self.d1_1, 3)
+        # 耦合臂：解码器第 level 级（28²→224²）吃编码器同级 FGR 的谱门，级号按
+        # 分辨率配对（解码 level0=28²/512 ← FGR idx3=28²/512，其余同理）。
+        gates = (g1, g2, g3, g4)
+        d4 = self._decode(self._up(0, x5, skips[3]), skips[3], self.d4_1, 0, gates[3])
+        d3 = self._decode(self._up(1, d4, skips[2]), skips[2], self.d3_1, 1, gates[2])
+        d2 = self._decode(self._up(2, d3, skips[1]), skips[1], self.d2_1, 2, gates[1])
+        d1 = self._decode(self._up(3, d2, skips[0]), skips[0], self.d1_1, 3, gates[0])
         if self.edge_fuse_scale is not None:
             # 边缘概率（第 1 类）按标量 γ 残差注入主路最浅层；γ=0 起步
             e = torch.softmax(edge, dim=1)[:, 1:2]

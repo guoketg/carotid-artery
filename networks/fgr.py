@@ -125,7 +125,12 @@ class EFF(nn.Module):
 
 
 class FGR(nn.Module):
-    """输入输出同形 (B,C,H,W)，H/W 需为偶数（laplacian_split 要求，28/56/112/224 均满足）。"""
+    """输入输出同形 (B,C,H,W)，H/W 需为偶数（laplacian_split 要求，28/56/112/224 均满足）。
+
+    return_gate=True 时额外返回逐通道谱门 w (B,2C,1,1)（前 C 列管 hf、后 C 列管 lf），
+    供跨位置耦合使用（编码器 FGR → 解码器 DDBE 的频带支，见 DDBE.forward 的 band_gate
+    与 UNet 的 couple 开关）。门本身是模块的中间量，导出不改变任何数值与参数量。
+    """
 
     def __init__(self, channels, height, width, n_freq=16, mode="whole"):
         super().__init__()
@@ -146,7 +151,7 @@ class FGR(nn.Module):
         self.register_buffer(
             'dct_base', _dct_bases(3 * C, height, width, n_freq), persistent=False)
 
-    def forward(self, x):
+    def forward(self, x, return_gate=False):
         ll, details = laplacian_split_channels(x)
         hf = F.interpolate(details[0].abs() + details[1].abs() + details[2].abs(),
                            size=x.shape[-2:], mode="bilinear", align_corners=False)
@@ -156,5 +161,7 @@ class FGR(nn.Module):
         w = torch.sigmoid(self.gate(z)).unsqueeze(-1).unsqueeze(-1)    # (B,2C,1,1)
         if self.mode == "band":
             w_hf, w_lf = w.chunk(2, dim=1)   # gate 前 C 列管 hf、后 C 列管 lf，不新增门
-            return x + self.fuse_hf(w_hf * hf) + self.fuse_lf(w_lf * lf)
-        return x + self.fuse(w * torch.cat([hf, lf], dim=1))
+            y = x + self.fuse_hf(w_hf * hf) + self.fuse_lf(w_lf * lf)
+        else:
+            y = x + self.fuse(w * torch.cat([hf, lf], dim=1))
+        return (y, w) if return_gate else y

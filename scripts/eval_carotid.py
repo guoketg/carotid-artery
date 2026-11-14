@@ -40,6 +40,9 @@ def build_model(args):
                     wavelet_basis=args.wavelet_basis,
                     ddbe_level=args.ddbe, acam=bool(args.acam),
                     asr=bool(args.asr),
+                    fgr=bool(args.fgr), fgr_mode=args.fgr_mode,
+                    fgr_pos=args.fgr_pos,
+                    couple=bool(args.fgr_ddbe_couple),
                     edge_branch=bool(getattr(args, "edge_branch", 0)))
     if args.arch == "wmren":
         from networks.unet_wmren import UNetWMREN
@@ -247,6 +250,15 @@ def main():
     p.add_argument("--ddbe", type=int, default=0, help="0~4，与 train.py 同义（仅 baseline）")
     p.add_argument("--acam", type=int, default=0, help="1 = ACAM skip 对齐，与 train.py 同义（仅 baseline）")
     p.add_argument("--asr", type=int, default=0, help="1 = unet 解码器前三级挂 ASR，与 train.py 同义（仅 unet）")
+    p.add_argument("--fgr", type=int, default=0, help="1 = 挂 FGR 频带改写，与 train.py 同义（unet）")
+    p.add_argument("--fgr_mode", default="whole", choices=["whole", "band"],
+                   help="FGR 改写核档位，与 train.py 同义")
+    p.add_argument("--fgr_pos", default="dec", choices=["dec", "enc", "skip"],
+                   help="FGR 挂载位置，与 train.py 同义（仅 unet 支持 enc/skip）")
+    p.add_argument("--fgr_ddbe_couple", type=int, default=0,
+                   help="1 = 编码器 FGR 谱门投递到解码器同级 DDBE（零参数接口）。"
+                        "注意：该开关不改变 state_dict，权重文件本身看不出差异，"
+                        "评估时必须与训练命令逐字一致，否则会静默用错前向")
     p.add_argument("--hf_branch", type=int, default=0, help="1 = GobletNet 式 HF 支 + FAM，与 train.py 同义（仅 baseline）")
     p.add_argument("--hf_lambda", type=float, default=0.3, help="HF 图低频回灌权重 λ，与 train.py 同义")
     p.add_argument("--head_hr", type=int, default=0,

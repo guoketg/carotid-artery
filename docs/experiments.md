@@ -26,6 +26,7 @@
 | M1 | K2 + `--wmren_no_mlkm 1`（55.35 M）：MLKM 值多少 | leaveout 队列在跑 | §3.2 |
 | M2 | K2 + `--wmren_no_gate 1`（54.37 M）：WRDM 软加权 vs 固定 0.5 | 同上 | §3.2 |
 | F1 | R50 全段 → 每级 WRMM `stride=1` 精炼 → `unet_dec`（72.17 M） | r50pre 队列已就绪，等前序退出，未开跑 | §3.3 |
+| FGREnc+cvar | 弱骨干 U-Net 同时挂 **FGR（编码器四级频带门控改写，`--fgr_pos enc`，改写后继续下采样并作 skip）** 与 **cvartail 损失（CVaR 距离尾部 + 面积一致项）**：`--arch unet --fgr 1 --fgr_pos enc --loss cvartail --tl_w 0.1 --tl_q 0.1 --tl_area_w 0.05`，seed **42 / 317 / 1029**（§0 三 seed 集合）。两者作用面不重叠（特征改写 vs 优化目标），无 DDBE+FGR 那种同点互覆风险。判定：3 seed 合并一行报均值 ± sd，主判 ΔDice ≥ +0.5 或 ΔHD ≤ −0.1 mm，参照 UNet 基线 86.5455 / HD 1.13618 与 FGREnc 单挂 88.62 / HD 0.93；另记与 cvartail 单挂 87.37 / HD 0.96 的差额看两项是否可加。**成对 Δ 缺口**：FGREnc 单挂的三 seed 尚未按 42/317/1029 跑（历史 2024/3407 是解码器位置，不属本 seed 集合），要写成对 Δ 需补 3 个对照 run（`-WithControl` 开关已就绪，默认未开） | `queue_c2d_fgr_cvartail_3seed.ps1` 已挂载（PID 11288），等 `queue_c2d_distloss_unet` 收口后自动开跑 | results.md §7 |
 
 ## 2. 待跑 / 未启动
 

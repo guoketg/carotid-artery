@@ -34,6 +34,7 @@ FGR 的输入不是图像，是解码器特征图 `x (B, C, H, W)`。进入门�
 **特征融合模块逐项**（最常被追问的部分）：
 
 - **融合位置**：解码器四级输出点，DDBE 之后（次序：ABF→ACAM→concat→DBB→DDBE→FGR，[unet.py#L292-L303](file:///e:/mkl/code/python_code/carotid-artery/networks/unet.py#L292-L303)）。四级通道/分辨率 512²@28²、256²@56²、128²@112²、64²@224²，输入输出同形 (B,C,H,W)。
+- **跨位置耦合（2026-11-14 实现，未跑）**：`--fgr_pos enc` 时 FGR 挂在编码器主链；此时可以把它的谱门 w 顺手导出（`FGR.forward(x, return_gate=True)`），按分辨率喂给解码器同级 DDBE 的 HF/LF 两支（`DDBE.forward(x, band_gate=w)`，`--fgr_ddbe_couple 1`）。接口零参数，两臂参数量逐位相同；门只乘 DDBE 的频带支、CTX 支与全部卷积不变，DDBE.fuse 仍是唯一零点 → 恒等起步。方向固定为编码器→解码器（解码器特征在前向中还没算出来，反向不可实现）。设计见 [module-suite-design.md](../module-suite-design.md) §10。
 - **融合轴向**：**通道轴 + 逐位置改写**，不是空间轴注意力。1×1 卷积在每个像素位置内部混合通道，门 w 是逐通道标量、对整张特征图广播——门不看任何空间位置关系（对比：QKV 跨位置注意力是空间轴，两者在本项目里严格区分）。三条信息走的路：原图信息在 x 主干**原样通过**；高频/低频内容走频带支被门调幅后改写回主干。
 - **算子公式**（[fgr.py#L70-L73](file:///e:/mkl/code/python_code/carotid-artery/networks/fgr.py#L70-L73)）：
   - `z_c = ⟨cat[x,hf,lf]_c, base_c⟩`：FcaNet（ICCV 2021）式固定 DCT 基，4×4 频率网格共 16 个基循环分配给 3C 个通道，每个基是一张固定的 H×W 余弦图，与特征图逐元素乘再求和 = 一个数。基是 `register_buffer(persistent=False)`，零参数不进 state_dict。
