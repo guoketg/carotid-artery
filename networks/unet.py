@@ -28,8 +28,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from networks.asr import ASR
-from networks.ddbe import ACAM, DDBE
+from networks.ddbe import DDBE
 from networks.fgr import EFF, FGR
+from networks.sdf import SDFHead
 from networks.wavelet import build_edge_map
 
 
@@ -204,11 +205,14 @@ class UNetDecoder(nn.Module):
         self.d1_1 = DoubleBasicBlock(l1c * 2, l1c, make_downsample(l1c * 2, l1c))
         self.d1_2 = nn.Conv2d(l1c, num_classes, kernel_size=1)
 
-    def forward(self, x5, skips):
+    def forward(self, x5, skips, return_levels=False):
         d4 = self.d4_1(torch.cat([self.d5_1(x5), skips[3]], dim=1))
         d3 = self.d3_1(torch.cat([self.d4_2(d4), skips[2]], dim=1))
         d2 = self.d2_1(torch.cat([self.d3_2(d3), skips[1]], dim=1))
         d1 = self.d1_1(torch.cat([self.d2_2(d2), skips[0]], dim=1))
+        if return_levels:
+            # 双向门控臂逐级交错解码时复用（避免把四级 DBB 再跑一遍）
+            return self.d1_2(d1), (d4, d3, d2, d1)
         return self.d1_2(d1)
 
 
@@ -229,11 +233,12 @@ class UNet(nn.Module):
     """
 
     def __init__(self, in_channels=1, num_classes=2, edge_in=False, edge_op="wavelet",
-                 wavelet_basis="haar", ddbe_level=0, acam=False, asr=False,
+                 wavelet_basis="haar", ddbe_level=0, asr=False,
                  ddbe_hf_op="haar", fgr=False, fgr_mode="whole", fgr_pos="dec",
                  couple=False,
                  eff=False, eff_mode="whole", eff_lfdiff=False, edge_branch=False,
-                 edge_fuse="none"):
+                 edge_fuse="none", edge_gate="none", sdf="none", sdf_tau=12.0, ds=False,
+                 dec_wrmm=0, dec_wrmm_op="haar", dec_wrmm_mlkm=0):
         super(UNet, self).__init__()
         # couple：跨位置耦合——编码器四级 FGR 的逐通道谱门按分辨率投递到解码器
         # 同级 DDBE 的 HF/LF 两支（零参数接口，见 networks/ddbe.py 的 band_gate）。
@@ -271,9 +276,9 @@ class UNet(nn.Module):
         self.d2_2 = up_conv(l2c, l1c)
         self.d1_1 = DoubleBasicBlock(l1c * 2, l1c, make_downsample(l1c * 2, l1c))
         self.d1_2 = nn.Conv2d(l1c, num_classes, kernel_size=1, stride=1, padding=0)
-        # BDFR-Net 式解码器改造（与 baseline 的 --ddbe/--acam 同语义）：
+        # BDFR-Net 式解码器改造（与 baseline 的 --ddbe 同语义）：
         # 解码器四级按 28²/512 → 56²/256 → 112²/128 → 224²/64 编号，
-        # ddbe_level=1~3 只挂单级，4 = 四级全挂；acam 对每级 skip 做跨级对齐。
+        # ddbe_level=1~3 只挂单级，4 = 四级全挂；ACAM 已于 2026-11-20 移除。
         # DDBE/FGR 模块在下方 init_kaiming 之后创建（RNG 对齐纪律：pitfalls 3
         # 「DDBE 挂载时机太早」——同 seed 基础权重与不挂载版本逐位一致）。
         dec_chs = (l4c, l3c, l2c, l1c)
@@ -281,7 +286,6 @@ class UNet(nn.Module):
         self.fgr_modules = None
         self.fgr_pos = fgr_pos
         self.eff_modules = None
-        self.acams = nn.ModuleList([ACAM(c, c) for c in dec_chs]) if acam else None
         # 解码器 skip 汇合点的融合模块（ABF）：由 train.py 在权重初始化之后挂，
         # 保证同 seed 的基础权重与基线逐位对齐
         self.egf = None
@@ -329,13 +333,76 @@ class UNet(nn.Module):
         # 边缘监督分支（共享编码器 + 独立的对称边缘解码器）：最后创建，
         # 保证同 seed 的基础权重与不挂载版本逐位对齐（RNG 对齐纪律）。
         self.edge_dec = None
+        self.edge_gate = "none"
+        self.edge_proj = None
+        self.edge_heads = None
+        self.edge_gate_w = None
         if edge_branch:
             self.edge_dec = UNetDecoder(num_classes)
             init_kaiming(self.edge_dec)  # 与主解码器同初始化口径
+            self.edge_gate = edge_gate
+        elif edge_gate != "none":
+            raise ValueError('edge_gate 需要 edge_branch=True（没有边缘支就没有可交互的解码器）')
+        if self.edge_gate == "bi":
+            # 双向逐级门控（ba-net/gscnn 式）：主解码每级特征零初始化投影进边缘支，
+            # 边缘支每级边界响应经 sigmoid 门控回主解码。全部零初始化（α=0、Π=0），
+            # 第 0 步与「只挂边缘支、两条解码器互不相通」的臂逐位等价。
+            # 必须在 init_kaiming 之后创建，保证同 seed 的基础权重与历史臂逐位一致。
+            chs = (l4c, l3c, l2c, l1c)   # 28²/512、56²/256、112²/128、224²/64
+            self.edge_proj = nn.ModuleList([nn.Conv2d(c, c, 1) for c in chs])
+            self.edge_heads = nn.ModuleList([nn.Conv2d(c, 1, 1) for c in chs])
+            for mod in list(self.edge_proj) + list(self.edge_heads):
+                nn.init.zeros_(mod.weight)
+                nn.init.zeros_(mod.bias)
+            self.edge_gate_w = nn.Parameter(torch.zeros(4))
         # edge_fuse：把边缘概率以零初始化标量 γ 残差加到主解码器最浅层（224²）。
         # γ=0 时与不注入逐位一致，是否采用边缘证据交给训练自己决定。
         self.edge_fuse_scale = (nn.Parameter(torch.zeros(1))
                                 if edge_fuse == "add" and edge_branch else None)
+        # 连续界面表示（--sdf，与 baseline 侧同语义）：距离场头挂在主解码器
+        # 224²/64 上，最后创建以保证同 seed 的基础权重与不挂载版本逐位对齐。
+        #   out = 分割输出改成带符号距离场（logits = ±sharp·sdf，零水平集给掩膜）
+        #   aux = 只作窄带辅助监督，分类头仍是主输出
+        self.sdf_mode = sdf
+        self.sdf_head = None
+        self.sdf_sharp = 0.5
+        if sdf != "none":
+            self.sdf_head = SDFHead(l1c, tau=float(sdf_tau))
+        # 多尺度深监督（--ds）：112²/128、56²/256 两级解码中间特征各挂一个 1×1
+        # 分类头，监督权重 0.3 / 0.15（浅层更大，与 Syn-Net 深监督同向）。
+        # 推理只取主输出，辅助头不参与评测链路。
+        self.ds_heads = None
+        if ds:
+            self.ds_heads = nn.ModuleDict({
+                "h112": nn.Conv2d(l2c, num_classes, 1),
+                "h56": nn.Conv2d(l3c, num_classes, 1),
+            })
+        # 解码器 WRMM（2026-11-20）：把 `unet_wmren` 编码器的 WRDM 镜像搬到 U-Net
+        # 解码器，stride=1 同级精炼，挂在每个解码级 DBB 输出之后：
+        #   28²/512 → 56²/256 → 112²/128 → 224²/64。
+        # 动机：WRMM 此前只出现在编码器（K2 / r50wrmm），而 r50wrmm 对 R50 基线是
+        # −0.75~−0.84，判为「预训练编码器已编码的低频被再分一次频 = 冗余」。解码器
+        # 上采样路径是编码器完全没碰过的区域，本开关就是把这层频域精炼挪到那里。
+        # 档位与 wmren 的 `--wmren_dec_wrmm` 一致：1=四级全挂，2=只挂浅两级（112/224），
+        # 3=只挂 224²/64。最后创建（在 init_kaiming 之后），保证同 seed 的基础权重
+        # 与不挂载版本逐位一致（RNG 对齐纪律）。
+        self.dec_wrmm = int(dec_wrmm)
+        self.dec_wrmms = None
+        if self.dec_wrmm:
+            if self.dec_wrmm not in (1, 2, 3):
+                raise ValueError('dec_wrmm must be 0/1/2/3, got %r' % (dec_wrmm,))
+            # 延迟导入：`unet_wmren` 反过来 import 本文件的积木，模块级导入会成环
+            from networks.unet_wmren import WRDM, MLKM
+            levels = {1: (0, 1, 2, 3), 2: (2, 3), 3: (3,)}[self.dec_wrmm]
+            full = bool(dec_wrmm_mlkm)   # 1 = 完整 WRMM（WRDM → MLKM），0 = 只有 WRDM
+
+            def _blk(c):
+                if not full:
+                    return WRDM(c, c, wave_op=dec_wrmm_op, stride=1)
+                return nn.Sequential(WRDM(c, c, wave_op=dec_wrmm_op, stride=1), MLKM(c, c))
+
+            mods = [_blk(c) if i in levels else nn.Identity() for i, c in enumerate(dec_chs)]
+            self.dec_wrmms = nn.ModuleList(mods)
 
     def _up(self, level, feat, skip):
         """单级上采样：该级挂了 ASR 就用 ASR(feat, skip)，否则用原 up_conv"""
@@ -369,16 +436,24 @@ class UNet(nn.Module):
             return self.fgr_modules[idx](x, return_gate=True)
         return self.fgr_modules[idx](x), None
 
+    def _edge_level(self, level, prev, skip):
+        """双向门控臂的单级边缘解码：up_conv → cat(skip) → DBB（与 UNetDecoder 同构）。
+
+        level 与主解码一致：0=28²/512 … 3=224²/64；prev 为该级上一层的边缘特征
+        （level 0 时为编码器瓶颈 x5）。
+        """
+        ups = (self.edge_dec.d5_1, self.edge_dec.d4_2, self.edge_dec.d3_2, self.edge_dec.d2_2)
+        blocks = (self.edge_dec.d4_1, self.edge_dec.d3_1, self.edge_dec.d2_1, self.edge_dec.d1_1)
+        return blocks[level](torch.cat([ups[level](prev), skip], dim=1))
+
     def _decode(self, up, skip, fuse, level, band_gate=None):
-        """单级解码：ABF → ACAM 对齐 skip → concat → DBB → DDBE → FGR（与 baseline 同序）。
+        """单级解码：ABF → concat skip → DBB → DDBE → FGR（与 baseline 同序）。
 
         FGR 只在 fgr_pos='dec' 时挂在这里；enc/skip 位置在 forward 里各自应用。
         band_gate 非空时（couple 臂）作为编码器同级 FGR 的谱门送进该级 DDBE。
         """
         if self.egf is not None:
             skip = self.egf[level](skip, up)
-        if self.acams is not None:
-            skip = self.acams[level](skip, up)
         out = fuse(torch.cat([up, skip], dim=1))
         if self.ddbe_modules is not None:
             out = (self.ddbe_modules[level](out, band_gate=band_gate)
@@ -414,26 +489,257 @@ class UNet(nn.Module):
         if self.fgr_pos == "skip" and self.fgr_modules is not None:
             # 只改写送进解码器的 skip 副本，编码器主干仍用原特征
             skips = tuple(m(s) for m, s in zip(self.fgr_modules, skips))
-        if self.edge_dec is not None:
+        bi = (self.edge_dec is not None and self.edge_gate == "bi")
+        if self.edge_dec is not None and not bi:
             # 边缘分支只吃共享编码器的瓶颈与原始 skip（浅→深）
             edge = self.edge_dec(x5, (x1, x2, x3, x4))
         # 耦合臂：解码器第 level 级（28²→224²）吃编码器同级 FGR 的谱门，级号按
         # 分辨率配对（解码 level0=28²/512 ← FGR idx3=28²/512，其余同理）。
         gates = (g1, g2, g3, g4)
         d4 = self._decode(self._up(0, x5, skips[3]), skips[3], self.d4_1, 0, gates[3])
+        if self.dec_wrmms is not None:
+            d4 = self.dec_wrmms[0](d4)
+        if bi:
+            e4 = self._edge_level(0, x5, skips[3])
+            e4 = e4 + self.edge_proj[0](d4)
+            d4 = d4 * (1 + self.edge_gate_w[0] * torch.sigmoid(self.edge_heads[0](e4)))
         d3 = self._decode(self._up(1, d4, skips[2]), skips[2], self.d3_1, 1, gates[2])
+        if self.dec_wrmms is not None:
+            d3 = self.dec_wrmms[1](d3)
+        if bi:
+            e3 = self._edge_level(1, e4, skips[2])
+            e3 = e3 + self.edge_proj[1](d3)
+            d3 = d3 * (1 + self.edge_gate_w[1] * torch.sigmoid(self.edge_heads[1](e3)))
         d2 = self._decode(self._up(2, d3, skips[1]), skips[1], self.d2_1, 2, gates[1])
+        if self.dec_wrmms is not None:
+            d2 = self.dec_wrmms[2](d2)
+        if bi:
+            e2 = self._edge_level(2, e3, skips[1])
+            e2 = e2 + self.edge_proj[2](d2)
+            d2 = d2 * (1 + self.edge_gate_w[2] * torch.sigmoid(self.edge_heads[2](e2)))
         d1 = self._decode(self._up(3, d2, skips[0]), skips[0], self.d1_1, 3, gates[0])
+        if self.dec_wrmms is not None:
+            d1 = self.dec_wrmms[3](d1)
+        if bi:
+            e1 = self._edge_level(3, e2, skips[0])
+            e1 = e1 + self.edge_proj[3](d1)
+            d1 = d1 * (1 + self.edge_gate_w[3] * torch.sigmoid(self.edge_heads[3](e1)))
+            edge = self.edge_dec.d1_2(e1)
         if self.edge_fuse_scale is not None:
             # 边缘概率（第 1 类）按标量 γ 残差注入主路最浅层；γ=0 起步
             e = torch.softmax(edge, dim=1)[:, 1:2]
             e = F.interpolate(e, size=d1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = d1 + self.edge_fuse_scale * e
+        # 深监督辅助头吃解码中间特征（112²/128、56²/256），与主输出同网格比例
+        ds = None
+        if self.ds_heads is not None:
+            ds = [(self.ds_heads["h112"](d2), 0.3),
+                  (self.ds_heads["h56"](d3), 0.15)]
         out = self.d1_2(d1)
-        if self.edge_dec is not None:
-            return {"out": out, "edge": edge}
+        sdf = None
+        if self.sdf_head is not None:
+            sdf = self.sdf_head(d1)
+            if self.sdf_mode == "out":
+                out = torch.cat([-self.sdf_sharp * sdf,
+                                 self.sdf_sharp * sdf], dim=1)
+        if self.edge_dec is not None or sdf is not None or ds is not None:
+            res = {"out": out}
+            if self.edge_dec is not None:
+                res["edge"] = edge
+            if sdf is not None:
+                res["sdf"] = sdf
+            if ds is not None:
+                res["aux"] = ds
+            return res
         return out
 
     def load_from(self, weights):
         """train.py 统一调用的预训练加载入口；卷积 U-Net 无 ImageNet 权重可载，直接跳过"""
+        return
+
+
+# ---------------------------------------------------------------------------
+# 标准 U-Net（2026-11-21 起成为 --arch unet 的默认宿主，残差版退到 --unet_style res）
+# ---------------------------------------------------------------------------
+class _PlainDoubleConv(nn.Module):
+    """原版 U-Net 的双卷积块：conv3×3 + BN + ReLU，连续两次（无残差捷径）。"""
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class _PlainDown(nn.Module):
+    """原版下采样：MaxPool2d(2) + 双卷积（零参数池化，不是 stride-2 卷积）。"""
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = _PlainDoubleConv(in_ch, out_ch)
+
+    def forward(self, x):
+        return self.conv(self.pool(x))
+
+
+class _PlainUp(nn.Module):
+    """原版上采样：双线性插值到 skip 尺寸 → 1×1 降维（无 BN、无激活）→ concat → 双卷积。"""
+
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.reduce = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.conv = _PlainDoubleConv(out_ch + skip_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.reduce(x)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+class PlainUNet(nn.Module):
+    """标准 U-Net（Ronneberger 2015 拓扑）+ 与残差版逐点对齐的模块挂载接口。
+
+    通道按原版论文的 64→1024：base_channel=64 时 64/128/256/512/1024，参数量
+    28.95 M；base_channel=32 时 32/64/128/256/512，参数量 7.24 M（与同组研究生
+    的 PlainUNet 逐位同构，可用于交叉核对）。
+
+    与 `UNet`（残差版）的差别只在基础积木：MaxPool 下采样、纯双卷积、无残差、
+    双线性上采样 + 1×1 降维。模块挂载点与调用顺序照抄残差版，保证同一份队列
+    脚本换宿主后仍是单变量对照：
+        编码器 l1..l4 输出 → FGR（fgr_pos=enc 时）
+        解码器四级输出     → DDBE → FGR（fgr_pos=dec 时）→ dec_wrmm(+MLKM)
+    不支持的开关（asr/eff/edge_in/edge_branch/sdf/ds/edge_fuse/edge_gate）直接
+    抛错，避免静默跑成另一个模型。
+    """
+
+    def __init__(self, in_channels=1, num_classes=2, base_channel=64,
+                 ddbe_level=0, ddbe_hf_op="haar",
+                 fgr=False, fgr_mode="whole", fgr_pos="dec", couple=False,
+                 dec_wrmm=0, dec_wrmm_op="haar", dec_wrmm_mlkm=0,
+                 asr=False, eff=False, edge_in=False, edge_branch=False,
+                 edge_fuse="none", edge_gate="none", sdf="none", ds=False,
+                 **_ignored):
+        super().__init__()
+        unsupported = {"asr": asr, "eff": eff, "edge_in": edge_in,
+                       "edge_branch": edge_branch, "sdf": sdf != "none", "ds": ds,
+                       "edge_fuse": edge_fuse != "none", "edge_gate": edge_gate != "none"}
+        bad = [k for k, v in unsupported.items() if v]
+        if bad:
+            raise NotImplementedError(
+                'PlainUNet（标准 U-Net 宿主）暂未接这些开关：%s；需要它们请用 --unet_style res'
+                % ", ".join(bad))
+
+        self.in_channels = int(in_channels)
+        self.base_channel = int(base_channel)
+        c0, c1, c2, c3, c4 = (self.base_channel * m for m in (1, 2, 4, 8, 16))
+
+        # 编码器：stem 双卷积 → 4 次 MaxPool+双卷积
+        self.l1_1 = _PlainDoubleConv(in_channels, c0)
+        self.l1_2 = _PlainDown(c0, c1)
+        self.l2_1 = _PlainDown(c1, c2)
+        self.l3_1 = _PlainDown(c2, c3)
+        self.l4_1 = _PlainDown(c3, c4)
+
+        # 解码器：与残差版同名同序（d5_1 先上采样，d4_1 出该级特征，依此类推）
+        self.d5_1 = _PlainUp(c4, c3, c3)
+        self.d4_1 = _PlainUp(c3, c2, c2)
+        self.d3_1 = _PlainUp(c2, c1, c1)
+        self.d2_1 = _PlainUp(c1, c0, c0)
+        self.d1_2 = nn.Conv2d(c0, num_classes, 1)
+
+        dec_chs = (c3, c2, c1, c0)                 # 28²/512 → 224²/64
+        self.ddbe_modules = None
+        self.fgr_modules = None
+        self.fgr_pos = fgr_pos
+        self.fgr_ddbe_couple = bool(couple)
+        if couple and not (fgr and fgr_pos == "enc" and ddbe_level == 4):
+            raise ValueError('couple=True 需要 fgr=True + fgr_pos="enc" + ddbe_level=4')
+        if ddbe_level:
+            if ddbe_level == 4:
+                self.ddbe_modules = nn.ModuleList([DDBE(c, hf_op=ddbe_hf_op) for c in dec_chs])
+            else:
+                mods = [nn.Identity() for _ in dec_chs]
+                mods[ddbe_level - 1] = DDBE(dec_chs[ddbe_level - 1], hf_op=ddbe_hf_op)
+                self.ddbe_modules = nn.ModuleList(mods)
+        if fgr:
+            if fgr_pos == "dec":
+                chs, sizes = dec_chs, (28, 56, 112, 224)
+            else:
+                chs, sizes = (c0, c1, c2, c3), (224, 112, 56, 28)
+            self.fgr_modules = nn.ModuleList(
+                [FGR(c, s, s, mode=fgr_mode) for c, s in zip(chs, sizes)])
+        self.dec_wrmm = int(dec_wrmm)
+        self.dec_wrmms = None
+        if self.dec_wrmm:
+            if self.dec_wrmm not in (1, 2, 3):
+                raise ValueError('dec_wrmm must be 0/1/2/3, got %r' % (dec_wrmm,))
+            from networks.unet_wmren import WRDM, MLKM
+            levels = {1: (0, 1, 2, 3), 2: (2, 3), 3: (3,)}[self.dec_wrmm]
+            full = bool(dec_wrmm_mlkm)
+
+            def _blk(c):
+                if not full:
+                    return WRDM(c, c, wave_op=dec_wrmm_op, stride=1)
+                return nn.Sequential(WRDM(c, c, wave_op=dec_wrmm_op, stride=1), MLKM(c, c))
+
+            self.dec_wrmms = nn.ModuleList(
+                [_blk(c) if i in levels else nn.Identity() for i, c in enumerate(dec_chs)])
+
+    def attach_edge_fusion(self, kind="abf", init_gamma=0.1):
+        raise NotImplementedError('PlainUNet 不支持 --edge_fusion；请用 --unet_style res')
+
+    def _enc_fgr(self, idx, x):
+        if self.fgr_modules is None or self.fgr_pos != "enc":
+            return x, None
+        if self.fgr_ddbe_couple:
+            return self.fgr_modules[idx](x, return_gate=True)
+        return self.fgr_modules[idx](x), None
+
+    def _decode(self, up, skip, block, level, band_gate=None):
+        out = block(up, skip)
+        if self.ddbe_modules is not None:
+            out = (self.ddbe_modules[level](out, band_gate=band_gate)
+                   if band_gate is not None else self.ddbe_modules[level](out))
+        if self.fgr_modules is not None and self.fgr_pos == "dec":
+            out = self.fgr_modules[level](out)
+        return out
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        x1, g1 = self._enc_fgr(0, self.l1_1(x))          # 224²/64
+        x2, g2 = self._enc_fgr(1, self.l1_2(x1))         # 112²/128
+        x3, g3 = self._enc_fgr(2, self.l2_1(x2))         # 56²/256
+        x4, g4 = self._enc_fgr(3, self.l3_1(x3))         # 28²/512
+        x5 = self.l4_1(x4)                               # 14²/1024
+
+        skips = (x1, x2, x3, x4)
+        if self.fgr_pos == "skip" and self.fgr_modules is not None:
+            skips = tuple(m(s) for m, s in zip(self.fgr_modules, skips))
+        gates = (g1, g2, g3, g4)
+
+        d4 = self._decode(x5, skips[3], self.d5_1, 0, gates[3])
+        if self.dec_wrmms is not None:
+            d4 = self.dec_wrmms[0](d4)
+        d3 = self._decode(d4, skips[2], self.d4_1, 1, gates[2])
+        if self.dec_wrmms is not None:
+            d3 = self.dec_wrmms[1](d3)
+        d2 = self._decode(d3, skips[1], self.d3_1, 2, gates[1])
+        if self.dec_wrmms is not None:
+            d2 = self.dec_wrmms[2](d2)
+        d1 = self._decode(d2, skips[0], self.d2_1, 3, gates[0])
+        if self.dec_wrmms is not None:
+            d1 = self.dec_wrmms[3](d1)
+        return self.d1_2(d1)
+
+    def load_from(self, weights):
         return

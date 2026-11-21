@@ -65,21 +65,25 @@ def build_model(args):
         return ViT_seg(config_vit, img_size=args.img_size, num_classes=2,
                        edge_in=bool(args.edge_in), edge_op=args.edge_op,
                        wavelet_basis=args.wavelet_basis,
-                       ddbe_level=args.ddbe,
-                       acam=bool(args.acam), hf_branch=bool(args.hf_branch),
+                       ddbe_level=args.ddbe, ddbe_hf_op=args.ddbe_hf_op,
+                       hf_branch=bool(args.hf_branch),
                        hf_lambda=args.hf_lambda,
                        bdfr_v2=bool(args.bdfr_v2), bdfr_ddbe=bool(args.bdfr_ddbe),
-                       bdfr_acam=bool(args.bdfr_acam), bdfr_wave_op=args.bdfr_wave_op,
+                       bdfr_wave_op=args.bdfr_wave_op,
                        ffusion=bool(args.ffusion))
     if args.arch == 'unet':
         from networks.unet import UNet
         return UNet(in_channels=1, num_classes=2, edge_in=bool(args.edge_in),
                     edge_op=args.edge_op, wavelet_basis=args.wavelet_basis,
                     ddbe_level=args.ddbe,
-                    acam=bool(args.acam), asr=bool(args.asr))
+                    ddbe_hf_op=args.ddbe_hf_op,
+                    asr=bool(args.asr))
     if args.arch == 'wmren':
         from networks.unet_wmren import UNetWMREN
-        return UNetWMREN(in_channels=1, num_classes=2)
+        return UNetWMREN(in_channels=1, num_classes=2,
+                         ablate=(args.wmren_ablate or None),
+                         wave_op=args.wmren_wave_op,
+                         enc=args.wmren_enc)
     raise SystemExit('eval_cross_center.py 未接 arch=%s（当前只覆盖 baseline/unet/wmren）' % args.arch)
 
 
@@ -99,7 +103,23 @@ def main():
     parser.add_argument('--wavelet_basis', type=str, default='haar',
                         help='与训练时保持一致（haar/db2/db4/sym4/coif1/bior1.5）')
     parser.add_argument('--ddbe', type=int, default=0)
-    parser.add_argument('--acam', type=int, default=0)
+    # 2026-11-19 补：U-Net 的 DDBE 接的是 --ddbe_hf_op，此前没传 → 评 lap 权重会按默认 haar
+    # 建块，load_state_dict 直接尺寸/形状不匹配。baseline 侧同理（bdfr 走 --bdfr_wave_op）。
+    parser.add_argument('--ddbe_hf_op', type=str, default='haar',
+                        choices=['haar', 'lap', 'pyr', 'none', 'plain'],
+                        help='与训练时一致（haar 默认 / lap 拉普拉斯 / pyr 金字塔 / none / plain）')
+    # 2026-11-19 补：WMREN 线的三种权重（K2 / r50wrmm / 各自的 lap 版）必须能按训练口径重建，
+    # 此前只建裸 UNetWMREN()（enc=wrmm、ablate 空、haar），评 wmren 的快照一律结构不匹配。
+    parser.add_argument('--wmren_enc', type=str, default='wrmm',
+                        choices=['wrmm', 'r50', 'r50deep', 'r50wrmm', 'r50seq'],
+                        help='与训练时一致：wrmm（默认，从零）/ r50wrmm（R50 四级并联 WRMM 精炼）')
+    parser.add_argument('--wmren_ablate', type=str, default='',
+                        choices=['', 'unet_enc', 'unet_dec', 'no_wave', 'no_mlkm',
+                                 'no_rem', 'no_gate'],
+                        help='与训练时一致：unet_dec = 解码器换普通 U-Net 解码器（K2 宿主）')
+    parser.add_argument('--wmren_wave_op', type=str, default='haar',
+                        choices=['haar', 'lap', 'pyr'],
+                        help='与训练时一致：WRDM 左支算子')
     parser.add_argument('--asr', type=int, default=0)
     parser.add_argument('--hf_branch', type=int, default=0)
     parser.add_argument('--hf_lambda', type=float, default=0.3)
@@ -108,7 +128,6 @@ def main():
     parser.add_argument('--bdfr_v2', type=int, default=0)
     parser.add_argument('--bdfr_ddbe', type=int, default=1,
                         help='DDBE 块（含 ECA），与训练口径一致')
-    parser.add_argument('--bdfr_acam', type=int, default=1)
     parser.add_argument('--bdfr_wave_op', type=str, default='haar',
                         choices=['haar', 'lap', 'pyr'])
     parser.add_argument('--ffusion', type=int, default=0)

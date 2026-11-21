@@ -48,7 +48,7 @@ $common = @(
 $jobs = @(
     @{ n = "CTL"; tag = "ddbectl"
        a = @("--arch", "baseline", "--vit_layers", "0",
-             "--ddbe", "4", "--ddbe_hf_op", "plain", "--acam", "0")
+             "--ddbe", "4", "--ddbe_hf_op", "plain")
        snap = "TU_pretrain_R50-ViT-B_16_skip3_vitL0_epo200_bs4_ga2_224_SPARC_ddbe4_ddhfplain_c2d" },
     @{ n = "A1"; tag = "r50drdac"
        a = @("--arch", "baseline", "--vit_layers", "0", "--r50_fdf", "drdac")

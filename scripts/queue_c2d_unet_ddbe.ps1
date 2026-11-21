@@ -1,10 +1,11 @@
-# 2026-11-01 队列：U-Net 上挂 BDFR-Net 解码器改造（DDBE / ACAM）。
-# 动机：WMREN(IJCAI-25) 与 BDFR 都把解码器整体换掉；此前 DDBE/ACAM 只在
+﻿# 2026-11-01 队列：U-Net 上挂 BDFR-Net 解码器改造（DDBE）。
+# 动机：WMREN(IJCAI-25) 与 BDFR 都把解码器整体换掉；此前 DDBE 只在
 # TransUNet(baseline) 上跑过（无增益），U-Net 上从未验证，而 U-Net 对边缘
-# 输入更敏感（+1.21% vs TransUNet 0）。两个 job 单变量对照 U-Net 基线 86.55%。
+# 输入更敏感（+1.21% vs TransUNet 0）。单变量对照 U-Net 基线 86.55%。
 #
 #   U1  --arch unet --ddbe 4          四级解码器全挂 DDBE（零初始化恒等起步）
-#   U2  --arch unet --ddbe 4 --acam 1 再加每级 skip 的 ACAM 跨级对齐
+#
+# 注：原 U2（DDBE×4 + ACAM）随 ACAM 于 2026-11-20 移除一并删除。
 #
 # 统一口径与 c2d 队列一致：SPARC / seed 1234 / bs4+ga2 / 200 epoch / 每 5 ep 评估。
 #
@@ -44,9 +45,7 @@ $pre = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224"
 
 $jobs = @(
     @{ Name = "U1_unet_ddbe4"; Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--arch", "unet", "--ddbe", "4") + $common;
-       Snapshot = "${pre}_SPARC_ddbe4_unet_c2d" },
-    @{ Name = "U2_unet_ddbe4_acam"; Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--arch", "unet", "--ddbe", "4", "--acam", "1") + $common;
-       Snapshot = "${pre}_SPARC_ddbe4_acam_unet_c2d" }
+       Snapshot = "${pre}_SPARC_ddbe4_unet_c2d" }
 )
 
 if ($Only -ne "") {

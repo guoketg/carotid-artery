@@ -52,8 +52,8 @@ def build_model(vit_layers=0, img_size=224):
     cfg.transformer.num_layers = vit_layers
     cfg.patches.grid = (int(img_size / 16), int(img_size / 16))
     return ViT_seg(cfg, img_size=img_size, num_classes=2, edge_in=False, edge_op='wavelet',
-                   wavelet_basis='haar', ddbe_level=0, acam=False, hf_branch=False,
-                   hf_lambda=0.3, bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True,
+                   wavelet_basis='haar', ddbe_level=0, hf_branch=False,
+                   hf_lambda=0.3, bdfr_v2=False, bdfr_ddbe=True,
                    bdfr_wave_op='haar', ffusion=False)
 
 

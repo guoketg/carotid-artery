@@ -1,12 +1,12 @@
-# 2026-11-07 队列：R50 单编码器协议下的融合算子对照（3 个 job 串行）。
+﻿# 2026-11-07 队列：R50 单编码器协议下的融合算子对照（3 个 job 串行）。
 # 宿主统一为新协议 A：--vit_layers 0（去掉 12 层 ViT，只留 R50 + DecoderCup，23.5 M），
 # 统一口径：SPARC / seed 1234 / bs4 + ga2 / 200 epoch / 每 5 epoch 测。
 # A 基线已跑过（90.49 / ASSD 0.142 / HD 0.71），此队列不重跑基线。
 #
 #   F1  --ffusion 1                            FreqFusion（NeurIPS 2024，Eq.6–13）
 #                                              插在 up+skip 融合点，+0.413 M
-#   F2  --bdfr_v2 1 --bdfr_acam 0              DDBE 块（DDBE+ECA）只挂解码特征，skip 仍 concat
-#                                              即 B3 配置搬到 R50 宿主，约 +30 M
+#   F2  --bdfr_v2 1                            DDBE 块（DDBE+ECA）只挂解码特征，skip 走 concat
+#                                              即 B3 配置搬到 R50 宿主，DDBE 增量 +41.70 M
 #   F3  同 F2 + --bdfr_wave_op lap             DDBE 块内 Haar → 单尺度拉普拉斯（零参数变化）
 #
 # 判定（对 A = 90.49 / HD 0.71）：
@@ -51,9 +51,9 @@ $jobs = @(
     # 显存增量最小的先跑，便于早发现 OOM
     @{ Name = "F1_r50_ffusion"; Args = @("train.py", "--arch", "baseline", "--ffusion", "1") + $common;
        Snapshot = "${pre}_SPARC_c2d_ff" },
-    @{ Name = "F2_r50_ddbe_only"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1", "--bdfr_acam", "0") + $common;
+    @{ Name = "F2_r50_ddbe_only"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1") + $common;
        Snapshot = "${pre}_SPARC_c2d_bdfr2_na" },
-    @{ Name = "F3_r50_ddbe_lap"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1", "--bdfr_acam", "0", "--bdfr_wave_op", "lap") + $common;
+    @{ Name = "F3_r50_ddbe_lap"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1", "--bdfr_wave_op", "lap") + $common;
        Snapshot = "${pre}_SPARC_c2d_bdfr2_na_bwlap" }
 )
 

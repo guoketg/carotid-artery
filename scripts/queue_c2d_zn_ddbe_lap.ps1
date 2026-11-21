@@ -1,6 +1,6 @@
 ﻿# DDBE + 拉普拉斯在第二个数据集（Zhongnan）上的复现验证。
 #
-# 背景：SPARC 上「R50 + BDFR-Net DDBE×4、ACAM 关、HF/LF 换单尺度拉普拉斯」
+# 背景：SPARC 上「R50 + BDFR-Net DDBE×4、skip 融合 concat、HF/LF 换单尺度拉普拉斯」
 #       = 90.9960 / 0.13577 / HD 0.6581，相对 R50 基线 90.4903 为 ΔDice +0.506、
 #       ΔHD −0.048（单 seed 刚过 Dice 线）。用户要求换数据集复核，防止是 SPARC
 #       特有的波动。
@@ -45,7 +45,7 @@ $jobs = @(
        snap = "TU_pretrain_R50-ViT-B_16_skip3_vitL0_epo200_bs4_ga2_224_Zhongnan_c2d" },
     @{ n = "Z1"; tag = "zn_ddbe_lap"
        a = @("--arch", "baseline", "--vit_layers", "0",
-             "--bdfr_v2", "1", "--bdfr_acam", "0", "--bdfr_wave_op", "lap")
+             "--bdfr_v2", "1", "--bdfr_wave_op", "lap")
        snap = "TU_pretrain_R50-ViT-B_16_skip3_vitL0_epo200_bs4_ga2_224_Zhongnan_bdfr2_na_bwlap_c2d" }
 )
 

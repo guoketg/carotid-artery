@@ -22,8 +22,8 @@ from scipy import ndimage
 from . import vit_seg_configs as configs
 from .vit_seg_modeling_resnet_skip import ResNetV2
 from .wavelet import build_hf_image, build_edge_map
-from .ddbe import DDBE, ACAM
-from .bdfr_v2 import DDBEv2, ACAMv2
+from .ddbe import DDBE
+from .bdfr_v2 import DDBEv2
 from .hf_branch import HFBranch, FAM, HF_DET_CHANNELS
 from .sdf import SDFHead
 
@@ -406,13 +406,16 @@ class DecoderCup(nn.Module):
         self.egf = None
         self._in_channels = in_channels
         self._skip_channels = skip_channels
-        # DDBE / ACAM 由 VisionTransformer 在全部基础权重初始化之后挂上（保证同 seed RNG 对齐）
+        # DDBE 由 VisionTransformer 在全部基础权重初始化之后挂上（保证同 seed RNG 对齐）
         self.ddbe = None
         self.ddbe_idx = -1
         self.ddbe_all = None
-        self.acams = None
+        # ACAM 已于 2026-11-20 移除，skip 融合固定走 concat
         # FDS（Syn-Net Eq.13）：非空时 forward 额外返回三级辅助 logits
         self.fds = None
+        # 多尺度深监督（--ds）：56²/112² 两侧解码中间特征挂 1×1 头，
+        # 非空时 forward 额外返回这两级辅助 logits（推理不参与评测）
+        self.ds_heads = None
         # FEM（--r50_fdf 解码器四级）/ FGR（--fgr）：同样由 VisionTransformer 最后挂载
         self.fem_dec = None
         self.fgr_all = None
@@ -420,6 +423,9 @@ class DecoderCup(nn.Module):
         # 112²/64 → 224²/16），每级独立实例；同样最后挂载保证 RNG 对齐
         self.fd_mfea = None
         self.fd_fgbr = None
+        # 解码器 WRMM（--dec_wrmm）：由 VisionTransformer 在全部基础权重初始化之后挂
+        # （同 fgr_all / fem_dec），保证同 seed 的基础权重与不挂载版本逐位对齐
+        self.dec_wrmm_all = None
 
     def attach_edge_fusion(self, gate_mode="spatial", init_gamma=0.0, kind="rel", depth=1):
         """在全部基础权重初始化之后挂边缘融合模块（保证同 seed 的基础权重逐位对齐）。
@@ -466,6 +472,7 @@ class DecoderCup(nn.Module):
         aux = [] if self.fds is not None else None
         if aux is not None:
             aux.append(x)          # 14² / 512（conv_more 输出）
+        ds_aux = [] if self.ds_heads is not None else None
         for i, decoder_block in enumerate(self.blocks):
             if features is not None:
                 skip = features[i] if (i < self.config.n_skip) else None
@@ -474,9 +481,6 @@ class DecoderCup(nn.Module):
             if skip is not None and self.egf is not None and self.egf[i] is not None:
                 # R-GEF：边缘按逐像素可靠性残差注入 skip
                 skip = self.egf[i](skip, x)
-            if skip is not None and self.acams is not None:
-                # ACAM：深层特征跨级对齐 skip（ddbefull；零初始化恒等起步）
-                skip = self.acams[i](skip, x)
             if skip is not None and self.ffs is not None and self.ffs[i] is not None:
                 # FreqFusion 自己完成上采样 + 融合，输出通道 = 原 up+cat 的通道
                 x = self.ffs[i](x, skip)
@@ -495,27 +499,38 @@ class DecoderCup(nn.Module):
                 x = self.fd_mfea[i](x)
             if self.fd_fgbr is not None:
                 x = self.fd_fgbr[i](x)
+            if self.dec_wrmm_all is not None:
+                x = self.dec_wrmm_all[i](x)
             if aux is not None and i in (0, 1):
                 aux.append(x)      # 28² / 256（block0 后）、56² / 128（block1 后）
+            if ds_aux is not None:
+                # 深监督：解码 56² 与 112² 两级各出一个辅助 logits（权重浅层更大）
+                if i == 1:
+                    ds_aux.append((self.ds_heads['h56'](x), 0.15))
+                elif i == 2:
+                    ds_aux.append((self.ds_heads['h112'](x), 0.3))
         if aux is not None:
-            return x, self.fds(aux)
+            aux = self.fds(aux)
+            return x, (aux + ds_aux if ds_aux else aux)
+        if ds_aux is not None:
+            return x, ds_aux
         return x
 
 
 class DecoderCupBDFR(nn.Module):
-    """BDFR-Net 忠实版解码器（Eq.1–10）。
+    """BDFR-Net 忠实版解码器（Eq.1–6）。
 
-    每级：DDBE(解码特征) → 上采样 → ACAM(编码 skip, 解码特征) 加性融合 → conv 细化。
+    每级：DDBE(解码特征) → 上采样 → concat(编码 skip) → conv 细化。
+    ACAM（论文 Eq.7–10）已于 2026-11-20 整体移除，skip 融合固定为 concat。
     TransUNet 的 skip 在 28/56/112（比解码特征 14/28/56 浅一个八度），
-    因此 ACAM 只能落在上采样之后的融合点，这是骨干决定的唯一相位差。
+    融合只能落在上采样之后，这是骨干决定的相位差。
     """
 
-    def __init__(self, config, use_ddbe=True, use_acam=True, wave_op='haar'):
+    def __init__(self, config, use_ddbe=True, wave_op='haar'):
         super(DecoderCupBDFR, self).__init__()
         self.config = config
         self.n_skip = config.n_skip
         self.use_ddbe = use_ddbe
-        self.use_acam = use_acam
         self.wave_op = wave_op
         head_channels = 512
         self.conv_more = Conv2dReLU(config.hidden_size, head_channels, 3, padding=1, use_batchnorm=True)
@@ -524,18 +539,14 @@ class DecoderCupBDFR(nn.Module):
         skip_channels = list(config.skip_channels)  # 拷贝，避免原地改 config
         for i in range(4 - self.n_skip):
             skip_channels[3 - i] = 0
-        self.fused = [use_acam and sk > 0 for sk in skip_channels]
         self.ups = nn.ModuleList([nn.UpsamplingBilinear2d(scale_factor=2) for _ in in_channels])
         self.conv1 = nn.ModuleList([
-            Conv2dReLU(ic if fz else ic + sk, oc, 3, padding=1, use_batchnorm=True)
-            for ic, oc, sk, fz in zip(in_channels, decoder_channels, skip_channels, self.fused)])
+            Conv2dReLU(ic + sk, oc, 3, padding=1, use_batchnorm=True)
+            for ic, oc, sk in zip(in_channels, decoder_channels, skip_channels)])
         self.conv2 = nn.ModuleList([
             Conv2dReLU(oc, oc, 3, padding=1, use_batchnorm=True) for oc in decoder_channels])
         if use_ddbe:
             self.ddbe = nn.ModuleList([DDBEv2(c, wave_op=wave_op) for c in in_channels])
-        if use_acam:
-            self.acam = nn.ModuleList([
-                ACAMv2(sk, ic) for sk, ic in zip(skip_channels[:self.n_skip], in_channels[:self.n_skip])])
         self.fds = None  # BDFR 版不接 FDS
 
     def forward(self, hidden_states, features=None):
@@ -548,9 +559,7 @@ class DecoderCupBDFR(nn.Module):
                 x = self.ddbe[i](x)
             x = up(x)
             skip = features[i] if (features is not None and i < self.n_skip) else None
-            if self.fused[i]:
-                x = self.acam[i](skip, x)
-            elif skip is not None:
+            if skip is not None:
                 x = torch.cat([x, skip], dim=1)
             x = c2(c1(x))
         return x
@@ -575,14 +584,16 @@ class FDSHeads(nn.Module):
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 edge_in=False, edge_op="wavelet", wavelet_basis="haar", ddbe_level=0, acam=False,
+                 edge_in=False, edge_op="wavelet", wavelet_basis="haar", ddbe_level=0,
                  ddbe_hf_op="haar", hf_branch=False, hf_lambda=0.3,
-                 bdfr_v2=False, bdfr_ddbe=True, bdfr_acam=True, bdfr_wave_op="haar",
+                 bdfr_v2=False, bdfr_ddbe=True, bdfr_wave_op="haar",
                  ffusion=False, edge_fusion=False, edge_gate="spatial", edge_gamma=0.0,
                  edge_kind="rel", edge_depth=1, r50_fdf="none", fgr=False, fgr_mode="whole",
                  fgr_pos="dec",
+                 brp=False, brp_levels="1,2", brp_gate=False, brp_control=False,
                  fd_mfea=False, fd_fgbr=False, head_hr=False, edge_branch=False,
-                 edge_fuse="none", sdf="none", sdf_tau=12.0):
+                 edge_fuse="none", sdf="none", sdf_tau=12.0, ds=False,
+                 dec_wrmm=0, dec_wrmm_op="haar", dec_wrmm_mlkm=0):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -595,11 +606,10 @@ class VisionTransformer(nn.Module):
         self.wavelet_basis = wavelet_basis
         self.transformer = Transformer(config, img_size, vis,
                                        in_channels=4 if edge_in else 3)
-        # bdfr_v2：BDFR-Net Eq.(1)–(10) 忠实解码器（DDBE×4 + ACAM 替代 concat）
+        # bdfr_v2：BDFR-Net 忠实解码器（DDBE×4，skip 融合固定 concat）
         self.bdfr_v2 = bdfr_v2
         if bdfr_v2:
-            self.decoder = DecoderCupBDFR(config, use_ddbe=bdfr_ddbe, use_acam=bdfr_acam,
-                                          wave_op=bdfr_wave_op)
+            self.decoder = DecoderCupBDFR(config, use_ddbe=bdfr_ddbe, wave_op=bdfr_wave_op)
         else:
             self.decoder = DecoderCup(config, ffusion=ffusion)
         self.segmentation_head = SegmentationHead(
@@ -610,7 +620,6 @@ class VisionTransformer(nn.Module):
         self.config = config
         # ddbe_level 1~3 = 解码器第 N 级输出（实际 28/56/112/224，level3=112×112/64ch）挂 DDBE；
         # 4 = 四级全挂 DDBE×4（BDFR-Net 完整版，消融「挂几层」）。
-        # acam = 每个 decoder 级对 skip 特征做 ACAM 跨级语义对齐（ddbefull = ddbe4 + acam）。
         # 必须最后再建：否则随机数消耗顺序改变，同 seed 的基础权重与不挂的版本不再对齐。
         if ddbe_level == 4:
             self.decoder.ddbe_all = nn.ModuleList(
@@ -619,12 +628,6 @@ class VisionTransformer(nn.Module):
             self.decoder.ddbe = DDBE(config.decoder_channels[ddbe_level - 1],
                                      hf_op=ddbe_hf_op)
             self.decoder.ddbe_idx = ddbe_level - 1
-        if acam:
-            in_ch = [512] + list(config.decoder_channels[:-1])
-            self.decoder.acams = nn.ModuleList([
-                ACAM(sk, ic) for sk, ic in zip(config.skip_channels[:config.n_skip],
-                                               in_ch[:config.n_skip])
-            ])
         # hf_branch = GobletNet 式：轻量 HF 特征支 + FAM 与 skip 逐级互标定（批次 2）。
         # 高频图 H = HL+LH+HH+λ·LL 在 forward 内现算（λ 固定超参，不进 state_dict）。
         # 同样必须等全部基础权重建完再创建（RNG 对齐纪律），恒等起步见 hf_branch.py。
@@ -695,6 +698,18 @@ class VisionTransformer(nn.Module):
             hm.fgr_enc = nn.ModuleList([
                 FGR(c, hh, ww, mode=fgr_mode)
                 for c, hh, ww in ((64, 112, 112), (256, 55, 55), (512, 28, 28), (1024, 14, 14))])
+        if brp:
+            # --brp（2026-11-18）：编码器分带重投影，位置消融（浅 1,2 / 深 3,4 / 四级 / +跨级门）。
+            # 只把「分带→拼接→1×1 重投影→零初始化残差」搬到编码器——这是 R50 上唯一有正证据
+            # 的形态（解码器 DDBE 四级 +0.435 / 单尺度拉普拉斯 +0.506，plain 对照仅 +0.060）；
+            # 编码器侧此前的门控回注全负（FGR enc −1.64）。形状同 fgr_enc（padding hack 前 55²）。
+            from .band_reproject import EncoderBandStack
+            hm = self.transformer.embeddings.hybrid_model
+            levels = tuple(int(v) for v in
+                           str(brp_levels).replace(' ', '').split(',') if v != '')
+            hm.brp_enc = EncoderBandStack(
+                ((64, 112, 112), (256, 55, 55), (512, 28, 28), (1024, 14, 14)),
+                levels, use_gate=brp_gate, control=brp_control)
         if fd_mfea or fd_fgbr:
             from .freqdino import MFEA, FGBR
             # 四级全挂：每级一个独立实例，通道跟着解码器分级走
@@ -737,6 +752,36 @@ class VisionTransformer(nn.Module):
         self.sdf_sharp = 0.5  # logit = sharp·sdf，界面位于 sdf=0，概率斜坡宽约 ±2/ sharp px
         if sdf != "none":
             self.sdf_head = SDFHead(config['decoder_channels'][-1], tau=float(sdf_tau))
+        # 多尺度深监督头（--ds）：同样最后创建（RNG 对齐），只挂在标准 DecoderCup 上。
+        # 通道对应解码 level：56² ← decoder_channels[1]、112² ← decoder_channels[2]。
+        self.ds_mode = bool(ds)
+        if ds:
+            if not isinstance(self.decoder, DecoderCup):
+                raise ValueError('--ds 目前只接标准 DecoderCup（--bdfr_v2 1 不支持）')
+            dc = list(config['decoder_channels'])
+            self.decoder.ds_heads = nn.ModuleDict({
+                'h56': nn.Conv2d(dc[1], config['n_classes'], 1),
+                'h112': nn.Conv2d(dc[2], config['n_classes'], 1),
+            })
+        # 解码器 WRMM（2026-11-20）：把 unet_wmren 编码器的 WRDM 镜像搬到 DecoderCup，
+        # stride=1 同级精炼，挂在每个解码级（28²/256 → 56²/128 → 112²/64 → 224²/16）
+        # 的 DBB 之后（与 fem_dec / fgr_all 同一位置、同一顺序）。最后创建（RNG 对齐）。
+        self.dec_wrmm = int(dec_wrmm)
+        if self.dec_wrmm:
+            if not isinstance(self.decoder, DecoderCup):
+                raise ValueError('--dec_wrmm 目前只接标准 DecoderCup（--bdfr_v2 1 不支持）')
+            from .unet_wmren import WRDM, MLKM
+            levels = {1: (0, 1, 2, 3), 2: (2, 3), 3: (3,)}[self.dec_wrmm]
+            full = bool(dec_wrmm_mlkm)   # 1 = 完整 WRMM（WRDM → MLKM），0 = 只有 WRDM
+
+            def _blk(c):
+                if not full:
+                    return WRDM(c, c, wave_op=dec_wrmm_op, stride=1)
+                return nn.Sequential(WRDM(c, c, wave_op=dec_wrmm_op, stride=1), MLKM(c, c))
+
+            self.decoder.dec_wrmm_all = nn.ModuleList([
+                _blk(c) if i in levels else nn.Identity()
+                for i, c in enumerate(config['decoder_channels'])])
 
     def forward(self, x):
         x_in = x  # HF 支要从 repeat 之前的 1 通道原图派生高频图
@@ -771,6 +816,10 @@ class VisionTransformer(nn.Module):
             # 但走独立的第二个解码器，输出 2 类边缘 logits（背景 / 边缘带）
             edge = self.edge_head(self.edge_dec(x_enc, features))
         x = self.decoder(x, features)
+        ds_aux = None
+        if isinstance(x, tuple):
+            # FDS / 多尺度深监督：解码器额外返回辅助 logits 列表 [(logits, w), ...]
+            x, ds_aux = x
         if self.edge_fuse_scale is not None:
             # 边缘概率（第 1 类）按标量 γ 残差注入主路解码特征；γ=0 起步
             e = torch.softmax(edge, dim=1)[:, 1:2]
@@ -788,12 +837,14 @@ class VisionTransformer(nn.Module):
                 # 事件位置是连续的，不存在 argmax 的整像素量化。
                 logits = torch.cat([-self.sdf_sharp * sdf,
                                     self.sdf_sharp * sdf], dim=1)
-        if edge is not None or sdf is not None:
+        if edge is not None or sdf is not None or ds_aux is not None:
             out = {"out": logits}
             if edge is not None:
                 out["edge"] = edge
             if sdf is not None:
                 out["sdf"] = sdf
+            if ds_aux is not None:
+                out["aux"] = ds_aux
             return out
         return logits
 

@@ -1,11 +1,11 @@
-# 2026-11-04 队列：BDFR-Net（3612 Submission）忠实复现的 4 组消融。
+﻿# 2026-11-04 队列：BDFR-Net（3612 Submission）忠实复现的 4 组消融。
 # 骨干/数据集沿用本项目：TransUNet（R50-ViT-B/16，--arch baseline）+ SPARC 颈动脉；
 # 除数据集与骨干外，按论文 Eq.(1)–(10) 重写解码器（networks/bdfr_v2.py + DecoderCupBDFR）。
 #
 #   B0  --arch baseline                          纯 TransUNet（论文口径重跑，作为同一协议下的基线）
-#   B1  --arch baseline --bdfr_v2 1              完整论文实现（DDBE×4 + ACAM 替代 concat）
-#   B2  --arch baseline --bdfr_v2 1 --bdfr_ddbe 0  完整去掉 DDBE（连同其 ECA），只留 ACAM
-#   B3  --arch baseline --bdfr_v2 1 --bdfr_acam 0  去掉 ACAM（回退 concat），只留 DDBE×4
+#   B3  --arch baseline --bdfr_v2 1              DDBE×4（skip 融合 concat；ACAM 已于 2026-11-20 移除）
+#
+# 注：原 B1（DDBE×4 + ACAM）与 B2（去 DDBE、只留 ACAM）两臂随 ACAM 移除一并删除。
 #
 # 论文口径（§3.1）：AdamW lr 1e-4 / wd 1e-4、Dice+CE、rotation+gray-scale+gamma 增强、
 # batch 16、100 epoch。硬件限制（12GB 单卡）用 bs8 × ga2 = 有效 bs16 等价替代；
@@ -48,15 +48,10 @@ $common = @(
 $pre = "TU_pretrain_R50-ViT-B_16_skip3_epo100_bs8_ga2_lr0.0001_224"
 
 $jobs = @(
-    # 显存最重的 B1 先跑：若 12GB 放不下会立刻失败，不至于白等一整夜
-    @{ Name = "B1_bdfr2_full"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1") + $common;
-       Snapshot = "${pre}_SPARC_bdfr2_c2d" },
     @{ Name = "B0_baseline"; Args = @("train.py", "--arch", "baseline") + $common;
        Snapshot = "${pre}_SPARC_c2d" },
-    @{ Name = "B3_bdfr2_no_acam"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1", "--bdfr_acam", "0") + $common;
-       Snapshot = "${pre}_SPARC_bdfr2_na_c2d" },
-    @{ Name = "B2_bdfr2_no_ddbe"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1", "--bdfr_ddbe", "0") + $common;
-       Snapshot = "${pre}_SPARC_bdfr2_nod_c2d" }
+    @{ Name = "B3_bdfr2"; Args = @("train.py", "--arch", "baseline", "--bdfr_v2", "1") + $common;
+       Snapshot = "${pre}_SPARC_bdfr2_na_c2d" }
 )
 
 if ($Only -ne "") {

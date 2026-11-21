@@ -33,6 +33,27 @@ def _primary_out(outputs):
     return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
 
+def bce_dice_sum_parts(out, label):
+    """A0 基础项（BCEWithLogits + soft Dice 各 1.0 相加）的拆分实现。
+
+    2026-11-21 抽出为模块级函数：`--loss bce_dice_sum`（A0 基线）与
+    `--loss rhd --rhd_base bce_dice_sum`（A0 基础 + 区域 HD 项）必须共用同一段算式，
+    否则「基线 → +RHD」就不是单变量。返回 (总损失, bce 分项, dice 分项)。
+    """
+    logit = out[:, 1] - out[:, 0]
+    tgt = label.float()
+    if tgt.dim() == 4:
+        tgt = tgt[:, 0]
+    l_bce = F.binary_cross_entropy_with_logits(logit, tgt)
+    prob = torch.sigmoid(logit)
+    dims = tuple(range(1, prob.ndim))
+    inter = (prob * tgt).sum(dim=dims)
+    denom = prob.sum(dim=dims) + tgt.sum(dim=dims)
+    dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
+    l_dice = 1.0 - dice.mean()
+    return l_bce + l_dice, l_bce, l_dice
+
+
 def _edge_target(label, k=3):
     """由原 GT 掩膜经边缘算子得到边缘标签（与 CCFR Stage1 同口径，可复现）：
 
@@ -57,6 +78,11 @@ def _sdf_target(label, tau=12.0):
     m = (label.detach().cpu().numpy() > 0)
     out = np.empty(m.shape, dtype=np.float32)
     for i in range(m.shape[0]):
+        if not m[i].any():
+            # GT 全空时"到最近前景的距离"未定义（scipy 会返回全 1，clip 后变成 -1），
+            # 统一取 -tau：窄带为空，该样本的几何场项贡献 0，不引入假的 -1 目标
+            out[i] = -tau
+            continue
         d = ndi.distance_transform_edt(m[i]) - ndi.distance_transform_edt(~m[i])
         out[i] = np.clip(d, -tau, tau)
     return torch.from_numpy(out)
@@ -241,6 +267,26 @@ def _eval_test(model, testloader, root_path):
     return records, summarize(records)
 
 
+def _check_finite_or_skip(loss, nan_streak, nan_patience, step_no):
+    """NaN/Inf 守卫：判断本步损失是否有限，返回 (是否跳过该步, 新的连续非有限计数)。
+
+    背景：2026-11-16 的 unet_sdfaux_cons_ds 臂在 iter 3136（约 ep36）起出现间歇 nan，
+    ep75 起 test curve 一直 dice=0.00% 挂到 ep200，脚本仍 exit 0 并落盘 epoch_199.pth，
+    属于「队列只认 exit_code」的静默污染。本守卫把这种情况在训练侧拦掉：
+    单步非有限 → 跳过该步（清空已累积梯度、不计 iter、不更新 LR/权重）；
+    连续 nan_patience 步仍非有限 → 抛 RuntimeError，让进程以非零码退出。
+    """
+    if bool(torch.isfinite(loss).all()):
+        return False, 0
+    streak = nan_streak + 1
+    logging.warning('iteration %d : non-finite loss (streak %d/%d), skip step'
+                    % (step_no, streak, nan_patience))
+    if streak >= nan_patience:
+        raise RuntimeError('连续 %d 步出现非有限损失，中止训练以防 NaN 权重落盘'
+                           % nan_patience)
+    return True, streak
+
+
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
@@ -270,13 +316,42 @@ def trainer_synapse(args, model, snapshot_path):
                                   use_wavelet=bool(args.use_wavelet),
                                   gamma_aug=bool(getattr(args, 'gamma_aug', 0)),
                                   weight_file=weight_file,
-                                  edge_mode=edge_mode)
+                                  edge_mode=edge_mode,
+                                  align_proto=bool(getattr(args, 'align_proto', 0)),
+                                  a0_proto=bool(getattr(args, 'a0_prep', 0)))
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
-                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode)
-        testloader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
+                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode,
+                                  align_proto=bool(getattr(args, 'align_proto', 0)),
+                                  a0_proto=bool(getattr(args, 'a0_prep', 0)))
+        testloader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers,
+                                persistent_workers=args.num_workers > 0,
+                                prefetch_factor=2 if args.num_workers > 0 else None)
         curve_path = os.path.join(snapshot_path, 'test_curve.csv')
         curve_rows = []
+        # 2026-11-21：验证集 + best-val 选模。仅在 --select_val 1 且该子集存在 val.txt 时启用，
+        # 默认关（历史臂没有 val，行为逐位不变）。
+        valloader = None
+        val_features = []
+        val_curve_path = os.path.join(snapshot_path, 'val_curve.csv')
+        best_val_dice, best_val_epoch = -1.0, -1
+        if int(getattr(args, 'select_val', 0)):
+            val_list = os.path.join(split_dir, "val.txt")
+            if not os.path.isfile(val_list):
+                raise FileNotFoundError('--select_val 1 但没有验证集清单: %s' % val_list)
+            val_set = CarotidDataset(root=args.root_path, list_file=val_list,
+                                     split="val", img_size=args.img_size,
+                                     augment=False,
+                                     use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode,
+                                     align_proto=bool(getattr(args, 'align_proto', 0)),
+                                     a0_proto=bool(getattr(args, 'a0_prep', 0)))
+            # 2026-11-21：val 每 epoch 都跑一次，原来每次迭代都要 spawn 一个新 worker、
+            # 重新装列表里的切片，GPU 在 epoch 尾部空转 3–6 秒。persistent_workers 让 worker
+            # 跨 epoch 常驻，prefetch_factor=2 让它提前取下一张；num_workers 仍保持 1。
+            valloader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=args.num_workers,
+                                   persistent_workers=args.num_workers > 0,
+                                   prefetch_factor=2 if args.num_workers > 0 else None)
+            logging.info('val split: %d slices (%s)' % (len(val_set), val_list))
     else:
         testloader = None
         curve_path = None
@@ -287,6 +362,7 @@ def trainer_synapse(args, model, snapshot_path):
 
     trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,
                              pin_memory=True, persistent_workers=args.num_workers > 0,
+                             prefetch_factor=2 if args.num_workers > 0 else None,
                              worker_init_fn=functools.partial(_worker_init, seed=args.seed))
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
@@ -363,9 +439,14 @@ def trainer_synapse(args, model, snapshot_path):
         def seg_loss(out, label):
             """距离尾部 + 面积一致性：0.5CE+0.5Dice + 面积项 + CVaR_q(距离加权不一致)。"""
             l_ce = ce_loss(out, label[:].long())
-            return (0.5 * l_ce + 0.5 * dice_loss(out, label, softmax=True)
+            l_dice = dice_loss(out, label, softmax=True)
+            l_cvar = cvar_distance_tail_loss(out, label, q=tl_q)
+            # 分项打点（与 rhd 同口径）：尾部项随训练衰减多少，是判断剂量够不够的直接证据
+            seg_loss.parts = (l_ce.detach(), l_dice.detach(), l_cvar.detach())
+            return (0.5 * l_ce + 0.5 * l_dice
                     + tl_area_w * area_consistency_loss(out, label)
-                    + tl_w * cvar_distance_tail_loss(out, label, q=tl_q)), l_ce
+                    + tl_w * l_cvar), l_ce
+        seg_loss.parts = None
     elif loss_name == 'rhd':
         # #82 区域 Hausdorff 距离损失（官方实现 lisaGUZZI/HD-Loss 的 LAHsymLoss 2D 版）
         from utils import regional_hd_loss
@@ -373,15 +454,21 @@ def trainer_synapse(args, model, snapshot_path):
         rhd_w = float(getattr(args, 'rhd_w', 0.5))
         rhd_iters = int(getattr(args, 'rhd_iters', 6))
         rhd_alpha = float(getattr(args, 'rhd_alpha', 150.0))
+        # 基础项口径：ce_dice（历史 0.5CE+0.5Dice）/ bce_dice_sum（A0，2026-11-21 起）
+        rhd_base = getattr(args, 'rhd_base', 'ce_dice')
 
         def seg_loss(out, label):
-            """0.5CE+0.5Dice + rhd_w·区域 HD 项（两侧距离剖面按各自质量归一）。"""
-            l_ce = ce_loss(out, label[:].long())
-            l_dice = dice_loss(out, label, softmax=True)
+            """基础项 + rhd_w·区域 HD 项（两侧距离剖面按各自质量归一）。"""
+            if rhd_base == 'bce_dice_sum':
+                l_main, l_ce, l_dice = bce_dice_sum_parts(out, label)
+            else:
+                l_ce = ce_loss(out, label[:].long())
+                l_dice = dice_loss(out, label, softmax=True)
+                l_main = 0.5 * l_ce + 0.5 * l_dice
             l_rhd = regional_hd_loss(out, label, term=rhd_term, iters=rhd_iters,
                                      alpha=rhd_alpha)
             seg_loss.parts = (l_ce.detach(), l_dice.detach(), l_rhd.detach())
-            return (0.5 * l_ce + 0.5 * l_dice + rhd_w * l_rhd), l_ce
+            return (l_main + rhd_w * l_rhd), l_ce
         seg_loss.parts = None
     elif loss_name == 'bndsoft':
         from utils import boundary_soft_ce
@@ -413,6 +500,26 @@ def trainer_synapse(args, model, snapshot_path):
             iou = 1.0 - (inter + 1.0) / (union + 1.0)
             dice = 1.0 - (2.0 * inter + 1.0) / (prob.sum() + tgt.sum() + 1.0)
             return 0.5 * bce + 0.5 * iou + dice, bce
+    elif loss_name == 'bce_dice':
+        # 2026-11-20 对齐口径：BCEWithLogits + soft Dice 等权（同组研究生 UNet 复现配置）。
+        # 二分类下 logit 差 (out[:,1]-out[:,0]) 的 BCE 与 CE(softmax) 数学等价，因此这里
+        # 与 ce_dice /默认分支）数值上只差浮点误差；分开写是为了让命令行口径逐字对上。
+        def seg_loss(out, label):
+            logit = out[:, 1] - out[:, 0]
+            tgt = label.float()
+            if tgt.dim() == 4:
+                tgt = tgt[:, 0]
+            l_bce = F.binary_cross_entropy_with_logits(logit, tgt)
+            prob = torch.sigmoid(logit)
+            inter = (prob * tgt).sum()
+            l_dice = 1.0 - (2.0 * inter + 1.0) / (prob.sum() + tgt.sum() + 1.0)
+            return 0.5 * l_bce + 0.5 * l_dice, l_bce
+    elif loss_name == 'bce_dice_sum':
+        # A0 口径（2026-11-21）：BCEWithLogits + soft Dice 各权重 1.0 相加，逐样本 Dice 求均值
+        def seg_loss(out, label):
+            total, l_bce, _ = bce_dice_sum_parts(out, label)
+            return total, l_bce
+        seg_loss.parts = None
     elif loss_name == 'ce_dice46':
         def seg_loss(out, label):
             """论文 Eq.(14) 口径：0.4·CE + 0.6·Dice（无类别权重）。"""
@@ -442,7 +549,8 @@ def trainer_synapse(args, model, snapshot_path):
     optim_name = getattr(args, 'optim', 'sgd')
     if optim_name == 'adamw':
         params = list(model.parameters()) + (list(aux_loss.parameters()) if aux_loss is not None else [])
-        optimizer = optim.AdamW(params, lr=base_lr, weight_decay=1e-4)
+        # wd 由 --wd 给（对齐口径要求 0；历史 BDFR 臂是 1e-4）
+        optimizer = optim.AdamW(params, lr=base_lr, weight_decay=float(getattr(args, 'wd', 0.0)))
     elif optim_name == 'adam':
         # FDFUNet 论文口径：Adam，lr 由命令行给（1e-4），无 weight decay
         adam_params = list(model.parameters()) + (list(aux_loss.parameters()) if aux_loss is not None else [])
@@ -460,7 +568,22 @@ def trainer_synapse(args, model, snapshot_path):
     steps_per_epoch = (len(trainloader) + grad_accum - 1) // grad_accum
     max_iterations = args.max_epochs * steps_per_epoch  # max_epoch = max_iterations // len(trainloader) + 1
     logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
+    # 斑点扰动一致性（--cons_w > 0）：第二视角 = 乘性斑点 + 每样本增益扰动。
+    # 两视各自照旧算 0.5CE+0.5Dice，另加 1−Dice(p, p') 把跨扰动方差压下去。
+    # --cons_off 1 是控制臂：第二视角不扰动（一致性恒 0），只测双前向/BN 统计的效应。
+    cons_state = {
+        'on': float(getattr(args, 'cons_w', 0.0)) > 0,
+        'w': float(getattr(args, 'cons_w', 0.0)),
+        'sigma': float(getattr(args, 'cons_sigma', 0.08)),
+        'gain': float(getattr(args, 'cons_gain', 0.1)),
+        'warmup': max(1, int(getattr(args, 'cons_warmup', 20))),
+        'off': bool(getattr(args, 'cons_off', 0)),
+        'l_cons': None,
+    }
     best_performance = 0.0
+    # NaN/Inf 守卫的容忍步数（连续非有限超过该值即中止），默认 20 步
+    nan_patience = max(1, int(getattr(args, 'nan_patience', 20)))
+    nan_streak = 0
     iterator = tqdm(range(max_epoch), ncols=70)
     for epoch_num in iterator:
         optimizer.zero_grad()
@@ -476,6 +599,7 @@ def trainer_synapse(args, model, snapshot_path):
             sdf_map = None
             l_edge = None
             l_sdf = None
+            l_ds = None
             if isinstance(outputs, dict):
                 # FDS：主输出 + 三级辅助 logits（各自上采样到 GT 分辨率后再算损失）
                 # weaveseg：额外带 sf/sb/su 三个上下文 logits，供 Eq.(12) 的后三项
@@ -485,6 +609,7 @@ def trainer_synapse(args, model, snapshot_path):
                 edge_logits = outputs.get('edge')
                 sdf_map = outputs.get('sdf')
                 outputs = outputs['out']
+            logits_main = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
             if isinstance(outputs, (tuple, list)):
                 # XNet 双输出（低频/高频支）：每支各算一次分割损失，再对支数取平均
                 loss = 0.0
@@ -502,12 +627,14 @@ def trainer_synapse(args, model, snapshot_path):
                 loss, loss_ce = seg_loss(outputs, label_batch)
             if aux:
                 hw = label_batch.shape[-2:]
+                l_ds = torch.zeros((), device=label_batch.device)
                 for aux_logits, w_aux in aux:
                     if aux_logits.shape[-2:] != hw:
                         aux_logits = F.interpolate(aux_logits, size=hw, mode='bilinear',
                                                    align_corners=False)
                     l_aux, _ = seg_loss(aux_logits, label_batch)
                     loss = loss + w_aux * l_aux
+                    l_ds = l_ds + w_aux * l_aux
             if edge_logits is not None:
                 # 边缘分支：与原 GT 经边缘算子得到的边缘标签做**与主分割同形式、同权重**
                 # 的监督（同一 seg_loss，默认 0.5CE+0.5Dice），权重 --edge_branch_w 默认 1.0；
@@ -537,15 +664,66 @@ def trainer_synapse(args, model, snapshot_path):
                 gy, gx = torch.gradient(sdf_map, dim=(2, 3))
                 eik = (((gy ** 2 + gx ** 2).sqrt() - 1.0) ** 2 * band).sum() / cnt
                 loss = loss + float(getattr(args, 'sdf_w', 1.0)) * (l_sdf + 0.02 * eik)
+            if cons_state['on']:
+                # 预热：第 0 轮系数 0，此时**不做**第二视角前向，与不挂该损失逐位一致；
+                # 之后线性升到 1（第 warmup 轮起满权重）。
+                s_w = min(1.0, epoch_num / float(cons_state['warmup']))
+                if s_w > 0:
+                    if cons_state['off']:
+                        # 控制臂：同一张图再前向一次（不加扰动），一致性项恒为 0，
+                        # 只保留「多一次前向 + BN 统计被更新一次」的效应。
+                        img2 = image_batch
+                    else:
+                        img2 = image_batch * (1.0 + torch.randn_like(image_batch)
+                                              * cons_state['sigma'])
+                        if cons_state['gain'] > 0:
+                            g = 1.0 + (torch.rand(image_batch.shape[0], 1, 1, 1,
+                                                  device=image_batch.device) * 2.0 - 1.0) \
+                                * cons_state['gain']
+                            img2 = img2 * g
+                    logits2 = _primary_out(model(img2))
+                    if isinstance(logits2, (tuple, list)):
+                        logits2 = logits2[0]
+                    l2, _ = seg_loss(logits2, label_batch)
+                    if cons_state['off']:
+                        l_cons = torch.zeros((), device=label_batch.device)
+                    else:
+                        p1 = torch.softmax(logits_main, dim=1)[:, 1:2]
+                        p2 = torch.softmax(logits2, dim=1)[:, 1:2]
+                        l_cons = 1.0 - (2.0 * (p1 * p2).sum() + 1.0) / (p1.sum() + p2.sum() + 1.0)
+                    loss = loss + s_w * (l2 + cons_state['w'] * l_cons)
+                    cons_state['l_cons'] = l_cons.detach()
+                else:
+                    cons_state['l_cons'] = None
+            skip_step, nan_streak = _check_finite_or_skip(
+                loss, nan_streak, nan_patience, iter_num + 1)
+            if skip_step:
+                # 已累积的梯度里可能带 NaN，一并清掉，避免污染下一次 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                continue
             (loss / grad_accum).backward()
 
             # 梯度累积：攒够 grad_accum 个 micro-batch（或到 epoch 末尾）才更新一次
             if (i_batch + 1) % grad_accum != 0 and (i_batch + 1) != len(trainloader):
                 continue
+            # 梯度裁剪（对齐口径 max_norm 10.0；默认 0 = 不裁剪，既有实验不受影响）
+            clip_norm = float(getattr(args, 'clip_grad', 0.0))
+            if clip_norm > 0:
+                clip_params = list(model.parameters()) + (
+                    list(aux_loss.parameters()) if aux_loss is not None else [])
+                torch.nn.utils.clip_grad_norm_(clip_params, clip_norm)
             optimizer.step()
             optimizer.zero_grad()
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
-            if optim_name == 'adamw':
+            sched = getattr(args, 'sched', 'poly')
+            if sched == 'cosine':
+                # A0 口径：cosine 退火到 --min_lr，按总迭代数平滑（等价于按 epoch 的 CosineAnnealingLR）
+                eta_min = float(getattr(args, 'min_lr', 1e-6))
+                t = min(1.0, float(iter_num) / max(1, max_iterations))
+                lr_ = eta_min + 0.5 * (base_lr - eta_min) * (1.0 + math.cos(math.pi * t))
+            elif sched == 'const':
+                lr_ = base_lr
+            elif optim_name == 'adamw':
                 lr_ = base_lr          # 论文只给了 AdamW lr=1e-4，未给衰减策略 → 恒定 lr
             elif optim_name == 'adam':
                 # FDFUNet 论文：cosine 退火，1e-4 → 1e-5，按 epoch 计算
@@ -562,17 +740,27 @@ def trainer_synapse(args, model, snapshot_path):
                 writer.add_scalar('info/loss_edge', l_edge, iter_num)
             if l_sdf is not None:
                 writer.add_scalar('info/loss_sdf', l_sdf, iter_num)
+            if l_ds is not None:
+                writer.add_scalar('info/loss_ds', l_ds, iter_num)
+            if cons_state['l_cons'] is not None:
+                writer.add_scalar('info/loss_cons', cons_state['l_cons'], iter_num)
             rhd_parts = getattr(seg_loss, 'parts', None)
-            if loss_name == 'rhd' and rhd_parts is not None:
-                writer.add_scalar('info/loss_rhd', rhd_parts[2], iter_num)
+            has_parts = loss_name in ('rhd', 'cvartail') and rhd_parts is not None
+            if has_parts:
+                writer.add_scalar('info/loss_%s' % loss_name, rhd_parts[2], iter_num)
+            parts_str = '' if not has_parts else (
+                ', %s_ce %.4f, %s_dice %.4f, %s_term %.4f'
+                % (loss_name, rhd_parts[0].item(), loss_name, rhd_parts[1].item(),
+                   loss_name, rhd_parts[2].item()))
 
-            logging.info('iteration %d : loss : %f, loss_ce: %f%s%s%s' % (
+            logging.info('iteration %d : loss : %f, loss_ce: %f%s%s%s%s%s' % (
                 iter_num, loss.item(), loss_ce.item(),
                 '' if l_edge is None else ', loss_edge: %f' % l_edge.item(),
                 '' if l_sdf is None else ', loss_sdf: %f' % l_sdf.item(),
-                '' if (loss_name != 'rhd' or rhd_parts is None) else
-                ', rhd_ce %.4f, rhd_dice %.4f, rhd_term %.4f'
-                % tuple(t.item() for t in rhd_parts)))
+                '' if l_ds is None else ', loss_ds: %f' % l_ds.item(),
+                '' if cons_state['l_cons'] is None else
+                ', loss_cons: %f' % cons_state['l_cons'].item(),
+                parts_str))
 
             if iter_num % 20 == 0:
                 image = image_batch[1, 0:1, :, :]
@@ -600,6 +788,38 @@ def trainer_synapse(args, model, snapshot_path):
                          "(w_ce=%.4f w_dice=%.4f)" % (
                              epoch_num + 1, s_ce, s_dice,
                              0.5 * np.exp(-s_ce), 0.5 * np.exp(-s_dice)))
+
+        if valloader is not None:
+            # best-val 选模：验证集逐样本 Dice 均值（与 A0 复现包的 selection 口径一致）
+            model.eval()
+            v_sum, v_cnt = 0.0, 0
+            with torch.no_grad():
+                for vb in valloader:
+                    v_img = vb['image'].cuda().float()
+                    v_lab = vb['label'].cuda().float()
+                    if v_lab.dim() == 4:      # [B,1,H,W] -> [B,H,W]
+                        v_lab = v_lab[:, 0]
+                    v_out = model(v_img)
+                    v_prob = torch.softmax(_primary_out(v_out), dim=1)[:, 1] >= 0.5
+                    v_gt = v_lab > 0.5
+                    v_inter = float(torch.logical_and(v_prob, v_gt).sum())
+                    v_den = float(v_prob.sum() + v_gt.sum())
+                    v_sum += 1.0 if v_den == 0 else 2.0 * v_inter / v_den
+                    v_cnt += 1
+            model.train()
+            v_dice = v_sum / max(v_cnt, 1)
+            val_features.append({"epoch": epoch_num + 1, "val_dice": v_dice})
+            with open(val_curve_path, "w", newline="", encoding="utf-8") as f:
+                val_writer = csv.writer(f)
+                val_writer.writerow(["epoch", "val_dice"])
+                for item in val_features:
+                    val_writer.writerow([item["epoch"], "%.6f" % item["val_dice"]])
+            improved = v_dice > best_val_dice
+            if improved:
+                best_val_dice, best_val_epoch = v_dice, epoch_num + 1
+                torch.save(model.state_dict(), os.path.join(snapshot_path, 'best_model.pth'))
+            logging.info("epoch %d val curve: dice=%.2f%%%s" % (
+                epoch_num + 1, v_dice * 100, ' (best -> best_model.pth)' if improved else ''))
 
         if testloader is not None and args.eval_test_every > 0 and (
                 (epoch_num + 1) % args.eval_test_every == 0 or epoch_num >= max_epoch - 1):
@@ -637,12 +857,27 @@ def trainer_synapse(args, model, snapshot_path):
 
     writer.close()
 
+    # 显存峰值落日志（2026-11-21）：12GB 卡上 bs8 的 dec_WRMM 臂曾到 reserved 11.4 GiB，
+    # 事后靠这段就能判断某条臂是否已经在换页区里跑，不必再去猜。
+    if torch.cuda.is_available():
+        logging.info('cuda peak: allocated %.0f MiB, reserved %.0f MiB' % (
+            torch.cuda.max_memory_allocated() / 2**20,
+            torch.cuda.max_memory_reserved() / 2**20))
+
+    if valloader is not None and best_val_epoch > 0:
+        best_path = os.path.join(snapshot_path, 'best_model.pth')
+        model.load_state_dict(torch.load(best_path))
+        logging.info('select_val: 载入 best-val 权重 epoch %d val_dice=%.2f%%' % (
+            best_val_epoch, best_val_dice * 100))
+
     if args.dataset == 'Carotid':
         from torch.utils.data import DataLoader as _DL
         from metrics_carotid import compute_case_metrics, original_grid_pair, summarize
         test_set = CarotidDataset(root=args.root_path, list_file=os.path.join(split_dir, "test.txt"),
                                   split="test", img_size=args.img_size,
-                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode)
+                                  use_wavelet=bool(args.use_wavelet), edge_mode=edge_mode,
+                                  align_proto=bool(getattr(args, 'align_proto', 0)),
+                                  a0_proto=bool(getattr(args, 'a0_prep', 0)))
         testloader = _DL(test_set, batch_size=1, shuffle=False, num_workers=args.num_workers)
         model.eval()
         records = []
@@ -676,7 +911,8 @@ def trainer_synapse(args, model, snapshot_path):
                                         prob.numpy(), record['dice'], es['edge_dice']))
         summary = summarize(records)
         with open(os.path.join(snapshot_path, "metrics.csv"), "w", newline="", encoding="utf-8") as f:
-            writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd", "delta_area"])
+            writer_csv = csv.DictWriter(f, fieldnames=["case", "dice", "assd", "hd95", "hd",
+                                                       "delta_area", "iou", "recall", "precision"])
             writer_csv.writeheader()
             writer_csv.writerows(records)
         logging.info("test summary: dice=%.2f%%±%.2f%% assd=%.3f±%.3f hd=%.2f±%.2f hd95=%.2f±%.2f "

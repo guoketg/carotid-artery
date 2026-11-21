@@ -469,7 +469,8 @@ class UNetWMREN(nn.Module):
     """
 
     def __init__(self, in_channels=1, num_classes=2, ablate=None, wave_op='haar',
-                 no_wave=False, no_gate=False, no_mlkm=False, enc='wrmm'):
+                 no_wave=False, no_gate=False, no_mlkm=False, enc='wrmm',
+                 dec_wrmm=0):
         super(UNetWMREN, self).__init__()
         if ablate not in (None, '', 'no_wave', 'no_mlkm', 'no_rem', 'no_gate',
                           'unet_enc', 'unet_dec'):
@@ -480,6 +481,8 @@ class UNetWMREN(nn.Module):
             raise ValueError('wave_op only applies to WRMM, not to unet_enc')
         if enc not in ('wrmm', 'r50', 'r50deep', 'r50wrmm', 'r50seq'):
             raise ValueError('unknown enc: %r' % (enc,))
+        if int(dec_wrmm) not in (0, 1, 2, 3):
+            raise ValueError('dec_wrmm must be 0/1/2/3, got %r' % (dec_wrmm,))
         if enc in ('r50', 'r50wrmm', 'r50seq') and ablate == 'unet_enc':
             raise ValueError('enc=%s 的浅层是 R50，没有 WRMM 可换' % enc)
         if enc == 'r50' and (ablate in ('no_wave', 'no_gate', 'no_mlkm')
@@ -601,6 +604,23 @@ class UNetWMREN(nn.Module):
         self.d3_2 = up_conv(l3c, l2c)
         self.d2_2 = up_conv(l2c, l1c)
         self.d1_2 = nn.Conv2d(l1c, num_classes, kernel_size=1)
+        # 解码器 WRMM（2026-11-20）：把编码器的 WRMM 镜像搬到解码器，挂在每个解码级
+        # 融合块（REM / UNetFusion）的输出之后。WRDM 走 stride=1 同级精炼，输入输出
+        # 形状与通道逐级不变，因此可以原样插在 d4/d3/d2 与最后一级上采样之间。
+        #   dec_wrmm = 0：不挂（所有历史臂逐位不变）
+        #              1：四级全挂（28²/512、56²/256、112²/128、224²/64）
+        #              2：只挂浅两级（112²/128、224²/64）
+        #              3：只挂 224²/64
+        # 参数量提醒：WRDM ≈ 53C² + MLKM ≈ 4C²；C=512 那一级单挂 ≈ 14.9M，
+        # 四级全挂在 31.00M 的 R50 宿主上会把总参数抬到 ≈ 50.9M，读增益时须配
+        # use_wave=False 的同参数孪生，否则分不清「小波内容」与「容量」。
+        self.dec_wrmm = int(dec_wrmm)
+        _dec_levels = {0: (), 1: (0, 1, 2, 3), 2: (2, 3), 3: (3,)}[self.dec_wrmm]
+        _dec_widths = (l4c, l3c, l2c, l1c)
+        self.dec_wrmms = nn.ModuleList([
+            WRMM(_dec_widths[i], _dec_widths[i], ablate=None, wave_op=wave_op, stride=1)
+            if i in _dec_levels else nn.Identity()
+            for i in range(4)])
         init_kaiming(self)
 
     def forward(self, x):
@@ -651,12 +671,12 @@ class UNetWMREN(nn.Module):
                 x4 = self.wrmm3(x3)                        # 28²/512
                 x5 = self.wrmm4(x4)                        # 14²/1024
         up4 = self.d5_1(x5)
-        d4 = self.d4_1(self.rems[0](x4, up4))          # 28²/512
+        d4 = self.dec_wrmms[0](self.d4_1(self.rems[0](x4, up4)))   # 28²/512
         up3 = self.d4_2(d4)
-        d3 = self.d3_1(self.rems[1](x3, up3))          # 56²/256
+        d3 = self.dec_wrmms[1](self.d3_1(self.rems[1](x3, up3)))   # 56²/256
         up2 = self.d3_2(d3)
-        d2 = self.d2_1(self.rems[2](x2, up2))          # 112²/128
-        return self.d1_2(self.d2_2(d2))                # 224²/64 → logits
+        d2 = self.dec_wrmms[2](self.d2_1(self.rems[2](x2, up2)))   # 112²/128
+        return self.d1_2(self.dec_wrmms[3](self.d2_2(d2)))         # 224²/64 → logits
 
     def load_from(self, weights):
         return

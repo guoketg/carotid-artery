@@ -1,4 +1,5 @@
-﻿# 批次 0+1 复现队列（experiments.md §1.9）：faff 重跑 + ddbe4（四级全挂 DDBE）+ ddbefull（DDBE×4+ACAM）+ mainLL（XNet 搭车）。
+﻿# 批次 0+1 复现队列（experiments.md §1.9）：faff 重跑 + ddbe4（四级全挂 DDBE）+ mainLL（XNet 搭车）。
+# ACAM 已于 2026-11-20 移除，原 ddbefull（DDBE×4+ACAM）臂删除。
 # 口径与 §1.7 一致：SPARC / bs4+ga2 / 200 epoch（poly 绑死）/ eval_test_every 5，判定点 ep150（epoch_149.pth）。
 # 判定规则（§1.9，跑之前写死）：|ΔDice| ≥ 0.005（病例级）或 HD95 下降 ≥ 0.5 mm 且 p < 0.05。
 # Usage:
@@ -39,11 +40,10 @@ $common = @(
 )
 $pre = "TU_pretrain_R50-ViT-B_16_skip3_epo200_bs4_ga2_224"
 
-# 顺序 == 优先级：批次 1 核心（ddbe4 → ddbefull，同 seed 配对消融「挂几层 + ACAM 增量」）
+# 顺序 == 优先级：批次 1 核心（ddbe4，同 seed 配对照「挂几层」）
 # → 批次 0 收尾（faff 修复后重跑）→ 搭车（mainLL，XNet 式低频主路）。
 $jobs = @(
     @{ Name = "ddbe4";     Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--ddbe", "4") + $common;               Snapshot = "${pre}_SPARC_ddbe4_c2d" },
-    @{ Name = "ddbefull";  Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--ddbe", "4", "--acam", "1") + $common; Snapshot = "${pre}_SPARC_ddbe4_acam_c2d" },
     @{ Name = "faff";      Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "aff") + $common; Snapshot = "${pre}_SPARC_dual_L1234_aff_c2d" },
     @{ Name = "mainll";    Args = @("train.py", "--subset", "SPARC", "--seed", "1234", "--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--main_input", "ll") + $common; Snapshot = "${pre}_SPARC_dual_L1234_auto_mainLL_c2d" }
 )

@@ -1,4 +1,4 @@
-﻿# 2026-11-12 队列：DDBE / FGR 的「R50 随机初始化」归因批（拆「ResNet 结构」与「ImageNet 预训练」）。
+# 2026-11-12 队列：DDBE / FGR 的「R50 随机初始化」归因批（拆「ResNet 结构」与「ImageNet 预训练」）。
 #
 # 动机（用户决策）：§5(1)(3)(16) 的 DDBE +0.435 / FGR +0.305 都是在 ImageNet21k 预训练
 # R50 上测的增量，无法回答「增益来自 ResNet 结构本身，还是来自预训练特征」。本轮把
@@ -8,7 +8,7 @@
 #   NP-CTL  --arch baseline --vit_layers 0 --no_pretrain 1
 #           snap: TU_R50-ViT-B_16_skip3_vitL0_epo200_bs4_ga2_224_SPARC_c2d（2026-11-07 已有，直接复用）
 #           读数：89.59% / ASSD 0.16520 / medpy HD 0.79 / HD95 0.51（同快照 metrics.csv 逐切片均值）
-#   NP-DDBE --arch baseline --vit_layers 0 --no_pretrain 1 --ddbe 4      （Haar，ACAM 关，与 §5(3) 同配置）
+#   NP-DDBE --arch baseline --vit_layers 0 --no_pretrain 1 --ddbe 4      （Haar，skip 融合 concat，与 §5(3) 同配置）
 #           snap: ..._SPARC_ddbe4_c2d
 #   NP-FGR  --arch baseline --vit_layers 0 --no_pretrain 1 --fgr 1        （whole 档，与 §5(16) 同配置）
 #           snap: ..._SPARC_fgr_c2d

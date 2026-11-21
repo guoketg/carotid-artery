@@ -1,4 +1,4 @@
-# 排队：FGR(编码器位置) + cvartail 损失联合训练（弱骨干 U-Net，SPARC，3 seed）
+﻿# 排队：FGR(编码器位置) + cvartail 损失联合训练（弱骨干 U-Net，SPARC，3 seed）
 #
 # 用户要求（2026-11-14）：把 FGR 与自研的 CVaR 尾部损失 cvartail 一起训，看结果，3 seed，用 U-Net；
 # 位置指定为**编码器**（`--fgr_pos enc`，改写主链后继续下采样并作 skip；U-Net 上单挂 88.62 / HD 0.93，
@@ -49,16 +49,10 @@ $logDir = Join-Path $Root "logs\queue"
 $modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-function Get-TrainingProcess {
-    Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*train.py*" }
-}
-
-function Get-OtherQueue {
-    Get-CimInstance Win32_Process -Filter "name='powershell.exe'" |
-        Where-Object { $_.CommandLine -like "*queue_*.ps1*" -and
-                       $_.CommandLine -notlike "*queue_c2d_fgr_cvartail_3seed.ps1*" }
-}
+# 队列互斥：严格全序优先级，只等待「严格优先于自己」的队列，任意两个队列都不会互锁
+# （2026-11-15 修复：原实现「有别的队列就等」导致本队列与 distloss 队列互相等待、空转 8 h）
+. (Join-Path $PSScriptRoot "queue_priority.ps1")
+Set-QueuePriority 30
 
 $statusPath = Join-Path $logDir "queue_c2d_fgr_cvartail_3seed_status.csv"
 if (-not (Test-Path $statusPath)) {

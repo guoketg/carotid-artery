@@ -34,20 +34,9 @@ $logDir = Join-Path $Root "logs\queue"
 $modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-function Get-TrainingProcess {
-    Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*train.py*" }
-}
-
-function Get-OtherQueue {
-    Get-CimInstance Win32_Process -Filter "name='powershell.exe'" |
-        Where-Object {
-            $_.ProcessId -ne $PID -and
-            $_.CommandLine -and
-            $_.CommandLine -like "*queue_*.ps1*" -and
-            $_.CommandLine -notlike "*queue_c2d_rhd*"
-        }
-}
+# 队列互斥：严格全序优先级（本队列 = 50，最高，不等任何队列），见 queue_priority.ps1
+. (Join-Path $PSScriptRoot "queue_priority.ps1")
+Set-QueuePriority 50
 
 $statusPath = Join-Path $logDir "queue_c2d_rhd_status.csv"
 if (-not (Test-Path $statusPath)) {

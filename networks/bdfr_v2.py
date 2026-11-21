@@ -5,7 +5,7 @@
 - HF/LF 支补齐 δ，上采样统一为转置卷积，顺序为 φ1→B→δ→φ3→U→CE（Eq.3）/ φ5→B→δ→U→CE（Eq.4）；
 - CTX 门控改为全局通道注意力 CE（Eq.5），不是逐像素 1×1；
 - 融合为 (F_hf + F_lf + F_ctx) → φ1(C→C) → CBAM（Eq.6，⊕ 按论文 Eq.1 的定义取逐元素相加），无残差；
-- ACAM 用空间 softmax 聚合 + LayerNorm + 加性融合替代 concat（Eq.7–10）。
+- ACAM（Eq.7–10）已于 2026-11-20 整体移除；skip 融合一律回退 concat，不再提供开关。
 
 论文未指定的参数：bottleneck 收缩比 r=16（默认）；小波基 Haar（1 级分解）。
 """
@@ -133,37 +133,5 @@ class DDBEv2(nn.Module):
         return self.cbam(self.fuse(hf + lf + ctx))
 
 
-class ACAMv2(nn.Module):
-    """Eq.(7)–(10)：两流各自空间 softmax 聚合 → LN → 两层 1×1 → sigmoid 门控 → 加性融合。
+# ACAMv2（论文 Eq.7–10）已于 2026-11-20 按用户要求整体移除。
 
-    g（编码 skip）与 x（解码特征）通道数不同时，用 1×1 把 g 投到 Cx（论文对称解码器下无此步）。
-    """
-
-    def __init__(self, g_channels, x_channels):
-        super(ACAMv2, self).__init__()
-        self.proj_g = nn.Conv2d(g_channels, x_channels, 1, bias=False) \
-            if g_channels != x_channels else nn.Identity()
-        self.att_g = nn.Conv2d(x_channels, 1, 1)
-        self.att_x = nn.Conv2d(x_channels, 1, 1)
-        # Eq.(9) σ(φ1(δ(LN(φ1(c_f)))))：内层 φ1 是 C→C（等价 1×1，作用在通道向量上），
-        # LN 作用在通道维，再 δ → φ1。用 Linear 实现是为避免 (B,C) 向量还要 reshape 成 4D
-        self.in_g = nn.Linear(x_channels, x_channels, bias=False)
-        self.in_x = nn.Linear(x_channels, x_channels, bias=False)
-        self.ln_g = nn.LayerNorm(x_channels)
-        self.ln_x = nn.LayerNorm(x_channels)
-        self.out_g = nn.Linear(x_channels, x_channels, bias=False)
-        self.out_x = nn.Linear(x_channels, x_channels, bias=False)
-
-    @staticmethod
-    def _modulate(f, att, inner, ln, outer):
-        b, c, h, w = f.shape
-        alpha = torch.softmax(att(f).flatten(2), dim=-1)          # Eq.(7) (B,1,HW)
-        ctx = torch.einsum('bnh,bch->bc', alpha, f.flatten(2))     # Eq.(8) (B,C)
-        ctx = ln(inner(ctx))                                       # Eq.(9) φ1 → LN
-        wgt = torch.sigmoid(outer(F.relu(ctx)))                    # Eq.(9) δ → φ1 → σ
-        return wgt.view(b, c, 1, 1)
-
-    def forward(self, g, x):
-        g = self.proj_g(g)
-        return self._modulate(g, self.att_g, self.in_g, self.ln_g, self.out_g) * g + \
-            self._modulate(x, self.att_x, self.in_x, self.ln_x, self.out_x) * x

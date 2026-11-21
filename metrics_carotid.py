@@ -21,25 +21,39 @@ def compute_case_metrics(pred, gt, spacing=None):
     delta = (pred_area - gt_area) * sy * sx
     fallback = _surface_fallback(pred.shape, spacing)
 
-    if pred_area == 0 and gt_area == 0:
-        return {"dice": 1.0, "assd": 0.0, "hd95": 0.0, "hd": 0.0, "delta_area": 0}
-    if pred_area == 0 or gt_area == 0:
-        return {"dice": 0.0, "assd": fallback, "hd95": fallback, "hd": fallback,
-                "delta_area": delta}
+    # 区域计数派生指标（2026-11-20 新增，供与同组研究生口径对齐时比较 iou/recall/precision）
+    tp = int(np.logical_and(pred, gt).sum())
+    fp, fn = pred_area - tp, gt_area - tp
+    if gt_area == 0 and pred_area == 0:
+        extra = {"iou": 1.0, "recall": 1.0, "precision": 1.0}
+    elif gt_area == 0:
+        extra = {"iou": 0.0, "recall": 1.0, "precision": 0.0}
+    elif pred_area == 0:
+        extra = {"iou": 0.0, "recall": 0.0, "precision": 0.0}
+    else:
+        extra = {"iou": tp / float(tp + fp + fn),
+                 "recall": tp / float(tp + fn),
+                 "precision": tp / float(tp + fp)}
 
-    return {
+    if pred_area == 0 and gt_area == 0:
+        return dict({"dice": 1.0, "assd": 0.0, "hd95": 0.0, "hd": 0.0, "delta_area": 0}, **extra)
+    if pred_area == 0 or gt_area == 0:
+        return dict({"dice": 0.0, "assd": fallback, "hd95": fallback, "hd": fallback,
+                     "delta_area": delta}, **extra)
+
+    return dict({
         "dice": float(dc(pred, gt)),
         "assd": float(assd(pred, gt, voxelspacing=spacing)),
         "hd95": float(hd95(pred, gt, voxelspacing=spacing)),
         # HD(max)：论文 Table 1 的 HD 口径，与 HD95 共用同一张表面距离矩阵
         "hd": float(hd(pred, gt, voxelspacing=spacing)),
         "delta_area": delta,
-    }
+    }, **extra)
 
 
 def summarize(records):
     """records 为 dict 列表，返回均值、标准差与绝对值均值"""
-    keys = ["dice", "assd", "hd95", "hd", "delta_area"]
+    keys = ["dice", "assd", "hd95", "hd", "delta_area", "iou", "recall", "precision"]
     summary = {}
     for key in keys:
         values = np.array([r[key] for r in records], dtype=np.float64)

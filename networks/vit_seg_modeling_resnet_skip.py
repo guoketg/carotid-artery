@@ -164,6 +164,9 @@ class ResNetV2(nn.Module):
         # 改写后的特征继续下采样并作为 skip；fuse 零初始化 → 恒等起步）。
         # 位置同 FEM：block1 的 padding hack 之前（module 看 55² 真实特征）。
         fgr = getattr(self, 'fgr_enc', None)
+        # --brp（2026-11-18）：编码器分带重投影，按 stage 号 1..4 取模（只建被选中的级，
+        # 未选中的级返回 x 原样）。改写保形，可继续下采样、也可直接当 skip。
+        brp = getattr(self, 'brp_enc', None)
         x = self.root(x)
         if drdac is not None:
             x = x + drdac[0](x)
@@ -171,6 +174,8 @@ class ResNetV2(nn.Module):
             x = fem[0](x)
         if fgr is not None:
             x = fgr[0](x)
+        if brp is not None:
+            x = brp(1, x)
         features.append(x)
         x = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)(x)
         for i in range(len(self.body)-1):
@@ -181,6 +186,8 @@ class ResNetV2(nn.Module):
                 x = fem[i + 1](x)
             if fgr is not None:
                 x = fgr[i + 1](x)
+            if brp is not None:
+                x = brp(i + 2, x)
             right_size = int(in_size / 4 / (i+1))
             if x.size()[2] != right_size:
                 pad = right_size - x.size()[2]
@@ -197,4 +204,6 @@ class ResNetV2(nn.Module):
             x = fem[3](x)
         if fgr is not None:
             x = fgr[3](x)
+        if brp is not None:
+            x = brp(4, x)
         return x, features[::-1]

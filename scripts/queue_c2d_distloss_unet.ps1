@@ -1,4 +1,4 @@
-# 2026-11-14 队列：U-Net 弱骨干上的三条「降距离指标」损失臂（各 1 臂单变量）。
+﻿# 2026-11-14 队列：U-Net 弱骨干上的三条「降距离指标」损失臂（各 1 臂单变量）。
 #
 # 目的：把「别人怎么降 ASSD/HD」的三条代表写法在同一个弱骨干、同一协议下横评，
 #       只回答机制问题，不外推到 R50（弱骨干结论不外推，见 docs/pitfalls.md）。
@@ -33,9 +33,12 @@
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_distloss_unet.ps1 -DryRun
 #   powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_distloss_unet.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\queue_c2d_distloss_unet.ps1 -Only RHDH,BND
+#     （-Only 只跑指定臂，用于接续：RHDSYM 已于 2026-11-15 00:24 收口 88.21 / 0.181 / HD 0.88）
 param(
     [string]$Python = "E:\mkl\code\python_code\carotid-artery\venv\Scripts\python.exe",
     [string]$Root = "E:\mkl\code\python_code\carotid-artery",
+    [string[]]$Only = @(),
     [switch]$DryRun
 )
 
@@ -52,20 +55,10 @@ $logDir = Join-Path $Root "logs\queue"
 $modelDir = "E:\mkl\code\python_code\model\TU_Carotid224"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-function Get-TrainingProcess {
-    Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*train.py*" }
-}
-
-function Get-OtherQueue {
-    $self = $PID
-    Get-CimInstance Win32_Process -Filter "name='powershell.exe'" |
-        Where-Object {
-            $_.ProcessId -ne $self -and
-            $_.CommandLine -and
-            $_.CommandLine -like "*queue_*.ps1*"
-        }
-}
+# 队列互斥：严格全序优先级，只等待「严格优先于自己」的队列，任意两个队列都不会互锁
+# （2026-11-15 修复：原实现「有别的队列就等」导致本队列与 3seed 队列互相等待、空转 8 h）
+. (Join-Path $PSScriptRoot "queue_priority.ps1")
+Set-QueuePriority 20
 
 $statusPath = Join-Path $logDir "queue_c2d_distloss_unet_status.csv"
 if (-not (Test-Path $statusPath)) {
@@ -91,6 +84,20 @@ $jobs = @(
        a = @("--loss", "boundary", "--bl_w", "5.0")
        snap = "${base}_lboundary_unet_c2d" }
 )
+
+# -Only <臂名列表>：只跑指定臂（接续用；臂名见上面 n 字段：RHDSYM / RHDH / BND）
+# 注意：用 powershell -File 调用时 "RHDH,BND" 会作为**单个字符串**传入（-File 不做逗号分割），
+# 故这里再按 , ; 空格 拆一次，两种调用方式都能用。
+if ($Only.Count -gt 0) {
+    $sel = @()
+    foreach ($s in $Only) { $sel += @($s -split '[,;\s]+' | Where-Object { $_ }) }
+    $jobs = @($jobs | Where-Object { $sel -contains $_.n })
+    if ($jobs.Count -eq 0) {
+        Write-Host "[distloss/unet] -Only 未匹配任何臂：$($sel -join ',')"
+        exit 1
+    }
+    Write-Host "[distloss/unet] resume mode, jobs: $(($jobs | ForEach-Object { $_.n }) -join ',')"
+}
 
 foreach ($job in $jobs) {
     # 等 GPU 与其它队列都空出来再开跑，绝不与其它训练抢卡

@@ -186,24 +186,5 @@ class DDBE(nn.Module):
         return x + self.cbam(self.fuse(torch.cat([hf, lf, ctx], dim=1)))
 
 
-class ACAM(nn.Module):
-    """BDFR-Net 式跨级语义对齐（论文 p.3「ACAM for cross-level semantic alignment」）。
-
-    深层解码器特征上采样到 skip 分辨率，与 skip 各自 GAP 后 concat 做通道注意力，
-    对 skip 重标定并以零初始化残差加回（恒等起步，保同 seed 等价性）。
-    输入：skip (B, skip_ch, Hs, Ws)，dec (B, dec_ch, Hd, Wd)——当前级未上采样特征。
-    """
-
-    def __init__(self, skip_ch, dec_ch):
-        super().__init__()
-        hidden = max(skip_ch // 4, 8)
-        self.excite = nn.Sequential(
-            nn.Linear(skip_ch + dec_ch, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, skip_ch))
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, skip, dec):
-        d = F.interpolate(dec, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        pooled = torch.cat([skip.mean(dim=(2, 3)), d.mean(dim=(2, 3))], dim=1)
-        w = torch.sigmoid(self.excite(pooled))[..., None, None]
-        return skip + self.gamma * (w * skip)
+# ACAM 已于 2026-11-20 按用户要求整体移除（不参与任何实验臂）；
+# 历史带 ACAM 的快照（_ddbe4_acam / _bdfr2 / _bdfr2_nod）不再被当前代码重建。

@@ -38,7 +38,7 @@ def build_model(args):
         return UNet(in_channels=1, num_classes=2,
                     edge_in=bool(args.edge_in), edge_op=args.edge_op,
                     wavelet_basis=args.wavelet_basis,
-                    ddbe_level=args.ddbe, acam=bool(args.acam),
+                    ddbe_level=args.ddbe,
                     asr=bool(args.asr),
                     fgr=bool(args.fgr), fgr_mode=args.fgr_mode,
                     fgr_pos=args.fgr_pos,
@@ -77,7 +77,7 @@ def build_model(args):
                                 fusion=args.fusion, heads=args.heads)
     return VisionTransformer(config, img_size=args.img_size, num_classes=2,
                              edge_in=bool(args.edge_in), ddbe_level=args.ddbe,
-                             acam=bool(args.acam), hf_branch=bool(args.hf_branch),
+                             hf_branch=bool(args.hf_branch),
                              hf_lambda=args.hf_lambda,
                              head_hr=bool(getattr(args, "head_hr", 0)),
                              edge_branch=bool(getattr(args, "edge_branch", 0)))
@@ -248,7 +248,6 @@ def main():
     p.add_argument("--side_pretrained", type=int, default=1)
     p.add_argument("--main_input", default="raw", choices=["raw", "ll"])
     p.add_argument("--ddbe", type=int, default=0, help="0~4，与 train.py 同义（仅 baseline）")
-    p.add_argument("--acam", type=int, default=0, help="1 = ACAM skip 对齐，与 train.py 同义（仅 baseline）")
     p.add_argument("--asr", type=int, default=0, help="1 = unet 解码器前三级挂 ASR，与 train.py 同义（仅 unet）")
     p.add_argument("--fgr", type=int, default=0, help="1 = 挂 FGR 频带改写，与 train.py 同义（unet）")
     p.add_argument("--fgr_mode", default="whole", choices=["whole", "band"],

@@ -38,6 +38,10 @@
 | `metrics.csv` 是 ep199 与判定点错位 | 读到的数字和判定点对不上 | trainer.py 末尾 metrics.csv 是最后一轮的产物，而判定点可能在中途 | 用判定点的存档（如 `epoch_199.pth`）+ [eval_carotid.py](../scripts/eval_carotid.py) 重算（~0.3 min/快照），批量用 [scripts/eval_batch_ep199.ps1](../scripts/eval_batch_ep199.ps1) |
 | 补训快照漏登记 | `edge_dual_L1234_deform` 手动训练后没进评测批次 | 手动起的训练没同步进评测脚本 `$jobs` 列表 | 手动训练的快照**当场**补进评测脚本的 job 表 |
 | 在测试集上调 epoch | 曲线取峰值 epoch 当判定点 = 变相调参 | 测试集参与了模型选择 | 判定点固定（现口径：**终点 epoch 200**），不取曲线峰值 |
+| NaN 训练静默通过（2026-11-16） | `unet_sdfaux_cons_ds`（U-Net 三项全叠）iter 3136 起间歇 `loss : nan`、ep75 起 `test curve` 恒为 dice=0.00% / assd=16.91 / hd=16.91，**脚本仍 exit 0 并落盘 `epoch_199.pth`**，队列按 exit_code 记 success | 训练循环不检查损失是否有限；队列只认退出码，不看 `test summary` | 两道守卫：① 训练侧检测到非有限损失即跳过该步（并记计数），连续 N 次则中止并写失败标记；② 队列侧解析 `test summary`，`dice < 1%` 直接判失败、单独记进状态 CSV。**在守卫落地前，人工读队列时必须扫一遍 `test summary`** |
+| 队列在跑时改被 worker 重新导入的文件 | `fgre` ep5 评测崩 `AttributeError: 'CarotidDataset' object has no attribute 'weights'` | 评测新建 DataLoader worker 重新导入新版类，而主进程仍持旧实例 | 队列在跑期间不改 `datasets/`、`networks/`、`trainer.py` 等会被子进程重新导入的文件；要改就等收口 |
+| 杀队列脚本想「保住正在跑的那个 job」（2026-11-16） | `Stop-Process` 掉 `queue_c2d_stack.ps1` 的 powershell（PID 640）后，臂 1 的 train.py 又写了 4 行日志就停住，GPU 显存 5380→1027 MiB，`iter 4852/8800` 处静默退出，快照目录只有 `log.txt` / `test_curve.csv`、**没有 `.pth`** | 队列脚本里的 `& $Python @argsList *> $jobLog` 中 `*>` 由 **PowerShell 建管道读子进程输出再写文件**；PowerShell 一死，读端关闭，子进程写 stdout 失败随之退出。`&` 同步等待并不构成进程组 | 要停某个队列的**后续** job，不能杀队列脚本。正确做法：① 让当前 job 自然跑完（队列会在两个 job 之间重新读盘/受 `Get-TrainingProcess` 阻断）；② 或直接杀当前训练进程 + 队列脚本，明确接受该 job 作废；③ 或提前用 `-Only` 只跑需要的臂。**绝不要指望「杀父进程、留子进程」** |
+| 队列互锁第 3 次：优先级有「两个来源」（2026-11-17） | `queue_c2d_resnet_loss` 首臂 17:38 收口后与 `queue_c2d_stack`（`-Only` 重挂）互相等待，**GPU 空转 20.8 h**（11-16 17:38 → 11-17 14:22），期间无 python 进程、GPU 4%，两个启动日志各刷 1247 / 1297 行 `busy, waiting 60s...` | 互斥是「严格全序」，但**自身优先级由脚本手写**（`Set-QueuePriority 3`）、**对方优先级查表**（表里登记 8）：resnet(self=3) 认为 stack(表=5) 更高、stack(self=5) 认为 resnet(表=8) 更高 → 成环。总序证明只在「两边同源」时成立 | 优先级**只能有一个来源**：现在本进程的优先级也由「本进程 CommandLine 查表」得到（`Get-SelfQueuePriority`，缓存一次），`Set-QueuePriority` 降级为一致性自检（不一致只告警、以表为准）；等待日志追加 `Get-BlockReason`，直接打印「在等谁（PID / 脚本名 / 优先级）」。**新写队列脚本时，手写数值必须与表一致，或干脆不写** |
 
 ## 5. 数据与口径
 
@@ -45,3 +49,89 @@
 |---|---|---|---|
 | 旧划分/像素口径数字混入 | 10-25 前的 90.49% 和现在的数字对不上 | 划分方式和指标单位都变了 | 旧口径结果不进 results.md；以 [results.md](results.md) 为唯一结果来源 |
 | 病人图像进 git 历史 | 工作区已删但 git 历史仍可 checkout | `git rm` 只清当前索引 | 彻底清除需 `git filter-repo` 重写历史（会改全部 commit hash，**待用户批准**后执行） |
+
+## 6. 事故复盘：队列互锁空转 20.8 h（2026-11-17）
+
+**一句话**：互斥规则本身没写错，错在**优先级有两个来源**——「自身值」由脚本手写、「对方值」查表；两者一旦不相等，两个队列就会各自认为对方更高，成环。
+
+### 6.1 时间线
+
+| 时间 | 事件 |
+|---|---|
+| 11-16 16:31 | `queue_c2d_resnet_loss.ps1` 起跑，脚本内 `Set-QueuePriority 3`，而优先级表登记 **8**；首臂 `RES-cvar` 开跑 |
+| 11-16 16:42 | `queue_c2d_stack.ps1 -Only U-FGREnc-RHD` 重挂，`Set-QueuePriority 5`，表里也是 5 |
+| 11-16 17:38 | `RES-cvar` 收口 exit 0（89.53 / 0.162 / HD 0.83，见 [results.md](results.md) §13）；resnet 进入第 2 臂 `RES-rhd6` 的等待循环 |
+| 11-16 17:38 → 11-17 14:22 | 双方互等：resnet 见 stack 表值 5 > 自身 3 → 等；stack 见 resnet 表值 8 > 自身 5 → 等。**GPU 全空、无任何 python 进程**，两个启动日志各刷 1247 / 1297 行 `busy, waiting 60s...` |
+| 11-17 14:22 | 人工巡检发现：GPU 1161 MiB / 4%、无 python、两个 powershell 空转 |
+| 11-17 14:25 | 终止两个队列进程（PID 42700 / 3348），`-Only` 重挂 resnet 剩余 11 臂 + stack 单臂，实测恢复训练（GPU 99%） |
+
+### 6.2 损失
+
+- **20.8 h GPU 空转**；resnet 批 ETA 从 11-17 04:30 推到 11-18 ≈ 03:00，stack 单臂推到 11-18 ≈ 05:00。
+- 期间无任何 job 产出，因此**不存在**污染读数：没有半截权重被当成结果。
+
+### 6.3 根因链
+
+1. **直接原因**：`queue_c2d_resnet_loss.ps1` 手写 `Set-QueuePriority 3`，`queue_priority.ps1` 表里登记 8，两者不一致。
+2. **机制原因**：`Test-QueuePreempts` 拿「自身值（手写）」比「对方值（查表）」。11-15 引入的「严格全序」证明只在**两边同源**时成立，而代码没有强制同源。
+3. **流程原因**：启动前没有可执行的一致性检查；等待日志只打 `busy, waiting`、不打「在等谁」，人工只能靠翻进程表倒推。
+4. **放大原因**：无人值守过夜，发现靠次日巡检，没有超时告警。
+
+### 6.4 修复（已落地）
+
+| 项 | 内容 |
+|---|---|
+| 单一来源 | `queue_priority.ps1` 新增 `Get-SelfQueuePriority`：本进程优先级由「本进程 CommandLine 查表」得到并缓存一次；`Set-QueuePriority` 降级为一致性自检（不一致只告警、以表为准）。等待关系由 `Test-QueueOrderBefore` 唯一定义 = (优先级, PID) 严格全序 |
+| 可观测 | 新增 `Get-BlockReason`：队列等待日志改为 `busy, waiting 60s... blocked by: PID / 脚本名 / 优先级`；实例见 `logs/queue/launcher_stack_resume2.log` |
+| 可自检 | 新增 [check_queue_priority.ps1](../scripts/check_queue_priority.ps1)：静态比对「每个参与互斥的脚本，手写值 == 表登记值」，并打印全序与当前存活队列的推断等待关系，有 error 时 **exit 1** |
+| 自检不干扰 | `Get-PreemptingQueue` 排除 `check_queue_priority.ps1` 自身——它的文件名也含 `queue_`，否则跑一次自检就会让队列误判「有更高优先级的队列在等」 |
+| 记录 | 本节 + [status.md](status.md) 首段 + [results.md](results.md) §13 + 本文 §4 表格行 |
+
+### 6.5 防复发清单（每次挂队列前逐条过）
+
+1. 新队列脚本先登记进 `scripts/queue_priority.ps1` 的表，**手写 `Set-QueuePriority` 必须与表一致**（或者干脆不写）。
+2. 挂载前跑 `powershell -File scripts\check_queue_priority.ps1`，**必须 exit 0** 才允许启动。
+3. 挂载后 5 分钟内看一次启动日志：正常应出现 `[job] train.py ...`；若出现 `busy, waiting`，直接看 `blocked by:` 后面的 PID / 脚本名 / 优先级，判断是「真有人在训练」还是「在空等」。
+4. 隔夜队列次日第一条检查必须是 **GPU 利用率 + `blocked by` 日志**；不看等于没挂。
+5. 一旦发现 A 等 B、B 又在等 A：**先杀优先级低（表值小）的那个**，不要指望它们自己解开；解开后按第 2 条自检再重挂。
+
+## 7. 事故复盘：TransUNet 线已封存却仍被挂载（2026-11-17，两次）
+
+**一句话**：骨干口径 11-16 17:00 已切换并写进 [CLAUDE.md](../CLAUDE.md) 第 18 条，但「文档写了」不等于「执行拦住了」——两次新队列仍把 `--arch baseline`（= R50-ViT-B_16 + DecoderCup，TransUNet 线）当宿主，于是升级为**代码级拦截 + 挂载前审计**。
+
+### 7.1 两次事故
+
+| 时间 | 事件 | 后果 |
+|---|---|---|
+| 11-16 08:55–11:30 | `queue_c2d_cvar_lambda_r50.ps1` 的 5 臂 cvartail 权重（λ/q）消融，全部跑在 `--arch baseline --vit_layers 0` 上 | 2.5 h GPU 产出**不能对外使用**，只能留作内部对照（当时口径尚未切换，属命名沿用的历史遗留，但结论已与新口径脱钩） |
+| 11-17 15:24 | `queue_c2d_cluster_weight_v2.ps1` 挂载，4 臂里有 2 臂（`CLW-echo-R-SPARC` / `CLW-echo-R-ZN`）写死 `vitL0` | 队列刚挂上就**反锁了正在跑的损失批**（见 7.3），16:30 起 GPU 空转 15 min；已终止该队列（其设计另属 CLAUDE.md 第 19 条禁止项，本就判负） |
+
+### 7.2 根因
+
+1. **口径以「R50」这个简称流传**：`--arch baseline --vit_layers 0` 在 11-16 之前一直被叫「R50」，脚本名、快照前缀、文档标题都写 `r50`。切换对外口径后旧脚本没有改名/加封存标记，新队列照抄旧脚本就自动跑回 TransUNet。
+2. **没有可执行的拦截**：验收依赖人工读 CLAUDE.md；`check_queue_priority.ps1` 只查优先级，不查骨干。
+3. **两次都是「照抄旧脚本」**：不是有人故意用 TransUNet，而是复用模板时未核对 arch 一行。
+
+### 7.3 顺带暴露的第二个互锁（15 min，同一根因族）
+
+杀掉 `cluster_weight_v2` 之前，`queue_c2d_resnet_loss.ps1`（p=8）与它（表登记 p=7）互相等待，GPU 从 16:30（`RES-rhd6` 收口）空到 16:45（杀进程）：
+
+- **缺陷 a：优先级表是进程启动时读进内存的。** resnet 队列 14:25 启动时表里还没有 `cluster_weight_v2`（15:24 才新增 p=7），故它把对方当「未登记」；
+- **缺陷 b：`UnknownQueuePriority = 10` 在「数字大者先跑」的比较器下是最高优先级**，注释却写「按最低处理」。于是 cluster(self=7) 等 resnet(8)、resnet 等 cluster(未登记=10)→ 成环。
+- 修法：`Get-QueuePriorityTable` 按文件 mtime **每次重读**（后补的表项对已启动队列也可见）；`UnknownQueuePriority` 降到 **1**（低于表中最小登记值 5，未登记队列只等不抢）。
+
+### 7.4 修复（已落地）
+
+| 项 | 内容 |
+|---|---|
+| 代码级拦截 | [train.py](../train.py) 在 `parse_args()` 后直接拒绝 `--arch baseline`（默认值也是 baseline，故少写 `--arch` 的老命令同样被拦），报错里给出两条合法宿主；确需复现历史读数才加 `--allow_legacy_tu 1` |
+| 挂载前审计 | 新增 [check_backbone_policy.ps1](../scripts/check_backbone_policy.ps1)：静态列出仍写死 TransUNet 的脚本，运行态扫存活 `python` 进程里的 `--arch baseline`；有存活事故进程即 **exit 1**。`-Scripts <file>` 可对拟挂载脚本点名判错 |
+| 文档口径 | [CLAUDE.md](../CLAUDE.md) 第 18 条开头加禁令块（含两次事故记录）；`queue_c2d_cvar_lambda_r50.ps1`、`queue_c2d_cluster_weight_v2.ps1` 头部加「已封存/已作废，禁止再挂载」 |
+| 优先级修复 | 见 7.3：表按 mtime 重读、未登记降到 1 |
+
+### 7.5 防复发清单（新增 3 条，与 §6.5 并列）
+
+1. **挂队列前必须同时过两道自检**：`check_queue_priority.ps1` **和** `check_backbone_policy.ps1`，两者都 exit 0 才允许启动。
+2. **复用旧队列脚本时，逐字核对 `--arch` 一行**：合法值只有 `--arch wmren --wmren_ablate unet_dec --wmren_enc r50`（纯 ResNet50）与 `--arch unet`（弱骨干）。看到 `baseline`/`vitL0` 一律改掉再挂。
+3. **新队列挂载后 5 分钟内，除看 `train.py` 是否启动，还要看启动命令行里没有 `baseline`**；`train.py` 会以 `--arch baseline 是 TransUNet 线...` 立刻退出，日志里出现该行即为事故。
+

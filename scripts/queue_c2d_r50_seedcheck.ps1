@@ -1,4 +1,4 @@
-# 2026-11-07 队列（第二批）：R-GEF γ 修正 + F3 的 seed 复核。
+﻿# 2026-11-07 队列（第二批）：R-GEF γ 修正 + F3 的 seed 复核。
 #
 # 背景读数（R50 宿主，--vit_layers 0，seed 1234）：
 #   基线 A        90.4903 / ASSD 0.14473 / HD95 0.41634
@@ -50,7 +50,7 @@ $base = @(
     "--max_epochs", "200", "--eval_test_every", "5"
 )
 $pre = "TU_pretrain_R50-ViT-B_16_skip3_vitL0_epo200_bs4_ga2_224_SPARC"
-$f3 = @("--arch", "baseline", "--bdfr_v2", "1", "--bdfr_ddbe", "1", "--bdfr_acam", "1",
+$f3 = @("--arch", "baseline", "--bdfr_v2", "1", "--bdfr_ddbe", "1",
         "--bdfr_wave_op", "lap")
 
 $jobs = @(

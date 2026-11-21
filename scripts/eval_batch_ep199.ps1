@@ -33,9 +33,8 @@ $jobs = @(
     @{ Name = "ddbe3";      Snap = "${pre}_SPARC_ddbe3_c2d";                    Args = @("--ddbe", "3"); Baseline = "b1234" },
     @{ Name = "edge";       Snap = "${pre}_SPARC_edge_c2d";                     Args = @("--edge_in", "1"); Baseline = "b1234" },
     @{ Name = "edgedual";   Snap = "${pre}_SPARC_edge_dual_L1234_auto_c2d";     Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--edge_in", "1"); Baseline = "b1234" },
-    # 批次 0+1（experiments.md §1.9，queue_c2d_repro.ps1）：ddbe4 / ddbefull / faff / mainll
+    # 批次 0+1（experiments.md §1.9，queue_c2d_repro.ps1）：ddbe4 / faff / mainll
     @{ Name = "ddbe4";      Snap = "${pre}_SPARC_ddbe4_c2d";                    Args = @("--ddbe", "4"); Baseline = "b1234" },
-    @{ Name = "ddbefull";   Snap = "${pre}_SPARC_ddbe4_acam_c2d";               Args = @("--ddbe", "4", "--acam", "1"); Baseline = "b1234" },
     @{ Name = "faff";       Snap = "${pre}_SPARC_dual_L1234_aff_c2d";           Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "aff"); Baseline = "b1234" },
     @{ Name = "mainll";     Snap = "${pre}_SPARC_dual_L1234_auto_mainLL_c2d";   Args = @("--arch", "dual", "--levels", "1,2,3,4", "--fuse_op", "auto", "--main_input", "ll"); Baseline = "b1234" },
     # 补记快照（2026-10-28 手动训练的边缘图+双骨干 deform，原 ep149 批次漏掉）

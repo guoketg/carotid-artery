@@ -46,19 +46,14 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 $selfName = "queue_c2d_cvartail_r50_3seed_zn.ps1"
 
-function Get-TrainingProcess {
-    Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-        Where-Object { $_.CommandLine -like "*train.py*" }
-}
+# 队列互斥：严格全序优先级（本队列 = 15，最低一档，会等 rhd(50)/3seed(30)/distloss(20) 全收口）
+# 2026-11-15：原「有别的队列就等」会与其它队列互锁，见 scripts/queue_priority.ps1
+. (Join-Path $PSScriptRoot "queue_priority.ps1")
+Set-QueuePriority 15
 
 function Get-OtherQueue {
     if ($IgnoreOtherQueues) { return @() }
-    Get-CimInstance Win32_Process -Filter "name='powershell.exe'" |
-        Where-Object {
-            $_.CommandLine -and
-            ($_.CommandLine -like "*\scripts\queue_*.ps1*") -and
-            ($_.CommandLine -notlike "*$selfName*")
-        }
+    Get-PreemptingQueue
 }
 
 $statusPath = Join-Path $logDir "queue_c2d_cvartail_r50_3seed_zn_status.csv"

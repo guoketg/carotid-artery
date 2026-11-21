@@ -44,7 +44,6 @@ parser.add_argument('--vit_layers', type=int, default=12,
 parser.add_argument('--bdfr_v2', type=int, default=0)
 parser.add_argument('--bdfr_ddbe', type=int, default=1,
                     help='DDBE 块（含 ECA），与训练口径一致')
-parser.add_argument('--bdfr_acam', type=int, default=1)
 parser.add_argument('--bdfr_wave_op', type=str, default='haar',
                     choices=['haar', 'lap', 'pyr'])
 parser.add_argument('--ffusion', type=int, default=0)
@@ -134,7 +133,7 @@ if __name__ == "__main__":
         config_vit.patches.grid = (int(args.img_size/args.vit_patches_size), int(args.img_size/args.vit_patches_size))
     net = ViT_seg(config_vit, img_size=args.img_size, num_classes=config_vit.n_classes,
                   bdfr_v2=bool(args.bdfr_v2), bdfr_ddbe=bool(args.bdfr_ddbe),
-                  bdfr_acam=bool(args.bdfr_acam), bdfr_wave_op=args.bdfr_wave_op,
+                  bdfr_wave_op=args.bdfr_wave_op,
                   ffusion=bool(args.ffusion),
                   edge_fusion=args.edge_fusion != 'none',
                   edge_gate='const' if args.edge_fusion == 'relconst' else 'spatial',
